@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: carvision
+      POSTGRES_USER: carvision
+      POSTGRES_PASSWORD: carvision
+    ports:
+      - "5433:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg2://carvision:carvision@db:5432/carvision
+      MEDIA_DIR: /app/datasets/media
+      APP_ENV: docker
+      YOLO_PLATE_MODEL: /app/models/plate.pt
+      LEGACY_FRONTEND_DIR: /app/old/python_frontend
+      SSL_CERTFILE: ${SSL_CERTFILE:-}
+      SSL_KEYFILE: ${SSL_KEYFILE:-}
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/app:/app/backend/app
+      - ./datasets/media:/app/datasets/media
+      - ./old:/app/old:ro
+      - ./models:/app/models
+      - ./certs:/certs:ro
+
+volumes:
+  db_data:

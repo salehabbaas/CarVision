@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}Notifications - CarVision by SpinelTech{% endblock %}
+{% block page_icon %}🔔{% endblock %}
+{% block page_title %}Notification Center{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Notification Center</h1>
+    <p>System events, alerts, and training updates.</p>
+  </div>
+  <div class="page-actions">
+    <span class="badge badge-warn" id="notif-unread-pill">Unread: {{ unread_count }}</span>
+    <button class="btn btn-secondary" id="notif-refresh" type="button">Refresh</button>
+    <button class="btn btn-primary" id="notif-read-all" type="button">Mark All Read</button>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <div class="card-body" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+    <label class="toggle-wrap" style="margin:0">
+      <input type="checkbox" id="notif-unread-only">
+      <div class="toggle-sw"></div>
+      <div>
+        <div class="toggle-text">Unread Only</div>
+        <div class="toggle-desc">Show only unread notifications</div>
+      </div>
+    </label>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-body" style="padding:0">
+    <div id="notif-list" class="notif-list">
+      {% if items %}
+        {% for n in items %}
+        <div class="notif-item {% if not n.is_read %}unread{% endif %} level-{{ n.level }}" data-id="{{ n.id }}">
+          <div class="notif-main">
+            <div class="notif-title-row">
+              <div class="notif-title">{{ n.title }}</div>
+              <span class="badge {% if n.level == 'error' %}badge-denied{% elif n.level == 'warn' %}badge-warn{% elif n.level == 'success' %}badge-allowed{% else %}badge-muted{% endif %}">{{ n.level }}</span>
+            </div>
+            <div class="notif-msg">{{ n.message }}</div>
+            <div class="notif-meta">
+              <span>{{ n.created_at }}</span>
+              {% if n.kind %}<span> - {{ n.kind }}</span>{% endif %}
+              {% if n.camera_id %}<span> - Camera {{ n.camera_id }}</span>{% endif %}
+            </div>
+          </div>
+          <div class="notif-actions">
+            {% if not n.is_read %}
+            <button class="btn btn-sm btn-secondary" data-action="read" data-id="{{ n.id }}">Mark Read</button>
+            {% endif %}
+            <button class="btn btn-sm btn-danger" data-action="delete" data-id="{{ n.id }}">Delete</button>
+          </div>
+        </div>
+        {% endfor %}
+      {% else %}
+      <div class="notif-empty" id="notif-empty">No notifications yet.</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+const notifList=document.getElementById('notif-list');
+const unreadOnly=document.getElementById('notif-unread-only');
+const unreadPill=document.getElementById('notif-unread-pill');
+const refreshBtn=document.getElementById('notif-refresh');
+const readAllBtn=document.getElementById('notif-read-all');
+
+function levelBadgeClass(level){
+  if(level==='error') return 'badge-denied';
+  if(level==='warn') return 'badge-warn';
+  if(level==='success') return 'badge-allowed';
+  return 'badge-muted';
+}
+
+function renderNotifications(items){
+  if(!notifList) return;
+  if(!items || !items.length){
+    notifList.innerHTML='<div class="notif-empty" id="notif-empty">No notifications yet.</div>';
+    return;
+  }
+  notifList.innerHTML=items.map(n=>`\
+    <div class="notif-item ${n.is_read?'':'unread'} level-${n.level||'info'}" data-id="${n.id}">\
+      <div class="notif-main">\
+        <div class="notif-title-row">\
+          <div class="notif-title">${n.title||'Notification'}</div>\
+          <span class="badge ${levelBadgeClass(n.level||'info')}">${n.level||'info'}</span>\
+        </div>\
+        <div class="notif-msg">${n.message||''}</div>\
+        <div class="notif-meta">${n.created_at||''}${n.kind?' - '+n.kind:''}${n.camera_id?' - Camera '+n.camera_id:''}</div>\
+      </div>\
+      <div class="notif-actions">\
+        ${n.is_read?'':'<button class="btn btn-sm btn-secondary" data-action="read" data-id="'+n.id+'">Mark Read</button>'}\
+        <button class="btn btn-sm btn-danger" data-action="delete" data-id="${n.id}">Delete</button>\
+      </div>\
+    </div>`).join('');
+  bindActionHandlers();
+}
+
+async function refreshNotifications(){
+  try{
+    const q=unreadOnly?.checked ? '?unread_only=true' : '';
+    const res=await fetch('/admin/api/notifications'+q);
+    if(!res.ok) return;
+    const data=await res.json();
+    renderNotifications(data.items||[]);
+    const unread=(data.items||[]).filter(i=>!i.is_read).length;
+    if(unreadPill) unreadPill.textContent='Unread: '+unread;
+  }catch(e){}
+}
+
+async function markRead(id){
+  await fetch('/admin/api/notifications/'+id+'/read',{method:'POST'});
+  refreshNotifications();
+}
+
+async function deleteNotification(id){
+  await fetch('/admin/api/notifications/'+id,{method:'DELETE'});
+  refreshNotifications();
+}
+
+async function markAllRead(){
+  await fetch('/admin/api/notifications/read_all',{method:'POST'});
+  refreshNotifications();
+}
+
+function bindActionHandlers(){
+  document.querySelectorAll('[data-action="read"]').forEach(btn=>{
+    btn.onclick=()=>markRead(btn.dataset.id);
+  });
+  document.querySelectorAll('[data-action="delete"]').forEach(btn=>{
+    btn.onclick=()=>deleteNotification(btn.dataset.id);
+  });
+}
+
+unreadOnly?.addEventListener('change',refreshNotifications);
+refreshBtn?.addEventListener('click',refreshNotifications);
+readAllBtn?.addEventListener('click',markAllRead);
+bindActionHandlers();
+setInterval(refreshNotifications,10000);
+</script>
+{% endblock %}

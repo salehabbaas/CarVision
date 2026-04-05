@@ -1,0 +1,402 @@
+{% extends "base.html" %}
+{% block title %}Cameras — CarVision by SpinelTech{% endblock %}
+{% block page_icon %}📹{% endblock %}
+{% block page_title %}Camera Management{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Camera Management</h1>
+    <p>Configure RTSP, webcam, browser, and MJPEG camera sources</p>
+  </div>
+  <div class="page-actions">
+    <a href="/admin/discovery" class="btn btn-secondary">🔍 ONVIF Discovery</a>
+    <button class="btn btn-primary" onclick="document.getElementById('add-camera-modal').style.display='flex'">+ Add Camera</button>
+  </div>
+</div>
+
+{% if cameras %}
+<div class="camera-grid">
+  {% for cam in cameras %}
+  <div class="camera-card">
+    <div class="camera-card-header">
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <div class="camera-name">{{ cam.name }}</div>
+          {% if cam.enabled %}
+            <span class="badge badge-allowed">Active</span>
+          {% else %}
+            <span class="badge badge-muted">Disabled</span>
+          {% endif %}
+          {% if cam.type == 'browser' %}
+            {% if status_map and status_map.get(cam.id) %}
+              <span class="badge badge-online">Online</span>
+            {% else %}
+              <span class="badge badge-offline">Offline</span>
+            {% endif %}
+          {% endif %}
+        </div>
+        <span class="camera-type-badge">{{ cam.type }}</span>
+        <div class="camera-source" title="{{ cam.source }}">{{ cam.source }}</div>
+        {% if cam.location %}<div style="font-size:0.72rem;color:var(--text-muted);margin-top:3px">📍 {{ cam.location }}</div>{% endif %}
+      </div>
+      <div class="flex gap-2">
+        {% if cam.enabled %}
+          <a href="/stream/{{ cam.id }}" target="_blank" class="btn btn-sm btn-secondary">▶ Preview</a>
+        {% endif %}
+      </div>
+    </div>
+    <div class="camera-card-body">
+      <div class="camera-meta-grid">
+        <div class="camera-meta-item">
+          <div class="camera-meta-key">Scan Interval</div>
+          <div class="camera-meta-value">{{ cam.scan_interval }}s</div>
+        </div>
+        <div class="camera-meta-item">
+          <div class="camera-meta-key">Cooldown</div>
+          <div class="camera-meta-value">{{ cam.cooldown_seconds }}s</div>
+        </div>
+        <div class="camera-meta-item">
+          <div class="camera-meta-key">Detector Mode</div>
+          <div class="camera-meta-value">{{ cam.detector_mode or 'inherit' }}</div>
+        </div>
+        <div class="camera-meta-item">
+          <div class="camera-meta-key">Live View</div>
+          <div class="camera-meta-value">{% if cam.live_view %}✅ Yes{% else %}❌ No{% endif %}</div>
+        </div>
+        <div class="camera-meta-item">
+          <div class="camera-meta-key">Save Snapshot</div>
+          <div class="camera-meta-value">{% if cam.save_snapshot %}✅ Yes{% else %}❌ No{% endif %}</div>
+        </div>
+        <div class="camera-meta-item">
+          <div class="camera-meta-key">Save Clip</div>
+          <div class="camera-meta-value">{% if cam.save_clip %}✅ {{ cam.clip_seconds }}s{% else %}❌ No{% endif %}</div>
+        </div>
+      </div>
+      {% if cam.onvif_xaddr %}
+      <div class="alert alert-info" style="margin:0">
+        🔌 ONVIF: <span class="font-mono text-xs">{{ cam.onvif_xaddr }}</span>
+      </div>
+      {% endif %}
+      {% if cam.type == 'browser' and cam.capture_token %}
+      <div style="margin-top:10px;padding:10px 12px;background:var(--glass-bg2);border:1px solid var(--glass-border);border-radius:var(--r-md)">
+        <div style="font-size:0.7rem;color:var(--text-dim);margin-bottom:4px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em">Capture URL</div>
+        {% set cu = (public_base_url or '')|replace('https://','http://')|replace('http://','') %}
+        <a href="http://{{ cu }}capture/{{ cam.id }}?token={{ cam.capture_token }}"
+           class="font-mono text-xs text-accent" style="word-break:break-all" target="_blank">
+          /capture/{{ cam.id }}?token={{ cam.capture_token[:12] }}…
+        </a>
+      </div>
+      {% endif %}
+    </div>
+    <div class="camera-card-footer">
+      <button class="btn btn-sm btn-secondary" onclick="openEditModal({{ cam.id }})">✏️ Edit</button>
+      {% if cam.type == 'browser' %}
+        <form method="post" action="/admin/cameras/{{ cam.id }}/rotate_token" style="margin:0">
+          <button type="submit" class="btn btn-sm btn-warn">🔄 Rotate Token</button>
+        </form>
+      {% endif %}
+      <form method="post" action="/admin/cameras/{{ cam.id }}/delete" style="margin:0"
+            onsubmit="return confirm('Delete camera {{ cam.name }}?')">
+        <button type="submit" class="btn btn-sm btn-danger">🗑️ Delete</button>
+      </form>
+    </div>
+
+    <!-- Edit Modal Data -->
+    <template id="edit-data-{{ cam.id }}">
+      <input type="hidden" name="edit-id" value="{{ cam.id }}">
+      <input type="hidden" name="edit-name" value="{{ cam.name }}">
+      <input type="hidden" name="edit-type" value="{{ cam.type }}">
+      <input type="hidden" name="edit-source" value="{{ cam.source }}">
+      <input type="hidden" name="edit-location" value="{{ cam.location or '' }}">
+      <input type="hidden" name="edit-enabled" value="{{ '1' if cam.enabled else '0' }}">
+      <input type="hidden" name="edit-scan_interval" value="{{ cam.scan_interval }}">
+      <input type="hidden" name="edit-cooldown_seconds" value="{{ cam.cooldown_seconds }}">
+      <input type="hidden" name="edit-save_snapshot" value="{{ '1' if cam.save_snapshot else '0' }}">
+      <input type="hidden" name="edit-save_clip" value="{{ '1' if cam.save_clip else '0' }}">
+      <input type="hidden" name="edit-clip_seconds" value="{{ cam.clip_seconds }}">
+      <input type="hidden" name="edit-live_view" value="{{ '1' if cam.live_view else '0' }}">
+      <input type="hidden" name="edit-live_order" value="{{ cam.live_order }}">
+      <input type="hidden" name="edit-onvif_xaddr" value="{{ cam.onvif_xaddr or '' }}">
+      <input type="hidden" name="edit-onvif_username" value="{{ cam.onvif_username or '' }}">
+      <input type="hidden" name="edit-onvif_password" value="{{ cam.onvif_password or '' }}">
+      <input type="hidden" name="edit-onvif_profile" value="{{ cam.onvif_profile or '' }}">
+      <input type="hidden" name="edit-detector_mode" value="{{ cam.detector_mode or 'inherit' }}">
+    </template>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card">
+  <div class="card-body" style="text-align:center;padding:64px">
+    <div style="font-size:56px;margin-bottom:16px">📷</div>
+    <h2>No cameras yet</h2>
+    <p style="margin:8px 0 20px">Add your first camera to start detecting plates</p>
+    <button class="btn btn-primary btn-lg" onclick="document.getElementById('add-camera-modal').style.display='flex'">+ Add First Camera</button>
+  </div>
+</div>
+{% endif %}
+
+<!-- ADD CAMERA MODAL -->
+<div id="add-camera-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:500;align-items:center;justify-content:center;backdrop-filter:blur(8px)">
+  <div style="background:var(--bg-mid);border:1px solid var(--glass-border2);border-radius:var(--r-xl);width:100%;max-width:680px;max-height:90vh;overflow-y:auto;box-shadow:0 24px 80px rgba(0,0,0,0.7)">
+    <div style="padding:20px 24px;border-bottom:1px solid var(--glass-border);display:flex;align-items:center;justify-content:space-between">
+      <h2 style="color:var(--text);display:flex;align-items:center;gap:8px"><span style="color:var(--accent)">+</span> Add New Camera</h2>
+      <button class="btn btn-icon btn-secondary" onclick="document.getElementById('add-camera-modal').style.display='none'">✕</button>
+    </div>
+    <form method="post" action="/admin/cameras" style="padding:24px">
+      <div class="form-section open" style="margin-bottom:16px">
+        <button type="button" class="form-section-header">
+          <span class="icon">📡</span>Basic Configuration
+          <span class="form-section-chevron">▼</span>
+        </button>
+        <div class="form-section-body">
+          <div class="form-grid" style="margin-bottom:0">
+            <div class="form-group">
+              <label class="form-label">Camera Name <span class="req">*</span></label>
+              <input name="name" class="form-control" placeholder="e.g. Gate 1 — Main Entrance" required>
+              <span class="form-hint">Unique display name for this camera</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Camera Type <span class="req">*</span></label>
+              <select name="type" class="form-control" id="add-type-select" onchange="updateSourceHelp(this.value,'add')">
+                <option value="rtsp">RTSP — IP Camera / DVR / NVR</option>
+                <option value="http_mjpeg">HTTP MJPEG Stream</option>
+                <option value="webcam">Webcam (USB / Built-in)</option>
+                <option value="browser">Browser Capture (Phone / Laptop)</option>
+              </select>
+            </div>
+            <div class="form-group form-full">
+              <label class="form-label">Source URL / Index <span class="req">*</span></label>
+              <input name="source" class="form-control" placeholder="rtsp://user:pass@192.168.1.100:554/..." id="add-source-input">
+              <span class="form-hint" id="add-source-hint">Enter the RTSP stream URL from your Dahua DVR/NVR or IP camera</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Location / Label</label>
+              <input name="location" class="form-control" placeholder="e.g. Main Gate, Parking B">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Detector Mode</label>
+              <select name="detector_mode" class="form-control">
+                <option value="inherit">Inherit from Global Settings</option>
+                <option value="auto">Auto (YOLO → Contour fallback)</option>
+                <option value="yolo">YOLO Only</option>
+                <option value="contour">Contour Only</option>
+              </select>
+              <span class="form-hint">Override global detector mode for this camera</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="form-section" style="margin-bottom:16px">
+        <button type="button" class="form-section-header">
+          <span class="icon">⏱️</span>Scan & Timing Settings
+          <span class="form-section-chevron">▼</span>
+        </button>
+        <div class="form-section-body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label class="form-label">Scan Interval (seconds)</label>
+              <input name="scan_interval" type="number" step="0.1" min="0.1" max="60" value="1.0" class="form-control">
+              <span class="form-hint">How often to analyze a frame for plates (1.0 = every second)</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Cooldown (seconds)</label>
+              <input name="cooldown_seconds" type="number" step="1" min="0" max="3600" value="10" class="form-control">
+              <span class="form-hint">Minimum time between logging the same plate again</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="form-section" style="margin-bottom:16px">
+        <button type="button" class="form-section-header">
+          <span class="icon">💾</span>Recording & Display
+          <span class="form-section-chevron">▼</span>
+        </button>
+        <div class="form-section-body">
+          <div class="form-grid" style="margin-bottom:12px">
+            <label class="toggle-wrap">
+              <input type="checkbox" name="enabled" value="true" checked>
+              <div class="toggle-sw"></div>
+              <div><div class="toggle-text">Enable Camera</div><div class="toggle-desc">Start monitoring immediately after saving</div></div>
+            </label>
+            <label class="toggle-wrap">
+              <input type="checkbox" name="live_view" value="true" checked>
+              <div class="toggle-sw"></div>
+              <div><div class="toggle-text">Show in Live View</div><div class="toggle-desc">Display feed on the Live View page</div></div>
+            </label>
+            <label class="toggle-wrap">
+              <input type="checkbox" name="save_snapshot" value="true" checked>
+              <div class="toggle-sw"></div>
+              <div><div class="toggle-text">Save Snapshots</div><div class="toggle-desc">Save JPEG image when a plate is detected</div></div>
+            </label>
+            <label class="toggle-wrap">
+              <input type="checkbox" name="save_clip" value="true">
+              <div class="toggle-sw"></div>
+              <div><div class="toggle-text">Save Video Clips</div><div class="toggle-desc">Save MP4 clip around detection event</div></div>
+            </label>
+          </div>
+          <div class="form-grid">
+            <div class="form-group">
+              <label class="form-label">Clip Duration (seconds)</label>
+              <input name="clip_seconds" type="number" min="1" max="60" value="5" class="form-control">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Live View Order</label>
+              <input name="live_order" type="number" min="0" value="0" class="form-control">
+              <span class="form-hint">Lower numbers appear first in Live View</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="form-section" style="margin-bottom:24px">
+        <button type="button" class="form-section-header">
+          <span class="icon">🔌</span>ONVIF / PTZ Settings (optional)
+          <span class="form-section-chevron">▼</span>
+        </button>
+        <div class="form-section-body">
+          <div class="alert alert-info" style="margin-bottom:14px">Use ONVIF Discovery to find your camera's XAddr automatically</div>
+          <div class="form-grid">
+            <div class="form-group form-full">
+              <label class="form-label">ONVIF XAddr URL</label>
+              <input name="onvif_xaddr" class="form-control" placeholder="http://192.168.1.100:80/onvif/device_service">
+            </div>
+            <div class="form-group">
+              <label class="form-label">ONVIF Username</label>
+              <input name="onvif_username" class="form-control" placeholder="admin">
+            </div>
+            <div class="form-group">
+              <label class="form-label">ONVIF Password</label>
+              <input name="onvif_password" type="password" class="form-control" placeholder="••••••••">
+            </div>
+            <div class="form-group">
+              <label class="form-label">ONVIF Profile Token</label>
+              <input name="onvif_profile" class="form-control" placeholder="Profile_1 (auto-detected)">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex gap-3 justify-between">
+        <button type="button" class="btn btn-secondary" onclick="document.getElementById('add-camera-modal').style.display='none'">Cancel</button>
+        <button type="submit" class="btn btn-primary btn-lg">💾 Save Camera</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- EDIT CAMERA MODAL -->
+<div id="edit-camera-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:500;align-items:center;justify-content:center;backdrop-filter:blur(8px)">
+  <div style="background:var(--bg-mid);border:1px solid var(--glass-border2);border-radius:var(--r-xl);width:100%;max-width:680px;max-height:90vh;overflow-y:auto;box-shadow:0 24px 80px rgba(0,0,0,0.7)">
+    <div style="padding:20px 24px;border-bottom:1px solid var(--glass-border);display:flex;align-items:center;justify-content:space-between">
+      <h2 style="color:var(--text);display:flex;align-items:center;gap:8px"><span style="color:var(--accent)">✏️</span> Edit Camera</h2>
+      <button class="btn btn-icon btn-secondary" onclick="document.getElementById('edit-camera-modal').style.display='none'">✕</button>
+    </div>
+    <form method="post" id="edit-form" style="padding:24px">
+      <div class="form-section open" style="margin-bottom:16px">
+        <button type="button" class="form-section-header"><span class="icon">📡</span>Basic Configuration<span class="form-section-chevron">▼</span></button>
+        <div class="form-section-body">
+          <div class="form-grid" style="margin-bottom:0">
+            <div class="form-group"><label class="form-label">Camera Name <span class="req">*</span></label><input name="name" id="edit-name" class="form-control" required></div>
+            <div class="form-group"><label class="form-label">Camera Type</label>
+              <select name="type" id="edit-type" class="form-control" onchange="updateSourceHelp(this.value,'edit')">
+                <option value="rtsp">RTSP</option><option value="http_mjpeg">HTTP MJPEG</option>
+                <option value="webcam">Webcam</option><option value="browser">Browser Capture</option>
+              </select></div>
+            <div class="form-group form-full"><label class="form-label">Source</label><input name="source" id="edit-source" class="form-control"><span class="form-hint" id="edit-source-hint"></span></div>
+            <div class="form-group"><label class="form-label">Location</label><input name="location" id="edit-location" class="form-control"></div>
+            <div class="form-group"><label class="form-label">Detector Mode</label>
+              <select name="detector_mode" id="edit-detector_mode" class="form-control">
+                <option value="inherit">Inherit</option><option value="auto">Auto</option>
+                <option value="yolo">YOLO Only</option><option value="contour">Contour Only</option>
+              </select></div>
+          </div>
+        </div>
+      </div>
+      <div class="form-section" style="margin-bottom:16px">
+        <button type="button" class="form-section-header"><span class="icon">⏱️</span>Timing<span class="form-section-chevron">▼</span></button>
+        <div class="form-section-body">
+          <div class="form-grid">
+            <div class="form-group"><label class="form-label">Scan Interval (s)</label><input name="scan_interval" id="edit-scan_interval" type="number" step="0.1" min="0.1" class="form-control"></div>
+            <div class="form-group"><label class="form-label">Cooldown (s)</label><input name="cooldown_seconds" id="edit-cooldown_seconds" type="number" step="1" min="0" class="form-control"></div>
+          </div>
+        </div>
+      </div>
+      <div class="form-section" style="margin-bottom:16px">
+        <button type="button" class="form-section-header"><span class="icon">💾</span>Recording & Display<span class="form-section-chevron">▼</span></button>
+        <div class="form-section-body">
+          <div class="form-grid" style="margin-bottom:12px">
+            <label class="toggle-wrap"><input type="checkbox" name="enabled" id="edit-enabled"><div class="toggle-sw"></div><div><div class="toggle-text">Enable Camera</div></div></label>
+            <label class="toggle-wrap"><input type="checkbox" name="live_view" id="edit-live_view"><div class="toggle-sw"></div><div><div class="toggle-text">Show in Live View</div></div></label>
+            <label class="toggle-wrap"><input type="checkbox" name="save_snapshot" id="edit-save_snapshot"><div class="toggle-sw"></div><div><div class="toggle-text">Save Snapshots</div></div></label>
+            <label class="toggle-wrap"><input type="checkbox" name="save_clip" id="edit-save_clip"><div class="toggle-sw"></div><div><div class="toggle-text">Save Video Clips</div></div></label>
+          </div>
+          <div class="form-grid">
+            <div class="form-group"><label class="form-label">Clip Duration (s)</label><input name="clip_seconds" id="edit-clip_seconds" type="number" min="1" class="form-control"></div>
+            <div class="form-group"><label class="form-label">Live View Order</label><input name="live_order" id="edit-live_order" type="number" min="0" class="form-control"></div>
+          </div>
+        </div>
+      </div>
+      <div class="form-section" style="margin-bottom:24px">
+        <button type="button" class="form-section-header"><span class="icon">🔌</span>ONVIF / PTZ<span class="form-section-chevron">▼</span></button>
+        <div class="form-section-body">
+          <div class="form-grid">
+            <div class="form-group form-full"><label class="form-label">ONVIF XAddr</label><input name="onvif_xaddr" id="edit-onvif_xaddr" class="form-control"></div>
+            <div class="form-group"><label class="form-label">Username</label><input name="onvif_username" id="edit-onvif_username" class="form-control"></div>
+            <div class="form-group"><label class="form-label">Password</label><input name="onvif_password" id="edit-onvif_password" type="password" class="form-control"></div>
+            <div class="form-group"><label class="form-label">Profile Token</label><input name="onvif_profile" id="edit-onvif_profile" class="form-control"></div>
+          </div>
+        </div>
+      </div>
+      <div class="flex gap-3 justify-between">
+        <button type="button" class="btn btn-secondary" onclick="document.getElementById('edit-camera-modal').style.display='none'">Cancel</button>
+        <button type="submit" class="btn btn-primary btn-lg">💾 Save Changes</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+const sourceHints={
+  rtsp:'RTSP URL from Dahua/Hikvision DVR/NVR: rtsp://user:pass@192.168.1.100:554/cam/realmonitor?channel=1&subtype=0',
+  http_mjpeg:'HTTP MJPEG stream URL: http://192.168.1.50:8080/video',
+  webcam:'Camera device index: 0 for first webcam, 1 for second, etc.',
+  browser:'Leave as "browser" — the source is provided by the mobile/browser device'
+};
+const sourcePlaceholders={
+  rtsp:'rtsp://user:pass@192.168.1.100:554/cam/realmonitor?channel=1&subtype=0',
+  http_mjpeg:'http://192.168.1.50:8080/video',
+  webcam:'0',
+  browser:'browser'
+};
+function updateSourceHelp(type,prefix){
+  const hint=document.getElementById(prefix+'-source-hint');
+  const inp=document.getElementById(prefix+'-source-input')||document.getElementById(prefix+'-source');
+  if(hint)hint.textContent=sourceHints[type]||'';
+  if(inp)inp.placeholder=sourcePlaceholders[type]||'';
+}
+
+function openEditModal(id){
+  const tpl=document.getElementById('edit-data-'+id);if(!tpl)return;
+  const fields=['id','name','type','source','location','scan_interval','cooldown_seconds','clip_seconds','live_order','onvif_xaddr','onvif_username','onvif_password','onvif_profile','detector_mode'];
+  fields.forEach(f=>{
+    const inp=tpl.content.querySelector('[name="edit-'+f+'"]');
+    const target=document.getElementById('edit-'+f);
+    if(inp&&target)target.value=inp.value;
+  });
+  ['enabled','live_view','save_snapshot','save_clip'].forEach(f=>{
+    const inp=tpl.content.querySelector('[name="edit-'+f+'"]');
+    const cb=document.getElementById('edit-'+f);
+    if(inp&&cb)cb.checked=inp.value==='1';
+  });
+  const typeEl=document.getElementById('edit-type');
+  if(typeEl)updateSourceHelp(typeEl.value,'edit');
+  const idEl=document.getElementById('edit-id');if(idEl)idEl.value=id;
+  document.getElementById('edit-form').action='/admin/cameras/'+id+'/update';
+  document.getElementById('edit-camera-modal').style.display='flex';
+}
+</script>
+{% endblock %}

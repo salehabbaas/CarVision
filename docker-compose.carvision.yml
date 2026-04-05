@@ -1,0 +1,58 @@
+services:
+  carvision-db:
+    image: postgres:16
+    container_name: carvision-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: carvision
+      POSTGRES_USER: carvision
+      POSTGRES_PASSWORD: carvision
+    ports:
+      - "5434:5432"
+    volumes:
+      - carvision_db_data:/var/lib/postgresql/data
+
+  carvision-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: carvision-backend
+    restart: unless-stopped
+    depends_on:
+      - carvision-db
+    environment:
+      DATABASE_URL: postgresql+psycopg2://carvision:carvision@carvision-db:5432/carvision
+      MEDIA_DIR: /app/datasets/media
+      YOLO_PLATE_MODEL: /app/models/plate.pt
+      LEGACY_FRONTEND_DIR: /app/old/python_frontend
+      API_ADMIN_USER: ${API_ADMIN_USER:-admin}
+      API_ADMIN_PASS: ${API_ADMIN_PASS:-admin}
+      JWT_SECRET: ${JWT_SECRET:-change-this-secret}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-480}
+      API_CORS_ORIGINS: ${API_CORS_ORIGINS:-http://localhost:5173,http://localhost:8081}
+      SSL_CERTFILE: ${SSL_CERTFILE:-}
+      SSL_KEYFILE: ${SSL_KEYFILE:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/app:/app/backend/app
+      - ./datasets/media:/app/datasets/media
+      - ./old:/app/old:ro
+      - ./models:/app/models
+      - ./certs:/certs:ro
+
+  carvision-frontend:
+    build:
+      context: ./frontend/carvision-web
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    container_name: carvision-frontend
+    restart: unless-stopped
+    depends_on:
+      - carvision-backend
+    ports:
+      - "8081:80"
+
+volumes:
+  carvision_db_data:

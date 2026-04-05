@@ -1,0 +1,16 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlalchemy==2.0.32
+psycopg2-binary==2.9.9
+jinja2==3.1.4
+python-multipart==0.0.9
+opencv-python-headless==4.10.0.84
+imutils==0.5.4
+easyocr==1.7.1
+numpy==1.26.4
+python-dotenv==1.0.1
+onvif-zeep==0.2.12
+wsdiscovery==2.0.0
+ultralytics==8.2.79
+itsdangerous==2.2.0
+PyJWT==2.9.0

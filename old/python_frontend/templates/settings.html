@@ -1,0 +1,226 @@
+{% extends "base.html" %}
+{% block title %}Settings — CarVision{% endblock %}
+{% block page_icon %}⚙️{% endblock %}
+{% block page_title %}System Settings{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>System Settings</h1>
+    <p>Global configuration for the CarVision detection engine and interface</p>
+  </div>
+</div>
+
+<form method="post" action="/admin/settings">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+    <div>
+      <div class="card section-gap">
+        <div class="card-header">
+          <h3><span class="icon">🧠</span>Model Overview</h3>
+        </div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:12px">
+          <div class="alert alert-info">
+            <strong>Auto</strong>: Runs YOLO first, then falls back to Contour when YOLO is not confident.
+          </div>
+          <div class="alert alert-info">
+            <strong>YOLO</strong>: Deep learning detector (best accuracy) — requires <code>models/plate.pt</code>.
+          </div>
+          <div class="alert alert-info">
+            <strong>Contour</strong>: Fast traditional OpenCV pipeline — works with no model file.
+          </div>
+          <div class="alert alert-info">
+            <strong>OCR</strong>: EasyOCR reads text from detected regions; language list is configurable.
+          </div>
+        </div>
+      </div>
+
+      <div class="card section-gap">
+        <div class="card-header">
+          <h3><span class="icon">🤖</span>Detection Engine</h3>
+        </div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:18px">
+          <div class="form-group">
+            <label class="form-label">Global Detector Mode</label>
+            <select name="detector_mode" class="form-control">
+              <option value="auto" {% if detector_mode == 'auto' %}selected{% endif %}>Auto — YOLO first, fallback to Contour</option>
+              <option value="yolo" {% if detector_mode == 'yolo' %}selected{% endif %}>YOLO Only — Deep learning model</option>
+              <option value="contour" {% if detector_mode == 'contour' %}selected{% endif %}>Contour Only — Traditional OpenCV</option>
+            </select>
+            <span class="form-hint">Cameras set to "inherit" will use this mode. YOLO requires a trained model file at <code>models/plate.pt</code></span>
+          </div>
+          <div class="alert alert-info">
+            💡 YOLO mode is more accurate but requires placing a <code>plate.pt</code> model file in the <code>models/</code> directory.
+            Contour mode works out-of-the-box with no model file needed.
+          </div>
+        </div>
+      </div>
+
+      <div class="card section-gap">
+        <div class="card-header">
+          <h3><span class="icon">🧪</span>YOLO Model Settings</h3>
+        </div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label class="form-label">Confidence Threshold</label>
+              <input name="yolo_conf" type="number" step="0.01" min="0.01" max="0.99" value="{{ yolo_conf }}" class="form-control">
+              <span class="form-hint">Lower finds more plates but may increase false positives.</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Image Size (imgsz)</label>
+              <input name="yolo_imgsz" type="number" step="32" min="320" max="1280" value="{{ yolo_imgsz }}" class="form-control">
+              <span class="form-hint">Higher improves accuracy but increases CPU/GPU usage.</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">IOU Threshold</label>
+              <input name="yolo_iou" type="number" step="0.05" min="0.05" max="0.95" value="{{ yolo_iou }}" class="form-control">
+              <span class="form-hint">Higher IOU reduces duplicate boxes.</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Max Detections</label>
+              <input name="yolo_max_det" type="number" step="1" min="1" max="50" value="{{ yolo_max_det }}" class="form-control">
+              <span class="form-hint">Max boxes per frame (usually 1–5).</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card section-gap">
+        <div class="card-header">
+          <h3><span class="icon">🎥</span>Live View</h3>
+        </div>
+        <div class="card-body">
+          <div class="form-group">
+            <label class="form-label">Max Live Cameras</label>
+            <input name="max_live_cameras" type="number" min="1" max="32" value="{{ max_live }}" class="form-control">
+            <span class="form-hint">Maximum number of cameras displayed simultaneously in the Live View grid (1–32)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card section-gap">
+        <div class="card-header">
+          <h3><span class="icon">🧰</span>Contour Model Settings</h3>
+        </div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label class="form-label">Canny Low</label>
+              <input name="contour_canny_low" type="number" min="1" max="200" value="{{ contour_canny_low }}" class="form-control">
+              <span class="form-hint">Edge detection low threshold.</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Canny High</label>
+              <input name="contour_canny_high" type="number" min="50" max="400" value="{{ contour_canny_high }}" class="form-control">
+              <span class="form-hint">Edge detection high threshold.</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Bilateral d</label>
+              <input name="contour_bilateral_d" type="number" min="3" max="31" value="{{ contour_bilateral_d }}" class="form-control">
+              <span class="form-hint">Bilateral filter diameter.</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Bilateral Sigma Color</label>
+              <input name="contour_bilateral_sigma_color" type="number" min="1" max="150" value="{{ contour_bilateral_sigma_color }}" class="form-control">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Bilateral Sigma Space</label>
+              <input name="contour_bilateral_sigma_space" type="number" min="1" max="150" value="{{ contour_bilateral_sigma_space }}" class="form-control">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Approx Epsilon</label>
+              <input name="contour_approx_eps" type="number" step="0.001" min="0.005" max="0.1" value="{{ contour_approx_eps }}" class="form-control">
+              <span class="form-hint">Contour simplification factor.</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Padding Ratio</label>
+              <input name="contour_pad_ratio" type="number" step="0.01" min="0.05" max="0.5" value="{{ contour_pad_ratio }}" class="form-control">
+              <span class="form-hint">Extra crop padding around detected plate.</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Padding Min</label>
+              <input name="contour_pad_min" type="number" min="4" max="100" value="{{ contour_pad_min }}" class="form-control">
+              <span class="form-hint">Minimum padding in pixels.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card section-gap">
+        <div class="card-header">
+          <h3><span class="icon">🔤</span>OCR Settings</h3>
+        </div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label class="form-label">OCR Max Width</label>
+              <input name="ocr_max_width" type="number" min="320" max="4000" value="{{ ocr_max_width }}" class="form-control">
+              <span class="form-hint">Resize large images before OCR to save time.</span>
+            </div>
+            <div class="form-group">
+              <label class="form-label">OCR Languages</label>
+              <input name="ocr_langs" type="text" value="{{ ocr_langs }}" class="form-control" placeholder="en,ar">
+              <span class="form-hint">Comma‑separated EasyOCR language codes.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card section-gap">
+        <div class="card-header">
+          <h3><span class="icon">🔐</span>Security Reminders</h3>
+        </div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:12px">
+          <div class="alert alert-warn">
+            ⚠️ Default admin credentials are <code>admin / admin</code>. Set <code>ADMIN_USER</code> and <code>ADMIN_PASS</code> environment variables to change them.
+          </div>
+          <div class="alert alert-warn">
+            ⚠️ Default session secret is <code>"saleh"</code>. Set <code>SESSION_SECRET</code> environment variable for production security.
+          </div>
+          <div class="alert alert-info">
+            💡 Use the Docker Compose file for production deployment with proper environment variables and a PostgreSQL database.
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3><span class="icon">ℹ️</span>System Info</h3>
+        </div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:10px">
+          <div class="camera-meta-item">
+            <div class="camera-meta-key">Detection Backend</div>
+            <div class="camera-meta-value">EasyOCR + OpenCV + YOLO</div>
+          </div>
+          <div class="camera-meta-item">
+            <div class="camera-meta-key">OCR Languages</div>
+            <div class="camera-meta-value">{{ ocr_langs or 'en' }}</div>
+          </div>
+          <div class="camera-meta-item">
+            <div class="camera-meta-key">Frame Preprocessing</div>
+            <div class="camera-meta-value">5 variants (RGB, Gray, BF, Thresh, Upscaled)</div>
+          </div>
+          <div class="camera-meta-item">
+            <div class="camera-meta-key">Protocol Support</div>
+            <div class="camera-meta-value">RTSP, HTTP MJPEG, Webcam, Browser, ONVIF</div>
+          </div>
+          <div class="camera-meta-item">
+            <div class="camera-meta-key">Built By</div>
+            <div class="camera-meta-value" style="color:var(--accent)">SpinelTech</div>
+          </div>
+          <div class="camera-meta-item">
+            <div class="camera-meta-key">Product</div>
+            <div class="camera-meta-value">CarVision</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top:24px;display:flex;gap:12px;justify-content:flex-end">
+    <a href="/admin" class="btn btn-secondary">Cancel</a>
+    <button type="submit" class="btn btn-primary btn-lg">💾 Save Settings</button>
+  </div>
+</form>
+{% endblock %}

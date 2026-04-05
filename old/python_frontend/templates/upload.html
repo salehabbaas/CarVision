@@ -1,0 +1,297 @@
+{% extends "base.html" %}
+{% block title %}Upload & Test — CarVision by SpinelTech{% endblock %}
+{% block page_icon %}⬆️{% endblock %}
+{% block page_title %}Upload & Test Detection{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Upload & Test</h1>
+    <p>Test plate detection on images or video files — results stored in the Detection Log</p>
+  </div>
+</div>
+
+<div class="upload-grid">
+  <div>
+    <div class="card">
+      <div class="card-header">
+        <h3><span class="icon">⬆️</span>Upload File</h3>
+      </div>
+      <div class="card-body">
+        <form method="post" action="/admin/upload" enctype="multipart/form-data" id="upload-form" data-no-loader="true" style="display:flex;flex-direction:column;gap:16px">
+          <div class="drop-zone" id="drop-zone">
+            <input type="file" name="file" accept="image/*,video/*" id="file-input" required>
+            <div class="drop-icon">📂</div>
+            <div class="drop-title" id="drop-title">Drop image or video here</div>
+            <div class="drop-hint">Supports JPG, PNG, MP4, AVI — or click to browse</div>
+          </div>
+          <div class="form-section open">
+            <button type="button" class="form-section-header"><span class="icon">⚙️</span>Video Options<span class="form-section-chevron">▼</span></button>
+            <div class="form-section-body">
+              <div class="form-grid">
+                <div class="form-group">
+                  <label class="form-label">Sample Every (seconds)</label>
+                  <input name="sample_seconds" type="number" step="0.5" min="0.1" max="30" value="1.0" class="form-control">
+                  <span class="form-hint">Analyze one frame every N seconds of video</span>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Max Frames</label>
+                  <input name="max_frames" type="number" min="1" max="1000" value="300" class="form-control">
+                  <span class="form-hint">Stop after this many frames (prevents long processing)</span>
+                </div>
+              </div>
+              <label class="toggle-wrap" style="margin-top:4px">
+                <input type="checkbox" name="show_debug" value="true">
+                <div class="toggle-sw"></div>
+                <div><div class="toggle-text">Show Debug Images</div><div class="toggle-desc">Save and display intermediate preprocessing images</div></div>
+              </label>
+            </div>
+          </div>
+          <div id="upload-progress" class="hidden">
+            <div class="progress-bar">
+              <div class="progress-fill" id="upload-progress-fill"></div>
+            </div>
+            <div class="progress-text" id="upload-progress-text">0%</div>
+          </div>
+          <button type="submit" class="btn btn-primary btn-full btn-lg" id="submit-btn">🔍 Run Detection</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:16px">
+    <div class="card">
+      <div class="card-header">
+        <h3><span class="icon">🧭</span>Live Processing</h3>
+        <span class="badge badge-muted" id="job-status">Idle</span>
+      </div>
+      <div class="card-body">
+        <div class="text-muted" id="processing-current">Waiting for upload…</div>
+        <div class="log-box" id="processing-steps" style="margin-top:10px;max-height:220px">
+          <div class="log-line">No processing steps yet.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3><span class="icon">📋</span>Detection Results</h3>
+        <span class="badge badge-accent" id="result-count">{{ result_items|length if result_items else 0 }} found</span>
+      </div>
+      <div class="card-body" id="result-container">
+        {% if result and result.message %}
+          <div class="alert {% if result_items %}alert-success{% else %}alert-warn{% endif %}" style="margin-bottom:16px">
+            {{ result.message }}
+          </div>
+        {% endif %}
+        {% if result_items %}
+          <div style="display:flex;flex-direction:column;gap:12px">
+            {% for item in result_items %}
+            <div style="background:var(--glass-bg2);border:1px solid {% if item.status == 'allowed' %}var(--allowed-border){% else %}var(--denied-border){% endif %};border-radius:var(--r-md);padding:14px 16px">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+                <span class="plate-tag">{{ item.plate_text }}</span>
+                <span class="badge {% if item.status == 'allowed' %}badge-allowed{% else %}badge-denied{% endif %}">{{ item.status }}</span>
+              </div>
+              {% set conf = item.confidence or 0 %}
+              <div class="conf-wrap">
+                <div class="conf-bar">
+                  <div class="conf-fill {% if conf >= 0.75 %}high{% elif conf >= 0.45 %}mid{% else %}low{% endif %}"
+                       style="width:{{ (conf*100)|round|int }}%"></div>
+                </div>
+                <span>Confidence: {{ '%.0f'|format(conf*100) }}%</span>
+              </div>
+              {% if item.image_path %}
+              <button class="btn btn-sm btn-secondary" style="margin-top:10px" onclick="openLightbox('/media/{{ item.image_path }}')">🖼️ View Snapshot</button>
+              {% endif %}
+            </div>
+            {% endfor %}
+          </div>
+        {% elif not result %}
+          <div style="text-align:center;padding:48px">
+            <div style="font-size:48px;margin-bottom:14px">🔍</div>
+            <h3>Detection Results</h3>
+            <p style="margin-top:8px">Upload a file to see detection results here</p>
+          </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+const dropZone=document.getElementById('drop-zone');
+const fileInput=document.getElementById('file-input');
+const dropTitle=document.getElementById('drop-title');
+const submitBtn=document.getElementById('submit-btn');
+const uploadForm=document.getElementById('upload-form');
+const progressWrap=document.getElementById('upload-progress');
+const progressFill=document.getElementById('upload-progress-fill');
+const progressText=document.getElementById('upload-progress-text');
+const processingCurrent=document.getElementById('processing-current');
+const processingSteps=document.getElementById('processing-steps');
+const jobStatus=document.getElementById('job-status');
+const resultContainer=document.getElementById('result-container');
+const resultCount=document.getElementById('result-count');
+let uploadPollTimer=null;
+
+const initialResult = {{ (result or {'message':'','items':[],'debug':None})|tojson }};
+
+dropZone?.addEventListener('dragover',e=>{e.preventDefault();dropZone.classList.add('drag-over');});
+dropZone?.addEventListener('dragleave',()=>dropZone.classList.remove('drag-over'));
+dropZone?.addEventListener('drop',e=>{e.preventDefault();dropZone.classList.remove('drag-over');if(e.dataTransfer.files[0]){fileInput.files=e.dataTransfer.files;dropTitle.textContent='📄 '+e.dataTransfer.files[0].name;}});
+fileInput?.addEventListener('change',()=>{if(fileInput.files[0])dropTitle.textContent='📄 '+fileInput.files[0].name;});
+
+function escapeHtml(v){
+  return String(v||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');
+}
+
+function setJobBadge(status){
+  if(!jobStatus) return;
+  jobStatus.textContent=status||'Idle';
+  jobStatus.classList.remove('badge-muted','badge-accent','badge-allowed','badge-denied','badge-warn');
+  if(status==='running') jobStatus.classList.add('badge-accent');
+  else if(status==='complete') jobStatus.classList.add('badge-allowed');
+  else if(status==='failed') jobStatus.classList.add('badge-denied');
+  else if(status==='queued') jobStatus.classList.add('badge-warn');
+  else jobStatus.classList.add('badge-muted');
+}
+
+function renderSteps(steps){
+  if(!processingSteps) return;
+  if(!steps || !steps.length){
+    processingSteps.innerHTML='<div class="log-line">No processing steps yet.</div>';
+    return;
+  }
+  processingSteps.innerHTML=steps.map(s=>`<div class="log-line">${escapeHtml(s)}</div>`).join('');
+  processingSteps.scrollTop=processingSteps.scrollHeight;
+}
+
+function renderResult(result){
+  if(!resultContainer) return;
+  const items=(result && Array.isArray(result.items)) ? result.items : [];
+  const debug=(result && Array.isArray(result.debug)) ? result.debug : [];
+  if(resultCount) resultCount.textContent=`${items.length} found`;
+
+  let html='';
+  const msg=escapeHtml(result?.message || '');
+  if(msg){
+    html+=`<div class="alert ${items.length?'alert-success':'alert-warn'}" style="margin-bottom:16px">${msg}</div>`;
+  }
+  if(!items.length){
+    html+=`<div style="text-align:center;padding:32px"><div style="font-size:40px;margin-bottom:10px">🔍</div><p>No plates detected in this file</p></div>`;
+    resultContainer.innerHTML=html;
+    return;
+  }
+  html+='<div style="display:flex;flex-direction:column;gap:12px">';
+  items.forEach((item,idx)=>{
+    const conf=Math.max(0, Math.min(100, Math.round((Number(item.confidence)||0)*100)));
+    const status=item.status==='allowed'?'allowed':'denied';
+    const debugItem=debug[idx]||{};
+    html+=`<div style="background:var(--glass-bg2);border:1px solid ${status==='allowed'?'var(--allowed-border)':'var(--denied-border)'};border-radius:var(--r-md);padding:14px 16px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <span class="plate-tag">${escapeHtml(item.plate_text||'UNKNOWN')}</span>
+        <span class="badge ${status==='allowed'?'badge-allowed':'badge-denied'}">${status}</span>
+      </div>
+      <div class="conf-wrap">
+        <div class="conf-bar"><div class="conf-fill ${conf>=75?'high':(conf>=45?'mid':'low')}" style="width:${conf}%"></div></div>
+        <span>Confidence: ${conf}%</span>
+      </div>
+      ${item.image_path?`<button class="btn btn-sm btn-secondary" style="margin-top:10px" onclick="openLightbox('/media/${encodeURI(item.image_path)}')">🖼️ View Snapshot</button>`:''}
+      ${(debugItem.debug_color||debugItem.debug_bw||debugItem.debug_gray||debugItem.debug_edged||debugItem.debug_mask)?`
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
+        ${debugItem.debug_color?`<button class="btn btn-sm btn-secondary" onclick="openLightbox('/media/${encodeURI(debugItem.debug_color)}')">Color</button>`:''}
+        ${debugItem.debug_bw?`<button class="btn btn-sm btn-secondary" onclick="openLightbox('/media/${encodeURI(debugItem.debug_bw)}')">Threshold</button>`:''}
+        ${debugItem.debug_gray?`<button class="btn btn-sm btn-secondary" onclick="openLightbox('/media/${encodeURI(debugItem.debug_gray)}')">Gray</button>`:''}
+        ${debugItem.debug_edged?`<button class="btn btn-sm btn-secondary" onclick="openLightbox('/media/${encodeURI(debugItem.debug_edged)}')">Edges</button>`:''}
+        ${debugItem.debug_mask?`<button class="btn btn-sm btn-secondary" onclick="openLightbox('/media/${encodeURI(debugItem.debug_mask)}')">Mask</button>`:''}
+      </div>`:''}
+    </div>`;
+  });
+  html+='</div>';
+  resultContainer.innerHTML=html;
+}
+
+function setSubmittingUI(isBusy){
+  if(submitBtn){
+    submitBtn.disabled=!!isBusy;
+    submitBtn.innerHTML=isBusy
+      ? '<span class="spinner" style="width:14px;height:14px;border-width:2px"></span><span class="loader-dots sm" aria-hidden="true"><span></span><span></span><span></span></span><span class="sr-only">Uploading</span>'
+      : '🔍 Run Detection';
+  }
+}
+
+async function pollUploadJob(jobId){
+  try{
+    const res=await fetch(`/admin/api/upload/status/${jobId}`);
+    if(!res.ok) throw new Error('Status request failed');
+    const data=await res.json();
+    const job=data.job||{};
+    setJobBadge(job.status||'idle');
+    if(processingCurrent) processingCurrent.textContent=job.message||'Running';
+    renderSteps(job.steps||[]);
+    if(progressWrap) progressWrap.classList.remove('hidden');
+    if(progressFill) progressFill.style.width=`${Number(job.progress||0)}%`;
+    if(progressText) progressText.textContent=`${Number(job.progress||0)}%`;
+
+    if(job.status==='complete'){
+      clearInterval(uploadPollTimer);uploadPollTimer=null;
+      setSubmittingUI(false);
+      renderResult(job.result||{message:'Complete',items:[],debug:null});
+      if(window.showToast) showToast('Upload complete', job.message||'Done', 'info');
+    }else if(job.status==='failed'){
+      clearInterval(uploadPollTimer);uploadPollTimer=null;
+      setSubmittingUI(false);
+      if(window.showToast) showToast('Upload failed', job.error||job.message||'Failed', 'warn');
+    }
+  }catch(err){
+    clearInterval(uploadPollTimer);uploadPollTimer=null;
+    setSubmittingUI(false);
+    setJobBadge('failed');
+    if(processingCurrent) processingCurrent.textContent='Failed to poll job status.';
+    if(window.showToast) showToast('Upload failed','Could not fetch job status','warn');
+  }
+}
+
+uploadForm?.addEventListener('submit',async (e)=>{
+  if(!uploadForm) return;
+  if(!fileInput?.files?.length){
+    e.preventDefault();
+    if(window.showToast)showToast('No file selected','Choose an image or video first','warn');
+    return;
+  }
+  e.preventDefault();
+  setSubmittingUI(true);
+  setJobBadge('queued');
+  if(processingCurrent) processingCurrent.textContent='Uploading file…';
+  renderSteps(['Starting upload…']);
+  if(progressWrap)progressWrap.classList.remove('hidden');
+  if(progressFill)progressFill.style.width='5%';
+  if(progressText)progressText.textContent='5%';
+  if(uploadPollTimer){clearInterval(uploadPollTimer);uploadPollTimer=null;}
+  try{
+    const formData=new FormData(uploadForm);
+    const startRes=await fetch('/admin/api/upload/start',{method:'POST',body:formData});
+    if(!startRes.ok){
+      const err=await startRes.json().catch(()=>({error:'Failed to start upload job'}));
+      throw new Error(err.error||'Failed to start upload job');
+    }
+    const data=await startRes.json();
+    const jobId=data.job_id;
+    if(!jobId) throw new Error('No job id returned');
+    setJobBadge('running');
+    if(processingCurrent) processingCurrent.textContent='Upload accepted. Processing started.';
+    uploadPollTimer=setInterval(()=>pollUploadJob(jobId),900);
+    pollUploadJob(jobId);
+  }catch(err){
+    setSubmittingUI(false);
+    setJobBadge('failed');
+    if(processingCurrent) processingCurrent.textContent=err?.message||'Upload failed';
+    if(window.showToast)showToast('Upload failed',err?.message||'Upload failed','warn');
+  }
+});
+
+if(initialResult && (initialResult.message || (initialResult.items && initialResult.items.length))){
+  renderResult(initialResult);
+}
+</script>
+{% endblock %}

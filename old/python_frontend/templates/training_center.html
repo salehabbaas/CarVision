@@ -1,0 +1,304 @@
+{% extends "base.html" %}
+{% block title %}Training Center — CarVision by SpinelTech{% endblock %}
+{% block page_icon %}🧭{% endblock %}
+{% block page_title %}Training Center{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Training Center</h1>
+    <p>Monitor training progress, review recent steps, and control training parameters.</p>
+  </div>
+  <div class="page-actions">
+    <span class="badge badge-muted" id="training-status-pill">Status: {{ training_status.status }}</span>
+    <a class="btn btn-secondary" href="/admin/training">← Training Data</a>
+    <button class="btn btn-secondary" type="button" id="export-yolo">⬇️ Export YOLO</button>
+    <button class="btn btn-primary" type="button" id="start-training">🚀 Start Training</button>
+  </div>
+</div>
+
+{% if request.query_params.get('saved') == '1' %}
+<div class="alert alert-success">Training settings saved.</div>
+{% endif %}
+
+<div class="grid-2">
+  <div class="card">
+    <div class="card-header">
+      <h3><span class="icon">🧪</span>Training Status</h3>
+    </div>
+    <div class="card-body">
+      <div class="training-status-block">
+        <div class="training-visual">
+          <div class="training-spinner idle" id="tc-spinner"></div>
+          <div class="training-phases">
+            <span class="training-phase-dot" id="tc-phase-queued" title="Queued"></span>
+            <span class="training-phase-dot" id="tc-phase-running" title="Running"></span>
+            <span class="training-phase-dot" id="tc-phase-complete" title="Complete"></span>
+          </div>
+        </div>
+        <div class="badge badge-muted" id="training-status-badge">Status: {{ training_status.status }}</div>
+        <div class="text-muted" id="training-status-msg">{{ training_status.message }}</div>
+        <div class="training-progress">
+          <div class="training-progress-fill" id="tc-progress-fill"></div>
+        </div>
+        <div class="training-progress-label">
+          <span id="tc-progress-pct">0%</span>
+          <span id="tc-progress-meta">Waiting</span>
+        </div>
+      </div>
+      <div class="kv-grid">
+        <div class="kv-item">
+          <div class="kv-label">Started</div>
+          <div class="kv-value" id="training-started">{{ training_status.started_at or '—' }}</div>
+        </div>
+        <div class="kv-item">
+          <div class="kv-label">Last Update</div>
+          <div class="kv-value" id="training-updated">{{ training_status.updated_at or '—' }}</div>
+        </div>
+        <div class="kv-item">
+          <div class="kv-label">Last Run Dir</div>
+          <div class="kv-value" id="training-run-dir">{{ training_status.last_run_dir or run_root }}</div>
+        </div>
+        <div class="kv-item">
+          <div class="kv-label">Model Output</div>
+          <div class="kv-value" id="training-model-path">{{ training_status.last_model_path or 'models/plate.pt' }}</div>
+        </div>
+        <div class="kv-item">
+          <div class="kv-label">Dataset Root</div>
+          <div class="kv-value">{{ dataset_root }}</div>
+        </div>
+        <div class="kv-item">
+          <div class="kv-label">Runs Root</div>
+          <div class="kv-value">{{ run_root }}</div>
+        </div>
+      </div>
+      <div class="log-section">
+        <div class="log-title">Recent Steps</div>
+        <div class="log-box" id="training-log">
+          {% if training_status.log %}
+            {% for entry in training_status.log|reverse %}
+            <div class="log-line">{{ entry }}</div>
+            {% endfor %}
+          {% else %}
+            <div class="log-line">No training activity yet.</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-header">
+      <h3><span class="icon">⚙️</span>Training Parameters</h3>
+    </div>
+    <div class="card-body">
+      <form method="post" action="/admin/training/settings" class="stack">
+        <label class="form-label">Base Model</label>
+        <input class="form-control" name="train_model" value="{{ settings.train_model }}" placeholder="yolov8n.pt">
+        <div class="form-hint">Ultralytics model checkpoint used to start training.</div>
+
+        <label class="form-label">Epochs</label>
+        <input class="form-control" type="number" min="1" name="train_epochs" value="{{ settings.train_epochs }}">
+        <div class="form-hint">More epochs can improve accuracy but take longer.</div>
+
+        <label class="form-label">Image Size (imgsz)</label>
+        <input class="form-control" type="number" min="160" name="train_imgsz" value="{{ settings.train_imgsz }}">
+        <div class="form-hint">Training resize dimension. Higher values increase detail and compute.</div>
+
+        <label class="form-label">Batch</label>
+        <input class="form-control" type="number" name="train_batch" value="{{ settings.train_batch }}">
+        <div class="form-hint">Use -1 for auto batch size selection.</div>
+
+        <label class="form-label">Device</label>
+        <input class="form-control" name="train_device" value="{{ settings.train_device }}" placeholder="auto">
+        <div class="form-hint">Use auto, cpu, or a CUDA index like 0 if available.</div>
+
+        <label class="form-label">Early Stop Patience</label>
+        <input class="form-control" type="number" min="1" name="train_patience" value="{{ settings.train_patience }}">
+        <div class="form-hint">Stop early if validation does not improve for N epochs.</div>
+
+        <div class="divider"></div>
+        <h4 style="margin:0">Augmentation</h4>
+        <div class="form-hint">These help model generalize across lighting, angle, and scale so it does not overfit one image.</div>
+
+        <label class="form-label">HSV H</label>
+        <input class="form-control" type="number" step="0.001" min="0" max="1" name="train_hsv_h" value="{{ settings.train_hsv_h }}">
+        <label class="form-label">HSV S</label>
+        <input class="form-control" type="number" step="0.01" min="0" max="1" name="train_hsv_s" value="{{ settings.train_hsv_s }}">
+        <label class="form-label">HSV V</label>
+        <input class="form-control" type="number" step="0.01" min="0" max="1" name="train_hsv_v" value="{{ settings.train_hsv_v }}">
+        <label class="form-label">Degrees</label>
+        <input class="form-control" type="number" step="0.1" min="0" max="30" name="train_degrees" value="{{ settings.train_degrees }}">
+        <label class="form-label">Translate</label>
+        <input class="form-control" type="number" step="0.01" min="0" max="0.7" name="train_translate" value="{{ settings.train_translate }}">
+        <label class="form-label">Scale</label>
+        <input class="form-control" type="number" step="0.01" min="0" max="1" name="train_scale" value="{{ settings.train_scale }}">
+        <label class="form-label">Shear</label>
+        <input class="form-control" type="number" step="0.1" min="0" max="20" name="train_shear" value="{{ settings.train_shear }}">
+        <label class="form-label">Perspective</label>
+        <input class="form-control" type="number" step="0.0001" min="0" max="0.01" name="train_perspective" value="{{ settings.train_perspective }}">
+        <label class="form-label">Flip LR</label>
+        <input class="form-control" type="number" step="0.01" min="0" max="1" name="train_fliplr" value="{{ settings.train_fliplr }}">
+        <label class="form-label">Mosaic</label>
+        <input class="form-control" type="number" step="0.01" min="0" max="1" name="train_mosaic" value="{{ settings.train_mosaic }}">
+        <label class="form-label">Mixup</label>
+        <input class="form-control" type="number" step="0.01" min="0" max="1" name="train_mixup" value="{{ settings.train_mixup }}">
+
+        <button class="btn btn-primary" type="submit">Save Settings</button>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+const startBtn=document.getElementById('start-training');
+const statusPill=document.getElementById('training-status-pill');
+const statusBadge=document.getElementById('training-status-badge');
+const statusMsg=document.getElementById('training-status-msg');
+const statusStarted=document.getElementById('training-started');
+const statusUpdated=document.getElementById('training-updated');
+const statusRunDir=document.getElementById('training-run-dir');
+const statusModel=document.getElementById('training-model-path');
+const logBox=document.getElementById('training-log');
+const tcSpinner=document.getElementById('tc-spinner');
+const tcProgressFill=document.getElementById('tc-progress-fill');
+const tcProgressPct=document.getElementById('tc-progress-pct');
+const tcProgressMeta=document.getElementById('tc-progress-meta');
+const tcPhaseQueued=document.getElementById('tc-phase-queued');
+const tcPhaseRunning=document.getElementById('tc-phase-running');
+const tcPhaseComplete=document.getElementById('tc-phase-complete');
+
+function applyStatusStyle(el,status){
+  if(!el) return;
+  el.classList.remove('badge-muted','badge-accent','badge-allowed','badge-denied','badge-warn');
+  if(status === 'running') el.classList.add('badge-accent');
+  else if(status === 'complete') el.classList.add('badge-allowed');
+  else if(status === 'failed') el.classList.add('badge-denied');
+  else if(status === 'queued') el.classList.add('badge-warn');
+  else el.classList.add('badge-muted');
+}
+
+function inferTrainingProgress(data){
+  if(!data) return 0;
+  const status=(data.status||'idle').toLowerCase();
+  if(status === 'idle') return 0;
+  if(status === 'queued') return 12;
+  if(status === 'complete') return 100;
+  if(status === 'failed') return 100;
+  const msg=(data.message||'').toLowerCase();
+  let pct = 24;
+  if(msg.includes('launch')) pct = 28;
+  if(msg.includes('config')) pct = 36;
+  const logCount = Array.isArray(data.log) ? data.log.length : 0;
+  if(logCount > 0){
+    pct = Math.max(pct, Math.min(92, 32 + logCount * 7));
+  }
+  const frac = msg.match(/(\d+)\s*\/\s*(\d+)/);
+  if(frac){
+    const cur = parseInt(frac[1],10);
+    const total = parseInt(frac[2],10);
+    if(total > 0) pct = Math.max(pct, Math.min(95, Math.round((cur/total)*85) + 10));
+  }
+  const ep = msg.match(/epoch\D+(\d+)/);
+  if(ep){
+    const epoch = parseInt(ep[1],10);
+    if(epoch > 0) pct = Math.max(pct, Math.min(95, 15 + epoch));
+  }
+  return pct;
+}
+
+function setPhaseState(status){
+  [tcPhaseQueued,tcPhaseRunning,tcPhaseComplete].forEach(el=>{
+    if(!el) return;
+    el.classList.remove('active','done');
+  });
+  if(status === 'queued'){
+    tcPhaseQueued?.classList.add('active');
+  }else if(status === 'running'){
+    tcPhaseQueued?.classList.add('done');
+    tcPhaseRunning?.classList.add('active');
+  }else if(status === 'complete'){
+    tcPhaseQueued?.classList.add('done');
+    tcPhaseRunning?.classList.add('done');
+    tcPhaseComplete?.classList.add('done');
+  }else if(status === 'failed'){
+    tcPhaseQueued?.classList.add('done');
+    tcPhaseRunning?.classList.add('done');
+    tcPhaseComplete?.classList.add('active');
+  }
+}
+
+async function refreshStatus(){
+  try{
+    const res=await fetch('/admin/api/training_status');
+    if(!res.ok) return;
+    const data=await res.json();
+    if(statusPill) statusPill.textContent=`Status: ${data.status}`;
+    if(statusBadge) statusBadge.textContent=`Status: ${data.status}`;
+    if(statusMsg) statusMsg.textContent=data.message||'';
+    applyStatusStyle(statusPill,data.status||'idle');
+    applyStatusStyle(statusBadge,data.status||'idle');
+    if(statusStarted) statusStarted.textContent=data.started_at||'—';
+    if(statusUpdated) statusUpdated.textContent=data.updated_at||'—';
+    if(statusRunDir) statusRunDir.textContent=data.last_run_dir||statusRunDir.textContent;
+    if(statusModel) statusModel.textContent=data.last_model_path||statusModel.textContent;
+    const pct=inferTrainingProgress(data);
+    if(tcProgressFill){
+      tcProgressFill.style.width=`${pct}%`;
+      tcProgressFill.classList.toggle('running', data.status === 'running');
+    }
+    if(tcProgressPct) tcProgressPct.textContent=`${pct}%`;
+    if(tcProgressMeta) tcProgressMeta.textContent=data.updated_at ? `Updated ${data.updated_at}` : (data.status||'idle');
+    if(tcSpinner){
+      tcSpinner.classList.toggle('idle', !(data.status === 'running' || data.status === 'queued'));
+    }
+    setPhaseState(data.status||'idle');
+    if(logBox && Array.isArray(data.log)){
+      logBox.innerHTML='';
+      const list=[...data.log].reverse();
+      if(!list.length){
+        logBox.innerHTML='<div class="log-line">No training activity yet.</div>';
+      }else{
+        list.forEach(line=>{
+          const div=document.createElement('div');
+          div.className='log-line';
+          div.textContent=line;
+          logBox.appendChild(div);
+        });
+      }
+    }
+  }catch(err){
+    console.error(err);
+  }
+}
+
+startBtn?.addEventListener('click',async ()=>{
+  if(window.showLoader) showLoader('Starting training…');
+  const res=await fetch('/admin/training/train',{method:'POST'});
+  if(window.hideLoader) hideLoader();
+  if(!res.ok){
+    const data=await res.json().catch(()=>({error:'Failed'}));
+    alert(data.error||'Failed to start training');
+    return;
+  }
+  refreshStatus();
+});
+
+const exportBtn=document.getElementById('export-yolo');
+exportBtn?.addEventListener('click',async ()=>{
+  if(window.showLoader) showLoader('Exporting YOLO dataset…');
+  const res=await fetch('/admin/export/yolo');
+  if(window.hideLoader) hideLoader();
+  if(!res.ok){
+    const data=await res.json().catch(()=>({error:'Export failed'}));
+    alert(data.error||'Export failed');
+    return;
+  }
+  const data=await res.json();
+  const path=data.counts?.dataset_root || 'training_yolo';
+  alert(`YOLO export complete. Output: ${path}`);
+});
+
+setInterval(refreshStatus, 4000);
+refreshStatus();
+</script>
+{% endblock %}

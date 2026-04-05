@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+.pytest_cache/
+
+# Environment
+.env
+.env.*
+!.env.carvision.example
+
+# Frontend
+frontend/carvision-web/node_modules/
+frontend/carvision-web/dist/
+
+# Runtime data
+datasets/media/
+*.db
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

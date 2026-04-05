@@ -1,0 +1,594 @@
+import { useEffect, useMemo, useState } from 'react';
+import { motion } from 'framer-motion';
+import { CheckCircle2, MessageSquareMore, RefreshCw, Search, Wrench, Trash2 } from 'lucide-react';
+import { request, mediaPath } from '../lib/api';
+import { useAuth } from '../context/AuthContext';
+import { Link } from 'react-router-dom';
+
+function badgeClass(status) {
+  if (status === 'allowed') return 'ok';
+  if (status === 'denied') return 'bad';
+  return 'muted';
+}
+
+function feedbackClass(row) {
+  if (row?.sample?.ignored) return 'muted';
+  if (row?.sample?.annotated) return 'ok';
+  return 'bad';
+}
+
+function feedbackLabel(row) {
+  if (row?.sample?.ignored) return 'Ignored';
+  if (row?.sample?.annotated) return 'Annotated';
+  return 'Pending';
+}
+
+export default function DetectionsPage() {
+  const { token } = useAuth();
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [q, setQ] = useState('');
+  const [status, setStatus] = useState('');
+  const [feedback, setFeedback] = useState('');
+  const [trained, setTrained] = useState('');
+  const [selected, setSelected] = useState({});
+  const [toast, setToast] = useState('');
+  const [busyDebug, setBusyDebug] = useState({});
+  const [busyReprocess, setBusyReprocess] = useState({});
+  const [busyDelete, setBusyDelete] = useState({});
+  const [bulkReprocessBusy, setBulkReprocessBusy] = useState(false);
+  const [bulkDeleteBusy, setBulkDeleteBusy] = useState(false);
+  const [debugPreview, setDebugPreview] = useState({ open: false, steps: [], index: 0, title: '' });
+
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkMode, setBulkMode] = useState('correct');
+  const [bulkExpected, setBulkExpected] = useState('');
+  const [bulkNotes, setBulkNotes] = useState('');
+
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedbackRow, setFeedbackRow] = useState(null);
+  const [feedbackMode, setFeedbackMode] = useState('correct');
+  const [feedbackExpected, setFeedbackExpected] = useState('');
+  const [feedbackNotes, setFeedbackNotes] = useState('');
+  const [createdSampleId, setCreatedSampleId] = useState(null);
+
+  async function load() {
+    setLoading(true);
+    setError('');
+    try {
+      const params = new URLSearchParams({ limit: '250' });
+      if (q) params.set('q', q);
+      if (status) params.set('status', status);
+      if (feedback) params.set('feedback', feedback);
+      if (trained) params.set('trained', trained);
+      const res = await request(`/api/v1/detections?${params.toString()}`, { token });
+      setItems(res.items || []);
+    } catch (err) {
+      setError(err.message || 'Failed to load detections');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, feedback, trained]);
+
+  const visibleIds = useMemo(() => items.map((x) => x.id), [items]);
+  const selectedIds = useMemo(
+    () => Object.keys(selected).filter((id) => selected[id]).map((id) => Number(id)),
+    [selected]
+  );
+  const targetIds = selectedIds.length ? selectedIds : visibleIds;
+
+  function toggleAll(v) {
+    const next = { ...selected };
+    visibleIds.forEach((id) => {
+      next[id] = v;
+    });
+    setSelected(next);
+  }
+
+  async function bulkReprocess() {
+    if (!targetIds.length) return;
+    if (!window.confirm(`Reprocess ${targetIds.length} detection(s)?`)) return;
+    setBulkReprocessBusy(true);
+    try {
+      const res = await request('/api/v1/detections/bulk/reprocess', {
+        token,
+        method: 'POST',
+        body: { detection_ids: targetIds },
+      });
+      setToast(`Reprocessed ${res.processed} events${res.failed ? `, failed ${res.failed}` : ''}.`);
+      await load();
+    } catch (err) {
+      setError(err.message || 'Bulk reprocess failed');
+    } finally {
+      setBulkReprocessBusy(false);
+    }
+  }
+
+  async function reprocessOne(id) {
+    setBusyReprocess((prev) => ({ ...prev, [id]: true }));
+    try {
+      await request(`/api/v1/detections/${id}/reprocess`, {
+        token,
+        method: 'POST',
+      });
+      setToast(`Detection #${id} reprocessed.`);
+      await load();
+    } catch (err) {
+      setError(err.message || 'Reprocess failed');
+    } finally {
+      setBusyReprocess((prev) => ({ ...prev, [id]: false }));
+    }
+  }
+
+  async function regenerateDebug(id) {
+    setBusyDebug((prev) => ({ ...prev, [id]: true }));
+    try {
+      await request(`/api/v1/detections/${id}/debug/regenerate`, {
+        token,
+        method: 'POST',
+      });
+      setToast(`Debug steps regenerated for #${id}.`);
+      await load();
+    } catch (err) {
+      setError(err.message || 'Debug regeneration failed');
+    } finally {
+      setBusyDebug((prev) => ({ ...prev, [id]: false }));
+    }
+  }
+
+  async function deleteOne(id) {
+    if (!window.confirm(`Delete detection #${id}?`)) return;
+    setBusyDelete((prev) => ({ ...prev, [id]: true }));
+    try {
+      await request(`/api/v1/detections/${id}`, {
+        token,
+        method: 'DELETE',
+      });
+      setToast(`Detection #${id} deleted.`);
+      await load();
+    } catch (err) {
+      setError(err.message || 'Delete failed');
+    } finally {
+      setBusyDelete((prev) => ({ ...prev, [id]: false }));
+    }
+  }
+
+  async function bulkDelete() {
+    if (!targetIds.length) return;
+    if (!window.confirm(`Delete ${targetIds.length} detection(s)?`)) return;
+    setBulkDeleteBusy(true);
+    try {
+      const res = await request('/api/v1/detections/bulk/delete', {
+        token,
+        method: 'POST',
+        body: { detection_ids: targetIds },
+      });
+      setToast(`Deleted ${res.deleted} events${res.failed ? `, failed ${res.failed}` : ''}.`);
+      setSelected({});
+      await load();
+    } catch (err) {
+      setError(err.message || 'Bulk delete failed');
+    } finally {
+      setBulkDeleteBusy(false);
+    }
+  }
+
+  async function saveBulkFeedback(e) {
+    e.preventDefault();
+    if (!targetIds.length) return;
+    try {
+      const res = await request('/api/v1/detections/bulk/feedback', {
+        token,
+        method: 'POST',
+        body: {
+          detection_ids: targetIds,
+          mode: bulkMode,
+          expected_plate: bulkMode === 'corrected' ? bulkExpected : null,
+          notes: bulkNotes,
+        },
+      });
+      setToast(`Feedback saved for ${res.processed} events.`);
+      setBulkOpen(false);
+      setBulkNotes('');
+      setBulkExpected('');
+      await load();
+    } catch (err) {
+      setError(err.message || 'Bulk feedback failed');
+    }
+  }
+
+  function openFeedback(row) {
+    setFeedbackRow(row);
+    setFeedbackMode(row.feedback_status || 'correct');
+    setFeedbackExpected(row.plate_text || '');
+    setFeedbackNotes(row.feedback_note || '');
+    setCreatedSampleId(null);
+    setFeedbackOpen(true);
+  }
+
+  async function saveFeedback(e) {
+    e.preventDefault();
+    if (!feedbackRow?.id) return;
+    try {
+      const res = await request(`/api/v1/detections/${feedbackRow.id}/feedback`, {
+        token,
+        method: 'POST',
+        body: {
+          mode: feedbackMode,
+          expected_plate: feedbackMode === 'corrected' ? feedbackExpected : null,
+          notes: feedbackNotes || null,
+        },
+      });
+      setCreatedSampleId(res.sample_id || null);
+      setToast(`Feedback saved for detection #${feedbackRow.id}.`);
+      await load();
+    } catch (err) {
+      setError(err.message || 'Feedback save failed');
+    }
+  }
+
+  function openDebugPreview(row, startIndex = 0) {
+    const steps = row?.debug_steps || [];
+    if (!steps.length) return;
+    setDebugPreview({
+      open: true,
+      steps,
+      index: Math.max(0, Math.min(startIndex, steps.length - 1)),
+      title: `Detection #${row.id}`,
+    });
+  }
+
+  return (
+    <div className="stack">
+      {error ? <div className="alert error">{error}</div> : null}
+      {toast ? <div className="alert success">{toast}</div> : null}
+
+      <div className="panel glass toolbar">
+        <div className="search-wrap">
+          <Search size={16} />
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search plate/camera/location"
+          />
+        </div>
+        <select value={status} onChange={(e) => setStatus(e.target.value)}>
+          <option value="">All status</option>
+          <option value="allowed">Allowed</option>
+          <option value="denied">Denied</option>
+        </select>
+        <select value={feedback} onChange={(e) => setFeedback(e.target.value)}>
+          <option value="">All feedback</option>
+          <option value="annotated">Annotated</option>
+          <option value="pending">Pending</option>
+          <option value="ignored">Ignored</option>
+        </select>
+        <select value={trained} onChange={(e) => setTrained(e.target.value)}>
+          <option value="">All training</option>
+          <option value="trained">Trained</option>
+          <option value="not_trained">Not trained</option>
+        </select>
+        <button className="btn" onClick={load}>Filter</button>
+      </div>
+
+      <div className="panel glass">
+        <div className="panel-head">
+          <h3>Detection Events</h3>
+          <div className="row">
+            <span className="tiny">
+              Selected: {selectedIds.length} • Filtered: {visibleIds.length}
+            </span>
+            <button className="btn" onClick={() => setBulkOpen(true)} disabled={!targetIds.length}>
+              <CheckCircle2 size={15} /> Bulk Feedback
+            </button>
+            <button className="btn" onClick={bulkReprocess} disabled={!targetIds.length || bulkReprocessBusy}>
+              <RefreshCw size={15} className={bulkReprocessBusy ? 'spin' : ''} />
+              {bulkReprocessBusy ? 'Reprocessing...' : 'Bulk Reprocess'}
+            </button>
+            <button className="btn ghost" onClick={bulkDelete} disabled={!targetIds.length || bulkDeleteBusy}>
+              <Trash2 size={15} className={bulkDeleteBusy ? 'spin' : ''} />
+              {bulkDeleteBusy ? 'Deleting...' : 'Bulk Delete'}
+            </button>
+          </div>
+        </div>
+
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th><input type="checkbox" onChange={(e) => toggleAll(e.target.checked)} /></th>
+                <th>ID</th>
+                <th>Snapshot</th>
+                <th>Time</th>
+                <th>Plate</th>
+                <th>Status</th>
+                <th>Conf</th>
+                <th>Camera</th>
+                <th>Debug</th>
+                <th>Feedback</th>
+                <th>Train</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((row) => (
+                <motion.tr
+                  key={row.id}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  onClick={(e) => {
+                    const interactive = e.target.closest('button,a,input,textarea,select,label');
+                    if (interactive) return;
+                    setSelected((prev) => ({ ...prev, [row.id]: !prev[row.id] }));
+                  }}
+                >
+                  <td>
+                    <input
+                      type="checkbox"
+                      className="big-check"
+                      checked={Boolean(selected[row.id])}
+                      onChange={(e) =>
+                        setSelected((prev) => ({ ...prev, [row.id]: e.target.checked }))
+                      }
+                    />
+                  </td>
+                  <td className="mono">{row.id}</td>
+                  <td>
+                    {row.image_path ? (
+                      <button type="button" className="unstyled-btn" onClick={() => openDebugPreview(row, 0)}>
+                        <img className="tiny-thumb" src={mediaPath(row.image_path)} alt={`det-${row.id}`} />
+                      </button>
+                    ) : (
+                      <span className="tiny muted">-</span>
+                    )}
+                  </td>
+                  <td className="mono small">
+                    {row.detected_at ? new Date(row.detected_at).toLocaleString() : '-'}
+                  </td>
+                  <td>{row.plate_text}</td>
+                  <td>
+                    <span className={`tag ${badgeClass(row.status)}`}>{row.status}</span>
+                  </td>
+                  <td>{Math.round((row.confidence || 0) * 100)}%</td>
+                  <td>{row.camera_name}</td>
+                  <td>
+                    <div className="row">
+                      {row.debug_steps?.map((step, idx) => (
+                        <button
+                          type="button"
+                          key={`${row.id}-${step.key}`}
+                          className="tiny-link btn-link"
+                          onClick={() => openDebugPreview(row, idx)}
+                        >
+                          {step.label}
+                        </button>
+                      ))}
+                      {!row.debug_steps?.length && <span className="tiny muted">No debug</span>}
+                      <button
+                        type="button"
+                        className="btn ghost"
+                        onClick={() => regenerateDebug(row.id)}
+                        disabled={Boolean(busyDebug[row.id])}
+                      >
+                        <Wrench size={13} /> {busyDebug[row.id] ? 'Building...' : 'Build Debug'}
+                      </button>
+                    </div>
+                  </td>
+                  <td>
+                    <span className={`tag ${feedbackClass(row)}`}>{feedbackLabel(row)}</span>
+                  </td>
+                  <td>
+                    {row.sample?.trained ? (
+                      <span className="tag ok">Trained</span>
+                    ) : (
+                      <span className="tag muted">Not trained</span>
+                    )}
+                  </td>
+                  <td>
+                    <div className="row">
+                      <button type="button" className="btn" onClick={() => openFeedback(row)}>
+                        <MessageSquareMore size={14} /> Feedback
+                      </button>
+                      <button type="button" className="btn ghost" onClick={() => reprocessOne(row.id)} disabled={Boolean(busyReprocess[row.id])}>
+                        <RefreshCw size={14} className={busyReprocess[row.id] ? 'spin' : ''} />
+                        {busyReprocess[row.id] ? 'Reprocessing...' : 'Reprocess'}
+                      </button>
+                      <button type="button" className="btn ghost" onClick={() => deleteOne(row.id)} disabled={Boolean(busyDelete[row.id])}>
+                        <Trash2 size={14} className={busyDelete[row.id] ? 'spin' : ''} />
+                        {busyDelete[row.id] ? 'Deleting...' : 'Delete'}
+                      </button>
+                    </div>
+                  </td>
+                </motion.tr>
+              ))}
+              {!items.length && (
+                <tr>
+                  <td colSpan={12} className="empty">
+                    {loading ? 'Loading...' : 'No detections found.'}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {bulkOpen && (
+        <div className="modal-backdrop" onClick={() => setBulkOpen(false)}>
+          <motion.form
+            className="modal glass"
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={saveBulkFeedback}
+            initial={{ scale: 0.98, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+          >
+            <h3>Bulk Feedback</h3>
+            <p className="muted">
+              Apply to {targetIds.length} events ({selectedIds.length ? 'selected' : 'filtered'}).
+            </p>
+            <label>Mode</label>
+            <select value={bulkMode} onChange={(e) => setBulkMode(e.target.value)}>
+              <option value="correct">Correct</option>
+              <option value="corrected">Corrected</option>
+              <option value="no_plate">No Plate</option>
+            </select>
+            {bulkMode === 'corrected' && (
+              <>
+                <label>Expected plate</label>
+                <input
+                  value={bulkExpected}
+                  onChange={(e) => setBulkExpected(e.target.value)}
+                  placeholder="ABC123"
+                />
+              </>
+            )}
+            <label>Notes</label>
+            <textarea
+              value={bulkNotes}
+              onChange={(e) => setBulkNotes(e.target.value)}
+              placeholder="Optional annotation note"
+            />
+            <div className="row end">
+              <button type="button" className="btn ghost" onClick={() => setBulkOpen(false)}>
+                Cancel
+              </button>
+              <button className="btn primary" type="submit">Save</button>
+            </div>
+          </motion.form>
+        </div>
+      )}
+
+      {feedbackOpen && feedbackRow && (
+        <div className="modal-backdrop" onClick={() => setFeedbackOpen(false)}>
+          <motion.form
+            className="modal glass feedback-modal"
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={saveFeedback}
+            initial={{ scale: 0.98, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+          >
+            <div className="panel-head">
+              <h3>Detection #{feedbackRow.id} Feedback</h3>
+              <span className={`tag ${feedbackClass(feedbackRow)}`}>{feedbackLabel(feedbackRow)}</span>
+            </div>
+            <div className="row two">
+              <div>
+                {feedbackRow.image_path ? (
+                  <button type="button" className="unstyled-btn" onClick={() => openDebugPreview(feedbackRow, 0)}>
+                    <img className="preview-image" src={mediaPath(feedbackRow.image_path)} alt={`det-${feedbackRow.id}`} />
+                  </button>
+                ) : (
+                  <div className="muted">No snapshot</div>
+                )}
+              </div>
+              <div className="stack">
+                <div className="tiny muted">Plate: {feedbackRow.plate_text || '-'}</div>
+                <div className="tiny muted">Camera: {feedbackRow.camera_name || '-'}</div>
+                <div className="tiny muted">Last feedback: {feedbackRow.feedback_status || 'none'}</div>
+                <label>Mode</label>
+                <select value={feedbackMode} onChange={(e) => setFeedbackMode(e.target.value)}>
+                  <option value="correct">Correct</option>
+                  <option value="corrected">Corrected</option>
+                  <option value="no_plate">No Plate</option>
+                </select>
+                {feedbackMode === 'corrected' && (
+                  <>
+                    <label>Expected plate</label>
+                    <input
+                      value={feedbackExpected}
+                      onChange={(e) => setFeedbackExpected(e.target.value)}
+                      placeholder="ABC123"
+                    />
+                  </>
+                )}
+                <label>Notes</label>
+                <textarea
+                  value={feedbackNotes}
+                  onChange={(e) => setFeedbackNotes(e.target.value)}
+                  placeholder="Correction note"
+                />
+                <div className="row">
+                  {createdSampleId ? (
+                    <Link className="btn" to={`/training-data?sample_id=${createdSampleId}`}>
+                      Open Training Sample #{createdSampleId}
+                    </Link>
+                  ) : null}
+                  {feedbackRow.feedback_sample_id ? (
+                    <Link className="btn ghost" to={`/training-data?sample_id=${feedbackRow.feedback_sample_id}`}>
+                      Open Existing Sample
+                    </Link>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+            <div>
+              <div className="tiny muted">Debug steps</div>
+              <div className="row">
+                {feedbackRow.debug_steps?.map((step, idx) => (
+                  <button
+                    type="button"
+                    key={`modal-${feedbackRow.id}-${step.key}`}
+                    className="tiny-link btn-link"
+                    onClick={() => openDebugPreview(feedbackRow, idx)}
+                  >
+                    {step.label}
+                  </button>
+                ))}
+                {!feedbackRow.debug_steps?.length && <span className="tiny muted">No debug steps.</span>}
+              </div>
+            </div>
+            <div className="row end">
+              <button type="button" className="btn ghost" onClick={() => setFeedbackOpen(false)}>
+                Close
+              </button>
+              <button className="btn primary" type="submit">Save Feedback</button>
+            </div>
+          </motion.form>
+        </div>
+      )}
+
+      {debugPreview.open && debugPreview.steps.length > 0 && (
+        <div className="modal-backdrop" onClick={() => setDebugPreview((d) => ({ ...d, open: false }))}>
+          <motion.div
+            className="modal glass feedback-modal"
+            onClick={(e) => e.stopPropagation()}
+            initial={{ scale: 0.98, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+          >
+            <div className="panel-head">
+              <h3>{debugPreview.title} Debug Viewer</h3>
+              <span className="tag ok">{debugPreview.steps[debugPreview.index]?.label || 'Step'}</span>
+            </div>
+            <img
+              className="preview-image"
+              src={mediaPath(debugPreview.steps[debugPreview.index]?.path)}
+              alt="debug-step"
+            />
+            <div className="row">
+              {debugPreview.steps.map((step, idx) => (
+                <button
+                  key={`dbg-${step.key}-${idx}`}
+                  className={`btn ${idx === debugPreview.index ? 'primary' : ''}`}
+                  onClick={() => setDebugPreview((d) => ({ ...d, index: idx }))}
+                >
+                  {step.label}
+                </button>
+              ))}
+            </div>
+            <div className="row end">
+              <button className="btn ghost" onClick={() => setDebugPreview((d) => ({ ...d, open: false }))}>
+                Close
+              </button>
+            </div>
+          </motion.div>
+        </div>
+      )}
+    </div>
+  );
+}

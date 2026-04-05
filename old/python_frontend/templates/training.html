@@ -1,0 +1,914 @@
+{% extends "base.html" %}
+{% block title %}Training Data — CarVision by SpinelTech{% endblock %}
+{% block page_icon %}🧪{% endblock %}
+{% block page_title %}Training Data{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Training Data</h1>
+    <p>Upload images, draw plate boxes, and label text to build a cleaner dataset for retraining.</p>
+  </div>
+  <div class="page-actions">
+    <span class="badge badge-muted">Total: {{ counts.total }}</span>
+    <span class="badge badge-accent">Annotated: {{ counts.annotated }}</span>
+    <span class="badge badge-warn">Pending: {{ counts.pending }}</span>
+    <span class="badge badge-muted" id="training-status-pill">Status: {{ training_status.status }}</span>
+    <a class="btn btn-secondary" href="/admin/training/center">🧭 Training Center</a>
+    <a class="btn btn-secondary" href="/admin/export/training">⬇️ Export JSON</a>
+    <button class="btn btn-secondary" type="button" id="export-yolo">⬇️ Export YOLO</button>
+    <button class="btn btn-primary" type="button" id="start-training">🚀 Start Training</button>
+  </div>
+</div>
+
+{% if notice %}
+<div class="alert alert-{{ notice_type }}">
+  {{ notice }}
+</div>
+{% endif %}
+
+{% set qparam = query_text|urlencode %}
+<div class="card" style="margin-bottom:18px">
+  <div class="card-body">
+    <div class="tabs">
+      <a class="tab-btn {% if status_filter == 'all' %}active{% endif %}" href="/admin/training{% if query_text %}?q={{ qparam }}{% endif %}">All <span class="badge badge-muted">{{ counts.total }}</span></a>
+      <a class="tab-btn {% if status_filter == 'annotated' %}active{% endif %}" href="/admin/training?status=annotated{% if query_text %}&q={{ qparam }}{% endif %}">Annotated <span class="badge badge-accent">{{ counts.annotated }}</span></a>
+      <a class="tab-btn {% if status_filter == 'pending' %}active{% endif %}" href="/admin/training?status=pending{% if query_text %}&q={{ qparam }}{% endif %}">Pending <span class="badge badge-warn">{{ counts.pending }}</span></a>
+      <a class="tab-btn {% if status_filter == 'negative' %}active{% endif %}" href="/admin/training?status=negative{% if query_text %}&q={{ qparam }}{% endif %}">Negative <span class="badge badge-allowed">{{ counts.negative }}</span></a>
+      <a class="tab-btn {% if status_filter == 'ignored' %}active{% endif %}" href="/admin/training?status=ignored{% if query_text %}&q={{ qparam }}{% endif %}">Ignored <span class="badge badge-muted">{{ counts.ignored }}</span></a>
+    </div>
+    <form method="get" action="/admin/training" class="training-search">
+      <input type="hidden" name="status" value="{{ status_filter }}">
+      <input class="form-control" type="text" name="q" placeholder="Search plate, filename, notes" value="{{ query_text }}">
+      <button class="btn btn-secondary" type="submit">Search</button>
+      {% if query_text %}
+      <a class="btn btn-secondary" href="/admin/training?status={{ status_filter }}">Clear</a>
+      {% endif %}
+    </form>
+    <div class="training-status" id="training-status-detail">
+      <div class="training-visual">
+        <div class="training-spinner idle" id="training-spinner"></div>
+        <div class="training-phases">
+          <span class="training-phase-dot" id="phase-queued" title="Queued"></span>
+          <span class="training-phase-dot" id="phase-running" title="Running"></span>
+          <span class="training-phase-dot" id="phase-complete" title="Complete"></span>
+        </div>
+      </div>
+      <div class="badge badge-muted" id="training-status-badge">Status: {{ training_status.status }}</div>
+      <div class="text-muted" id="training-status-msg">{{ training_status.message }}</div>
+      <div class="training-progress">
+        <div class="training-progress-fill" id="training-progress-fill"></div>
+      </div>
+      <div class="training-progress-label">
+        <span id="training-progress-pct">0%</span>
+        <span id="training-progress-meta">Waiting</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="upload-grid">
+  <div>
+    <div class="card" style="margin-bottom:18px">
+      <div class="card-header">
+        <h3><span class="icon">⬆️</span>Upload Training Images</h3>
+      </div>
+      <div class="card-body">
+        <form method="post" action="/admin/training/upload" enctype="multipart/form-data" id="training-upload" data-no-loader="true" style="display:flex;flex-direction:column;gap:16px">
+          <div class="drop-zone" id="train-drop">
+            <input type="file" name="files" accept="image/*" id="train-files" multiple required>
+            <div class="drop-icon">🗂️</div>
+            <div class="drop-title" id="train-title">Drop images here</div>
+            <div class="drop-hint">Select multiple JPG/PNG files to build a dataset</div>
+          </div>
+          <div class="form-hint">Tips: use clear daylight images and include different angles, distances, and plate formats.</div>
+          <button type="submit" class="btn btn-primary btn-full">📥 Add To Dataset</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3><span class="icon">📚</span>Samples</h3>
+        <span class="badge badge-accent">{{ counts.total }}</span>
+      </div>
+      <div class="card-body">
+        {% if samples %}
+        {% set return_to = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Preview</th>
+                <th>Plate</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for s in samples %}
+              {% set is_selected = selected and s.id == selected.id %}
+              <tr class="{% if is_selected %}row-active{% endif %}{% if s.ignored %} row-ignored{% endif %}">
+                <td>
+                  <img class="thumb" src="/media/{{ s.image_path }}" alt="sample" onclick="openLightbox('/media/{{ s.image_path }}')">
+                </td>
+                <td>
+                  {% if s.no_plate %}
+                    <span class="text-warn">No plate</span>
+                  {% elif s.plate_text %}
+                    <span class="plate-tag">{{ s.plate_text }}</span>
+                  {% else %}
+                    <span class="text-muted">—</span>
+                  {% endif %}
+                </td>
+                <td>
+                  {% if s.ignored %}
+                    <span class="badge badge-muted">Ignored</span>
+                  {% elif s.no_plate %}
+                    <span class="badge badge-warn">Negative</span>
+                  {% elif s.bbox %}
+                    <span class="badge badge-allowed">Annotated</span>
+                  {% else %}
+                    <span class="badge badge-warn">Pending</span>
+                  {% endif %}
+                </td>
+                <td class="text-muted">{{ s.created_at.strftime('%Y-%m-%d %H:%M') if s.created_at else '' }}</td>
+                <td style="display:flex;gap:6px;flex-wrap:wrap">
+                  <a class="btn btn-sm btn-secondary" href="/admin/training?sample_id={{ s.id }}&status={{ status_filter }}{% if query_text %}&q={{ qparam }}{% endif %}">Open</a>
+                  <form method="post" action="/admin/training/{{ s.id }}/ignore">
+                    <input type="hidden" name="next_url" value="{{ return_to }}">
+                    <button type="submit" class="btn btn-sm {% if s.ignored %}btn-success{% else %}btn-secondary{% endif %}">{% if s.ignored %}Unignore{% else %}Ignore{% endif %}</button>
+                  </form>
+                  <form method="post" action="/admin/training/{{ s.id }}/delete" onsubmit="return confirm('Delete this sample?')">
+                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                  </form>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <div style="text-align:center;padding:32px">
+          <div style="font-size:38px;margin-bottom:10px">🧪</div>
+          <p>No training samples yet. Upload images to start.</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <div class="card-header">
+        <h3><span class="icon">✍️</span>Annotate Sample</h3>
+        {% if selected %}
+        <span class="badge badge-accent">ID #{{ selected.id }}</span>
+        {% endif %}
+      </div>
+      <div class="card-body">
+        {% if selected %}
+        {% if selected.ignored %}
+        <div class="alert alert-warn">This sample is ignored and excluded from export/training.</div>
+        {% endif %}
+        <div class="annotation-wrap">
+          <div class="annotation-toolbar">
+            <div class="annotation-tool-group">
+              <button type="button" class="btn btn-sm btn-secondary" id="zoom-out">−</button>
+              <button type="button" class="btn btn-sm btn-secondary" id="zoom-in">+</button>
+              <button type="button" class="btn btn-sm btn-secondary" id="zoom-reset">100%</button>
+              <span class="badge badge-muted" id="zoom-label">Zoom: 100%</span>
+            </div>
+            <div class="annotation-tool-group">
+              <button type="button" class="btn btn-sm btn-secondary" id="pan-toggle">Pan: Off</button>
+              <button type="button" class="btn btn-sm btn-secondary" id="center-view">Center</button>
+            </div>
+          </div>
+          <div class="annotation-stage" id="annotation-stage">
+            <div class="annotation-canvas" id="annotation-wrap">
+              <img
+                id="annot-image"
+                src="/media/{{ selected.image_path }}"
+                alt="sample"
+                data-bbox='{{ selected.bbox | tojson }}'
+              >
+              <canvas id="annot-canvas"></canvas>
+            </div>
+          </div>
+          <div class="annotation-hint">Draw, move, or resize with handles. Shortcuts: arrows move box, Shift+arrows move faster, Delete clears, +/- zoom, Ctrl/Cmd+S saves.</div>
+
+          <form method="post" action="/admin/training/{{ selected.id }}/annotate" id="annot-form" style="display:flex;flex-direction:column;gap:14px">
+            <input type="hidden" name="status_filter" value="{{ status_filter }}">
+            <input type="hidden" name="query_text" value="{{ query_text }}">
+            <input type="hidden" name="next_sample_id" id="next_sample_id" value="">
+            <div class="form-grid">
+              <div class="form-group">
+                <label class="form-label">Plate Text</label>
+                <input class="form-control" type="text" name="plate_text" value="{{ selected.plate_text or '' }}" placeholder="ABC-1234">
+                <span class="form-hint">Optional but recommended for OCR training.</span>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Notes</label>
+                <input class="form-control" type="text" name="notes" value="{{ selected.notes or '' }}" placeholder="Lighting, angle, camera, etc">
+              </div>
+            </div>
+
+            <label class="toggle-wrap">
+              <input type="checkbox" name="no_plate" id="no-plate" {% if selected.no_plate %}checked{% endif %}>
+              <div class="toggle-sw"></div>
+              <div>
+                <div class="toggle-text">No Plate In Image</div>
+                <div class="toggle-desc">Mark this image as a negative example.</div>
+              </div>
+            </label>
+
+            <div class="bbox-info" id="bbox-info">No box drawn yet.</div>
+            <input type="hidden" name="bbox_x" id="bbox_x">
+            <input type="hidden" name="bbox_y" id="bbox_y">
+            <input type="hidden" name="bbox_w" id="bbox_w">
+            <input type="hidden" name="bbox_h" id="bbox_h">
+
+            <div style="display:flex;gap:10px;flex-wrap:wrap">
+              <button type="submit" class="btn btn-primary">💾 Save Annotation</button>
+              <button type="submit" class="btn btn-secondary" name="save_next" value="true" id="save-next-btn">💾 Save & Next</button>
+              <button type="button" class="btn btn-secondary" id="clear-bbox">Clear Box</button>
+            </div>
+          </form>
+
+          <div class="debug-steps-panel">
+            <div class="debug-steps-head">Detection Debug Steps</div>
+            {% if selected_debug %}
+            <div class="debug-steps-grid">
+              {% for step in selected_debug %}
+              <button type="button" class="debug-step-card" onclick="openLightbox('/media/{{ step.path }}')">
+                <img src="/media/{{ step.path }}" alt="{{ step.label }}">
+                <span>{{ step.label }}</span>
+              </button>
+              {% endfor %}
+            </div>
+            {% else %}
+            <div class="text-muted">No debug steps available for this sample.</div>
+            {% endif %}
+          </div>
+        </div>
+        {% else %}
+        <div style="text-align:center;padding:32px">
+          <div style="font-size:38px;margin-bottom:10px">🖼️</div>
+          <p>Select a sample from the list to start annotating.</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const dropZone=document.getElementById('train-drop');
+const fileInput=document.getElementById('train-files');
+const dropTitle=document.getElementById('train-title');
+
+if(dropZone){
+  dropZone.addEventListener('dragover',e=>{e.preventDefault();dropZone.classList.add('drag-over');});
+  dropZone.addEventListener('dragleave',()=>dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('drop',e=>{
+    e.preventDefault();dropZone.classList.remove('drag-over');
+    if(e.dataTransfer.files.length){
+      fileInput.files=e.dataTransfer.files;
+      dropTitle.textContent='📄 '+e.dataTransfer.files.length+' file(s) selected';
+    }
+  });
+}
+if(fileInput){
+  fileInput.addEventListener('change',()=>{
+    if(fileInput.files.length){
+      dropTitle.textContent='📄 '+fileInput.files.length+' file(s) selected';
+    }
+  });
+}
+
+const img=document.getElementById('annot-image');
+const canvas=document.getElementById('annot-canvas');
+const stage=document.getElementById('annotation-stage');
+const wrap=document.getElementById('annotation-wrap');
+const bboxInfo=document.getElementById('bbox-info');
+const clearBtn=document.getElementById('clear-bbox');
+const noPlate=document.getElementById('no-plate');
+const panToggleBtn=document.getElementById('pan-toggle');
+const centerViewBtn=document.getElementById('center-view');
+const zoomInBtn=document.getElementById('zoom-in');
+const zoomOutBtn=document.getElementById('zoom-out');
+const zoomResetBtn=document.getElementById('zoom-reset');
+const zoomLabel=document.getElementById('zoom-label');
+const saveNextBtn=document.getElementById('save-next-btn');
+const nextSampleInput=document.getElementById('next_sample_id');
+const inputs={
+  x: document.getElementById('bbox_x'),
+  y: document.getElementById('bbox_y'),
+  w: document.getElementById('bbox_w'),
+  h: document.getElementById('bbox_h')
+};
+let rect=null; // image coordinate space
+let mode='idle'; // idle|drawing|moving|resizing|panning
+let activeHandle=null; // nw,n,ne,e,se,s,sw,w
+let dragStart=null;
+let dragOriginRect=null;
+let panStart=null;
+let panOrigin=null;
+let panEnabled=false;
+let zoom=1;
+const MIN_BOX=8;
+
+if(noPlate && noPlate.checked && bboxInfo){
+  bboxInfo.textContent='Marked as no plate.';
+}
+
+function getImageDims(){
+  if(!img) return {w:0,h:0};
+  return {w:img.naturalWidth||0,h:img.naturalHeight||0};
+}
+
+function clampRectToImage(r){
+  if(!r) return null;
+  const dims=getImageDims();
+  if(!dims.w || !dims.h) return null;
+  const x=Math.max(0, Math.min(r.x, dims.w - MIN_BOX));
+  const y=Math.max(0, Math.min(r.y, dims.h - MIN_BOX));
+  const w=Math.max(MIN_BOX, Math.min(r.w, dims.w - x));
+  const h=Math.max(MIN_BOX, Math.min(r.h, dims.h - y));
+  return {x,y,w,h};
+}
+
+function resizeCanvas(){
+  if(!img || !canvas || !wrap) return;
+  const dims=getImageDims();
+  if(!dims.w || !dims.h) return;
+  const displayW=Math.max(1, Math.round(dims.w * zoom));
+  const displayH=Math.max(1, Math.round(dims.h * zoom));
+  wrap.style.width=displayW+'px';
+  wrap.style.height=displayH+'px';
+  img.style.width=displayW+'px';
+  img.style.height=displayH+'px';
+  canvas.width=displayW;
+  canvas.height=displayH;
+  if(zoomLabel) zoomLabel.textContent=`Zoom: ${Math.round(zoom * 100)}%`;
+  draw();
+}
+
+function canvasToImagePoint(px, py){
+  const dims=getImageDims();
+  if(!dims.w || !dims.h || !canvas) return {x:0,y:0};
+  const sx=dims.w / canvas.width;
+  const sy=dims.h / canvas.height;
+  return {
+    x: Math.max(0, Math.min(dims.w, px * sx)),
+    y: Math.max(0, Math.min(dims.h, py * sy)),
+  };
+}
+
+function imageToCanvasRect(r){
+  if(!r || !canvas) return null;
+  const dims=getImageDims();
+  if(!dims.w || !dims.h) return null;
+  const sx=canvas.width / dims.w;
+  const sy=canvas.height / dims.h;
+  return {x:r.x*sx,y:r.y*sy,w:r.w*sx,h:r.h*sy};
+}
+
+function getMouseCanvasPos(e){
+  const rectCanvas=canvas.getBoundingClientRect();
+  return {
+    x: e.clientX - rectCanvas.left,
+    y: e.clientY - rectCanvas.top,
+  };
+}
+
+function getHandlePoints(rc){
+  return {
+    nw:{x:rc.x,y:rc.y},
+    n:{x:rc.x+rc.w/2,y:rc.y},
+    ne:{x:rc.x+rc.w,y:rc.y},
+    e:{x:rc.x+rc.w,y:rc.y+rc.h/2},
+    se:{x:rc.x+rc.w,y:rc.y+rc.h},
+    s:{x:rc.x+rc.w/2,y:rc.y+rc.h},
+    sw:{x:rc.x,y:rc.y+rc.h},
+    w:{x:rc.x,y:rc.y+rc.h/2},
+  };
+}
+
+function detectHandle(px, py){
+  if(!rect) return null;
+  const rc=imageToCanvasRect(rect);
+  if(!rc) return null;
+  const handles=getHandlePoints(rc);
+  for(const [key, p] of Object.entries(handles)){
+    if(Math.abs(px - p.x) <= 8 && Math.abs(py - p.y) <= 8){
+      return key;
+    }
+  }
+  if(px >= rc.x && px <= rc.x + rc.w && py >= rc.y && py <= rc.y + rc.h){
+    return 'move';
+  }
+  return null;
+}
+
+function draw(){
+  if(!canvas) return;
+  const ctx=canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if(!rect || (noPlate && noPlate.checked)) return;
+  const rc=imageToCanvasRect(rect);
+  if(!rc) return;
+
+  ctx.setLineDash([6,4]);
+  ctx.lineWidth=2;
+  ctx.strokeStyle='#00c8ff';
+  ctx.fillStyle='rgba(0,200,255,0.18)';
+  ctx.strokeRect(rc.x,rc.y,rc.w,rc.h);
+  ctx.fillRect(rc.x,rc.y,rc.w,rc.h);
+  ctx.setLineDash([]);
+
+  const hs=6;
+  const handles=getHandlePoints(rc);
+  ctx.fillStyle='#00c8ff';
+  for(const p of Object.values(handles)){
+    ctx.fillRect(p.x-hs,p.y-hs,hs*2,hs*2);
+  }
+}
+
+function updateCursor(px, py){
+  if(!canvas) return;
+  if(panEnabled){
+    canvas.style.cursor='grab';
+    return;
+  }
+  const h=detectHandle(px, py);
+  const map={
+    nw:'nwse-resize',
+    se:'nwse-resize',
+    ne:'nesw-resize',
+    sw:'nesw-resize',
+    n:'ns-resize',
+    s:'ns-resize',
+    e:'ew-resize',
+    w:'ew-resize',
+    move:'move',
+  };
+  canvas.style.cursor=map[h]||'crosshair';
+}
+
+function applyRectFromHidden(){
+  const hx = inputs.x && inputs.x.value !== '' ? parseInt(inputs.x.value, 10) : null;
+  const hy = inputs.y && inputs.y.value !== '' ? parseInt(inputs.y.value, 10) : null;
+  const hw = inputs.w && inputs.w.value !== '' ? parseInt(inputs.w.value, 10) : null;
+  const hh = inputs.h && inputs.h.value !== '' ? parseInt(inputs.h.value, 10) : null;
+  if(hx !== null && hy !== null && hw && hh){
+    rect=clampRectToImage({x:hx,y:hy,w:hw,h:hh});
+  }else{
+    rect=null;
+  }
+}
+
+function updateHidden(){
+  if(!img || !canvas) return;
+  if(noPlate && noPlate.checked){
+    Object.values(inputs).forEach(i=>{if(i)i.value='';});
+    if(bboxInfo) bboxInfo.textContent='Marked as no plate.';
+    return;
+  }
+  if(!rect){
+    Object.values(inputs).forEach(i=>{if(i)i.value='';});
+    if(bboxInfo) bboxInfo.textContent='No box drawn yet.';
+    return;
+  }
+  rect=clampRectToImage(rect);
+  if(!rect){
+    Object.values(inputs).forEach(i=>{if(i)i.value='';});
+    return;
+  }
+  const x=Math.round(rect.x);
+  const y=Math.round(rect.y);
+  const w=Math.round(rect.w);
+  const h=Math.round(rect.h);
+  if(inputs.x) inputs.x.value=x;
+  if(inputs.y) inputs.y.value=y;
+  if(inputs.w) inputs.w.value=w;
+  if(inputs.h) inputs.h.value=h;
+  if(bboxInfo) bboxInfo.textContent=`Box: ${w}x${h} at (${x}, ${y})`;
+}
+
+function setRectFromSaved(){
+  if(!img || !canvas) return;
+  if(noPlate && noPlate.checked) return;
+  const raw=img.dataset.bbox;
+  if(!raw || raw === 'null') return;
+  try{
+    const b=JSON.parse(raw);
+    if(!b || !('x' in b)) return;
+    rect=clampRectToImage({
+      x:Number(b.x) || 0,
+      y:Number(b.y) || 0,
+      w:Number(b.w) || 0,
+      h:Number(b.h) || 0,
+    });
+    draw();
+    updateHidden();
+  }catch(e){/* ignore */}
+}
+
+function centerStage(){
+  if(!stage || !wrap) return;
+  stage.scrollLeft=Math.max(0, (wrap.clientWidth - stage.clientWidth) / 2);
+  stage.scrollTop=Math.max(0, (wrap.clientHeight - stage.clientHeight) / 2);
+}
+
+function setZoom(nextZoom){
+  const z=Math.max(0.35, Math.min(4, nextZoom));
+  if(Math.abs(z - zoom) < 0.001) return;
+  const cx=stage ? (stage.scrollLeft + stage.clientWidth / 2) : 0;
+  const cy=stage ? (stage.scrollTop + stage.clientHeight / 2) : 0;
+  const rw=wrap ? wrap.clientWidth : 1;
+  const rh=wrap ? wrap.clientHeight : 1;
+  const rx=rw ? cx / rw : 0.5;
+  const ry=rh ? cy / rh : 0.5;
+  zoom=z;
+  resizeCanvas();
+  if(stage && wrap){
+    stage.scrollLeft=Math.max(0, wrap.clientWidth * rx - stage.clientWidth / 2);
+    stage.scrollTop=Math.max(0, wrap.clientHeight * ry - stage.clientHeight / 2);
+  }
+}
+
+function applyResize(origin, curr, handle){
+  let x=origin.x;
+  let y=origin.y;
+  let w=origin.w;
+  let h=origin.h;
+  if(handle.includes('e')) w = curr.x - origin.x;
+  if(handle.includes('s')) h = curr.y - origin.y;
+  if(handle.includes('w')){
+    x = curr.x;
+    w = origin.x + origin.w - curr.x;
+  }
+  if(handle.includes('n')){
+    y = curr.y;
+    h = origin.y + origin.h - curr.y;
+  }
+  if(w < MIN_BOX){
+    if(handle.includes('w')) x = x - (MIN_BOX - w);
+    w = MIN_BOX;
+  }
+  if(h < MIN_BOX){
+    if(handle.includes('n')) y = y - (MIN_BOX - h);
+    h = MIN_BOX;
+  }
+  return clampRectToImage({x,y,w,h});
+}
+
+function bindAnnotCanvas(){
+  if(!canvas || !img) return;
+  canvas.addEventListener('mousedown',e=>{
+    const pos=getMouseCanvasPos(e);
+    updateCursor(pos.x, pos.y);
+    if(panEnabled){
+      mode='panning';
+      panStart={x:e.clientX,y:e.clientY};
+      panOrigin={x:stage?.scrollLeft||0,y:stage?.scrollTop||0};
+      canvas.style.cursor='grabbing';
+      return;
+    }
+    if(noPlate && noPlate.checked) return;
+    const h=detectHandle(pos.x, pos.y);
+    const imgPoint=canvasToImagePoint(pos.x,pos.y);
+    dragStart=imgPoint;
+    dragOriginRect=rect ? {...rect} : null;
+    if(h && h !== 'move'){
+      mode='resizing';
+      activeHandle=h;
+      return;
+    }
+    if(h === 'move' && rect){
+      mode='moving';
+      activeHandle='move';
+      return;
+    }
+    mode='drawing';
+    activeHandle='draw';
+    rect={x:imgPoint.x,y:imgPoint.y,w:MIN_BOX,h:MIN_BOX};
+    draw();
+  });
+
+  canvas.addEventListener('mousemove',e=>{
+    const pos=getMouseCanvasPos(e);
+    if(mode === 'idle'){
+      updateCursor(pos.x, pos.y);
+      return;
+    }
+    if(mode === 'panning'){
+      if(stage && panStart && panOrigin){
+        stage.scrollLeft=panOrigin.x - (e.clientX - panStart.x);
+        stage.scrollTop=panOrigin.y - (e.clientY - panStart.y);
+      }
+      return;
+    }
+    if(noPlate && noPlate.checked) return;
+    const imgPoint=canvasToImagePoint(pos.x,pos.y);
+    if(mode === 'drawing'){
+      const x=Math.min(dragStart.x, imgPoint.x);
+      const y=Math.min(dragStart.y, imgPoint.y);
+      const w=Math.max(MIN_BOX, Math.abs(imgPoint.x - dragStart.x));
+      const h=Math.max(MIN_BOX, Math.abs(imgPoint.y - dragStart.y));
+      rect=clampRectToImage({x,y,w,h});
+      draw();
+      return;
+    }
+    if(mode === 'moving' && dragOriginRect){
+      const dx=imgPoint.x - dragStart.x;
+      const dy=imgPoint.y - dragStart.y;
+      rect=clampRectToImage({
+        x:dragOriginRect.x + dx,
+        y:dragOriginRect.y + dy,
+        w:dragOriginRect.w,
+        h:dragOriginRect.h,
+      });
+      draw();
+      return;
+    }
+    if(mode === 'resizing' && dragOriginRect){
+      rect=applyResize(dragOriginRect, imgPoint, activeHandle);
+      draw();
+    }
+  });
+
+  canvas.addEventListener('mouseup',()=>{
+    if(mode !== 'idle'){
+      mode='idle';
+      activeHandle=null;
+      updateHidden();
+      draw();
+      if(panEnabled) canvas.style.cursor='grab';
+    }
+  });
+  canvas.addEventListener('mouseleave',()=>{
+    if(mode !== 'idle'){
+      mode='idle';
+      activeHandle=null;
+      updateHidden();
+      draw();
+      if(panEnabled) canvas.style.cursor='grab';
+    }
+  });
+}
+
+function resolveNextSampleId(){
+  if(!nextSampleInput) return;
+  const active=document.querySelector('tr.row-active');
+  if(!active) return;
+  const rows=[...document.querySelectorAll('table tbody tr')];
+  const idx=rows.indexOf(active);
+  if(idx < 0) return;
+  const next=rows[idx + 1] || rows[0];
+  if(!next) return;
+  const link=next.querySelector('a[href*="sample_id="]');
+  if(!link) return;
+  const href=link.getAttribute('href') || '';
+  const m=href.match(/sample_id=(\d+)/);
+  if(m) nextSampleInput.value=m[1];
+}
+
+if(img && canvas){
+  const init=()=>{
+    resizeCanvas();
+    applyRectFromHidden();
+    setRectFromSaved();
+    updateHidden();
+    centerStage();
+  };
+  if(img.complete) init();
+  else img.addEventListener('load', init);
+  window.addEventListener('resize', resizeCanvas);
+  bindAnnotCanvas();
+}
+
+clearBtn?.addEventListener('click',()=>{
+  rect=null;
+  draw();
+  updateHidden();
+});
+
+zoomInBtn?.addEventListener('click',()=>setZoom(zoom + 0.15));
+zoomOutBtn?.addEventListener('click',()=>setZoom(zoom - 0.15));
+zoomResetBtn?.addEventListener('click',()=>setZoom(1));
+centerViewBtn?.addEventListener('click',centerStage);
+panToggleBtn?.addEventListener('click',()=>{
+  panEnabled=!panEnabled;
+  panToggleBtn.textContent=`Pan: ${panEnabled ? 'On' : 'Off'}`;
+  if(canvas) canvas.style.cursor=panEnabled ? 'grab' : 'crosshair';
+});
+
+if(noPlate){
+  noPlate.addEventListener('change',()=>{
+    if(noPlate.checked){
+      rect=null;
+    }else{
+      applyRectFromHidden();
+    }
+    draw();
+    updateHidden();
+  });
+}
+
+saveNextBtn?.addEventListener('click', resolveNextSampleId);
+
+document.addEventListener('keydown',(e)=>{
+  if(!img || !canvas) return;
+  const target=e.target;
+  if(target instanceof HTMLElement && (target.tagName==='INPUT' || target.tagName==='TEXTAREA' || target.tagName==='SELECT')){
+    return;
+  }
+  if((e.ctrlKey || e.metaKey) && e.key.toLowerCase()==='s'){
+    e.preventDefault();
+    document.getElementById('annot-form')?.requestSubmit();
+    return;
+  }
+  if(e.key === '+' || e.key === '='){
+    e.preventDefault();
+    setZoom(zoom + 0.15);
+    return;
+  }
+  if(e.key === '-' || e.key === '_'){
+    e.preventDefault();
+    setZoom(zoom - 0.15);
+    return;
+  }
+  if(e.key === 'Delete' || e.key === 'Backspace'){
+    if(rect){
+      e.preventDefault();
+      rect=null;
+      draw();
+      updateHidden();
+    }
+    return;
+  }
+  const step=e.shiftKey ? 5 : 1;
+  if(rect){
+    if(e.key === 'ArrowLeft'){e.preventDefault();rect=clampRectToImage({...rect,x:rect.x-step});draw();updateHidden();}
+    if(e.key === 'ArrowRight'){e.preventDefault();rect=clampRectToImage({...rect,x:rect.x+step});draw();updateHidden();}
+    if(e.key === 'ArrowUp'){e.preventDefault();rect=clampRectToImage({...rect,y:rect.y-step});draw();updateHidden();}
+    if(e.key === 'ArrowDown'){e.preventDefault();rect=clampRectToImage({...rect,y:rect.y+step});draw();updateHidden();}
+  }
+});
+
+const exportBtn=document.getElementById('export-yolo');
+
+const startBtn=document.getElementById('start-training');
+const statusPill=document.getElementById('training-status-pill');
+const statusBadge=document.getElementById('training-status-badge');
+const statusMsg=document.getElementById('training-status-msg');
+const trainingSpinner=document.getElementById('training-spinner');
+const progressFill=document.getElementById('training-progress-fill');
+const progressPct=document.getElementById('training-progress-pct');
+const progressMeta=document.getElementById('training-progress-meta');
+const phaseQueued=document.getElementById('phase-queued');
+const phaseRunning=document.getElementById('phase-running');
+const phaseComplete=document.getElementById('phase-complete');
+
+function applyStatusStyle(el,status){
+  if(!el) return;
+  el.classList.remove('badge-muted','badge-accent','badge-allowed','badge-denied','badge-warn');
+  if(status === 'running') el.classList.add('badge-accent');
+  else if(status === 'complete') el.classList.add('badge-allowed');
+  else if(status === 'failed') el.classList.add('badge-denied');
+  else if(status === 'queued') el.classList.add('badge-warn');
+  else el.classList.add('badge-muted');
+}
+
+function inferTrainingProgress(data){
+  if(!data) return 0;
+  const status=(data.status||'idle').toLowerCase();
+  if(status === 'idle') return 0;
+  if(status === 'queued') return 12;
+  if(status === 'complete') return 100;
+  if(status === 'failed') return 100;
+  const msg=(data.message||'').toLowerCase();
+  let pct = 24;
+  if(msg.includes('launch')) pct = 28;
+  if(msg.includes('config')) pct = 36;
+  const logCount = Array.isArray(data.log) ? data.log.length : 0;
+  if(logCount > 0){
+    pct = Math.max(pct, Math.min(92, 32 + logCount * 7));
+  }
+  const frac = msg.match(/(\d+)\s*\/\s*(\d+)/);
+  if(frac){
+    const cur = parseInt(frac[1],10);
+    const total = parseInt(frac[2],10);
+    if(total > 0) pct = Math.max(pct, Math.min(95, Math.round((cur/total)*85) + 10));
+  }
+  const ep = msg.match(/epoch\D+(\d+)/);
+  if(ep){
+    const epoch = parseInt(ep[1],10);
+    if(epoch > 0) pct = Math.max(pct, Math.min(95, 15 + epoch));
+  }
+  return pct;
+}
+
+function setPhaseState(status){
+  [phaseQueued,phaseRunning,phaseComplete].forEach(el=>{
+    if(!el) return;
+    el.classList.remove('active','done');
+  });
+  if(status === 'queued'){
+    phaseQueued?.classList.add('active');
+  }else if(status === 'running'){
+    phaseQueued?.classList.add('done');
+    phaseRunning?.classList.add('active');
+  }else if(status === 'complete'){
+    phaseQueued?.classList.add('done');
+    phaseRunning?.classList.add('done');
+    phaseComplete?.classList.add('done');
+  }else if(status === 'failed'){
+    phaseQueued?.classList.add('done');
+    phaseRunning?.classList.add('done');
+    phaseComplete?.classList.add('active');
+  }
+}
+
+function updateStatusUI(data){
+  if(!data) return;
+  const status=data.status || 'idle';
+  const msg=data.message || 'Idle';
+  if(statusPill) statusPill.textContent=`Status: ${status}`;
+  if(statusBadge) statusBadge.textContent=`Status: ${status}`;
+  if(statusMsg) statusMsg.textContent=msg;
+  applyStatusStyle(statusPill,status);
+  applyStatusStyle(statusBadge,status);
+  setPhaseState(status);
+  const pct=inferTrainingProgress(data);
+  if(progressFill){
+    progressFill.style.width=`${pct}%`;
+    progressFill.classList.toggle('running', status === 'running');
+  }
+  if(progressPct) progressPct.textContent=`${pct}%`;
+  if(progressMeta) progressMeta.textContent=data.updated_at ? `Updated ${data.updated_at}` : status;
+  if(trainingSpinner){
+    trainingSpinner.classList.toggle('idle', !(status === 'running' || status === 'queued'));
+  }
+  if(startBtn){
+    startBtn.disabled = status === 'running';
+    if(status === 'running') startBtn.textContent='⏳ Training...';
+    else startBtn.textContent='🚀 Start Training';
+  }
+}
+
+async function fetchStatus(){
+  try{
+    const res=await fetch('/admin/api/training_status');
+    if(!res.ok) return;
+    const data=await res.json();
+    updateStatusUI(data);
+  }catch(e){/* ignore */}
+}
+
+exportBtn?.addEventListener('click',async ()=>{
+  try{
+    if(window.showLoader) showLoader('Exporting YOLO dataset…');
+    const res=await fetch('/admin/export/yolo');
+    const data=await res.json();
+    if(res.ok && data.ok){
+      const path=data.counts?.dataset_root || 'training_yolo';
+      if(window.showToast) showToast('Export complete',`Saved to ${path}`,'info');
+    }else{
+      const msg=data?.error || 'Export failed';
+      if(window.showToast) showToast('Export failed',msg,'warn');
+    }
+  }catch(e){
+    if(window.showToast) showToast('Export failed','Check server logs','warn');
+  }finally{
+    if(window.hideLoader) hideLoader();
+  }
+});
+
+startBtn?.addEventListener('click',async ()=>{
+  try{
+    if(window.showLoader) showLoader('Starting training…');
+    const res=await fetch('/admin/training/train',{method:'POST'});
+    const data=await res.json();
+    if(res.ok && data.ok){
+      if(window.showToast) showToast('Training started','This may take a few minutes','info');
+    }else{
+      const msg=data?.error || 'Training failed to start';
+      if(window.showToast) showToast('Training error',msg,'warn');
+    }
+    fetchStatus();
+  }catch(e){
+    if(window.showToast) showToast('Training error','Check server logs','warn');
+  }finally{
+    if(window.hideLoader) hideLoader();
+  }
+});
+
+fetchStatus();
+setInterval(fetchStatus, 4000);
+</script>
+{% endblock %}

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Login — CarVision by SpinelTech</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="login-page">
+  <div class="login-card animate-in">
+    <div class="login-logo">
+      <div class="logo-icon">📷</div>
+      <h1>CarVision</h1>
+      <p>Powered by SpinelTech · CarVision Platform</p>
+    </div>
+    {% if error %}
+    <div class="alert alert-danger" style="margin-bottom:20px">⚠️ {{ error }}</div>
+    {% endif %}
+    <form method="post" action="/login" style="display:flex;flex-direction:column;gap:16px">
+      <div class="form-group">
+        <label class="form-label">Username</label>
+        <input name="username" type="text" class="form-control" placeholder="Enter username" autocomplete="username" required autofocus>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Password</label>
+        <input name="password" type="password" class="form-control" placeholder="Enter password" autocomplete="current-password" required>
+      </div>
+      <button type="submit" class="btn btn-primary btn-full btn-lg" style="margin-top:4px">🔐 Sign In</button>
+    </form>
+    <div style="text-align:center;margin-top:20px;font-size:0.72rem;color:var(--text-dim)">
+      SpinelTech CarVision · Authorized Access Only
+    </div>
+  </div>
+</div>
+<script>
+(function(){const root=document.documentElement;const saved=localStorage.getItem('carvision-theme');if(saved)root.setAttribute('data-theme',saved);else root.setAttribute('data-theme','dark');})();
+</script>
+</body>
+</html>

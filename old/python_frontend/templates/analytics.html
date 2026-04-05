@@ -1,0 +1,203 @@
+{% extends "base.html" %}
+{% block title %}Analytics — CarVision{% endblock %}
+{% block page_icon %}📈{% endblock %}
+{% block page_title %}Analytics & Statistics{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Analytics</h1>
+    <p>Detection trends, camera performance, and plate activity statistics</p>
+  </div>
+  <div class="page-actions">
+    <select id="range-select" class="form-control" style="width:160px;padding:7px 12px" onchange="loadAnalytics(this.value)">
+      <option value="24">Last 24 hours</option>
+      <option value="168" selected>Last 7 days</option>
+      <option value="720">Last 30 days</option>
+    </select>
+    <a href="/admin/export/csv" class="btn btn-export">⬇️ Export CSV</a>
+  </div>
+</div>
+
+<!-- Stats row -->
+<div class="stats-grid" id="stats-grid">
+  <div class="stat-card stat-accent">
+    <div class="stat-icon">📋</div>
+    <div class="stat-value" id="a-total">—</div>
+    <div class="stat-label">Total Detections</div>
+    <div class="stat-sub" id="a-total-sub">
+      <span class="loader-dots sm" aria-hidden="true"><span></span><span></span><span></span></span>
+      <span class="sr-only">Loading</span>
+    </div>
+  </div>
+  <div class="stat-card stat-allowed">
+    <div class="stat-icon">✅</div>
+    <div class="stat-value" id="a-allowed">—</div>
+    <div class="stat-label">Allowed</div>
+    <div class="stat-sub" id="a-allowed-pct"></div>
+  </div>
+  <div class="stat-card stat-denied">
+    <div class="stat-icon">🚫</div>
+    <div class="stat-value" id="a-denied">—</div>
+    <div class="stat-label">Denied</div>
+    <div class="stat-sub" id="a-denied-pct"></div>
+  </div>
+  <div class="stat-card stat-warn">
+    <div class="stat-icon">🔁</div>
+    <div class="stat-value" id="a-unique">—</div>
+    <div class="stat-label">Unique Plates</div>
+    <div class="stat-sub" id="a-unique-sub"></div>
+  </div>
+  <div class="stat-card stat-accent">
+    <div class="stat-icon">📷</div>
+    <div class="stat-value" id="a-cameras">—</div>
+    <div class="stat-label">Active Cameras</div>
+    <div class="stat-sub">With detections</div>
+  </div>
+</div>
+
+<div class="analytics-grid section-gap">
+  <!-- Hourly activity -->
+  <div class="card">
+    <div class="card-header">
+      <h3><span class="icon">📊</span>Detection Activity</h3>
+      <span class="badge badge-muted" id="chart-period-label">7 days</span>
+    </div>
+    <div class="card-body" style="padding-bottom:8px">
+      <canvas id="activity-chart" class="chart" height="180"></canvas>
+    </div>
+  </div>
+
+  <!-- Allowed vs Denied donut -->
+  <div class="card">
+    <div class="card-header">
+      <h3><span class="icon">🍩</span>Status Breakdown</h3>
+    </div>
+    <div class="card-body" style="display:flex;align-items:center;justify-content:center;min-height:220px">
+      <canvas id="donut-chart" class="chart" height="200" width="200"></canvas>
+    </div>
+  </div>
+</div>
+
+<div class="analytics-grid-3 section-gap">
+  <!-- Top plates -->
+  <div class="card">
+    <div class="card-header">
+      <h3><span class="icon">🏆</span>Top Plates</h3>
+      <span class="badge badge-accent" id="top-plates-count">—</span>
+    </div>
+    <div class="card-body p-0">
+      <div id="top-plates-list" style="max-height:300px;overflow-y:auto"></div>
+    </div>
+  </div>
+
+  <!-- Top cameras -->
+  <div class="card">
+    <div class="card-header">
+      <h3><span class="icon">📹</span>Camera Activity</h3>
+    </div>
+    <div class="card-body p-0">
+      <div id="camera-activity-list" style="max-height:300px;overflow-y:auto"></div>
+    </div>
+  </div>
+
+  <!-- Avg confidence + peak hour -->
+  <div class="card">
+    <div class="card-header">
+      <h3><span class="icon">💡</span>Insights</h3>
+    </div>
+    <div class="card-body" style="display:flex;flex-direction:column;gap:12px">
+      <div class="camera-meta-item">
+        <div class="camera-meta-key">Average Confidence</div>
+        <div class="camera-meta-value" id="avg-confidence">—</div>
+      </div>
+      <div class="camera-meta-item">
+        <div class="camera-meta-key">Peak Activity Hour</div>
+        <div class="camera-meta-value" id="peak-hour">—</div>
+      </div>
+      <div class="camera-meta-item">
+        <div class="camera-meta-key">Denied Rate</div>
+        <div class="camera-meta-value" id="denied-rate">—</div>
+      </div>
+      <div class="camera-meta-item">
+        <div class="camera-meta-key">Last Detection</div>
+        <div class="camera-meta-value" id="last-detection">—</div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+let activityChart=null, donutChart=null;
+const ACCENT='rgba(0,200,255,0.85)', ACCENT2='rgba(0,132,255,0.85)';
+const ALLOWED='rgba(0,232,122,0.85)', DENIED='rgba(255,48,80,0.85)';
+const GRID='rgba(0,200,255,0.08)', TEXT='rgba(226,234,246,0.7)';
+
+Chart.defaults.color=TEXT;Chart.defaults.borderColor=GRID;
+
+async function loadAnalytics(hours){
+  try{
+    const r=await fetch('/admin/api/analytics?hours='+hours);
+    if(!r.ok){showToast('Error','Could not load analytics','warn');return;}
+    const d=await r.json();
+    // Stats
+    document.getElementById('a-total').textContent=d.total||0;
+    document.getElementById('a-allowed').textContent=d.allowed||0;
+    document.getElementById('a-denied').textContent=d.denied||0;
+    document.getElementById('a-unique').textContent=d.unique_plates||0;
+    document.getElementById('a-cameras').textContent=d.active_cameras||0;
+    const t=d.total||1;
+    document.getElementById('a-allowed-pct').textContent=((d.allowed/t)*100).toFixed(1)+'% of total';
+    document.getElementById('a-denied-pct').textContent=((d.denied/t)*100).toFixed(1)+'% of total';
+    document.getElementById('a-total-sub').textContent='In last '+hours+' hours';
+    document.getElementById('avg-confidence').textContent=d.avg_confidence?((d.avg_confidence)*100).toFixed(1)+'%':'—';
+    document.getElementById('peak-hour').textContent=d.peak_hour!=null?(d.peak_hour+':00 — '+(d.peak_hour+1)+':00'):'—';
+    document.getElementById('denied-rate').textContent=((d.denied/t)*100).toFixed(1)+'%';
+    document.getElementById('last-detection').textContent=d.last_detection||'—';
+    // Period label
+    const labels={24:'24 hours',168:'7 days',720:'30 days'};
+    document.getElementById('chart-period-label').textContent=labels[hours]||hours+'h';
+
+    // Activity chart
+    const labels_=d.activity_labels||[];
+    const counts_=d.activity_counts||[];
+    if(activityChart){activityChart.destroy();}
+    const ctx1=document.getElementById('activity-chart').getContext('2d');
+    activityChart=new Chart(ctx1,{type:'bar',data:{labels:labels_,datasets:[{label:'Detections',data:counts_,backgroundColor:'rgba(0,200,255,0.35)',borderColor:ACCENT,borderWidth:1,borderRadius:4}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:{maxTicksLimit:12,font:{size:10}}},y:{beginAtZero:true,ticks:{stepSize:1}}}}});
+
+    // Donut
+    if(donutChart){donutChart.destroy();}
+    const ctx2=document.getElementById('donut-chart').getContext('2d');
+    donutChart=new Chart(ctx2,{type:'doughnut',data:{labels:['Allowed','Denied'],datasets:[{data:[d.allowed||0,d.denied||0],backgroundColor:[ALLOWED,DENIED],borderColor:'rgba(7,16,32,0.9)',borderWidth:2}]},options:{cutout:'65%',plugins:{legend:{position:'bottom'}}}});
+
+    // Top plates
+    const platList=document.getElementById('top-plates-list');
+    document.getElementById('top-plates-count').textContent=(d.top_plates||[]).length;
+    platList.innerHTML=(d.top_plates||[]).map(p=>`
+      <div style="padding:10px 18px;border-bottom:1px solid var(--glass-border);display:flex;align-items:center;justify-content:space-between">
+        <span class="plate-tag">${p.plate}</span>
+        <div style="text-align:right">
+          <div style="font-weight:700;color:var(--text);font-family:var(--font-mono)">${p.count}</div>
+          <div style="font-size:0.7rem;color:var(--text-muted)">${p.status==='allowed'?'<span class="text-allowed">✅ Allowed</span>':'<span class="text-denied">🚫 Denied</span>'}</div>
+        </div>
+      </div>`).join('');
+
+    // Camera activity
+    const camList=document.getElementById('camera-activity-list');
+    camList.innerHTML=(d.camera_activity||[]).map(c=>{
+      const pct=Math.round((c.count/t)*100);
+      return`<div style="padding:10px 18px;border-bottom:1px solid var(--glass-border)">
+        <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+          <span style="font-weight:600;color:var(--text);font-size:0.83rem">${c.camera}</span>
+          <span class="font-mono text-sm">${c.count}</span>
+        </div>
+        <div class="conf-bar"><div class="conf-fill high" style="width:${pct}%"></div></div>
+      </div>`;
+    }).join('');
+  }catch(e){showToast('Error','Failed to load analytics: '+e.message,'warn');}
+}
+
+loadAnalytics(document.getElementById('range-select').value||168);
+</script>
+{% endblock %}

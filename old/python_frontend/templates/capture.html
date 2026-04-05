@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>Capture — CarVision by SpinelTech</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <style>
+    body{margin:0;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;min-height:100vh;color:#fff;padding:0}
+    .capture-frame{position:relative;width:100%;max-width:640px;border-bottom:1px solid var(--glass-border);background:#000}
+    #video{width:100%;display:block}
+    #overlay{position:absolute;inset:0;pointer-events:none}
+    #status-bar{width:100%;max-width:640px;padding:12px 18px;background:var(--glass-bg2);border-bottom:1px solid var(--glass-border);display:flex;align-items:center;justify-content:space-between;font-size:0.82rem}
+    #controls{width:100%;max-width:640px;padding:16px 18px;background:var(--glass-bg2);display:flex;gap:10px;flex-wrap:wrap}
+    #debug-steps{width:100%;max-width:640px;padding:12px 18px;background:var(--glass-bg2);border-top:1px solid var(--glass-border);display:flex;gap:8px;flex-wrap:wrap}
+    #secure-help{width:100%;max-width:640px;padding:12px 18px;background:var(--warn-bg);border-top:1px solid var(--warn-border);border-bottom:1px solid var(--warn-border);display:none;flex-direction:column;gap:8px}
+    .debug-thumb{display:flex;flex-direction:column;gap:4px;align-items:center;text-decoration:none;color:var(--text-muted)}
+    .debug-thumb img{width:96px;height:56px;object-fit:cover;border-radius:8px;border:1px solid var(--glass-border)}
+    .debug-thumb span{font-size:11px}
+    .cam-header{width:100%;max-width:640px;padding:14px 18px;background:var(--glass-bg2);border-bottom:1px solid var(--glass-border)}
+    #fps-display{font-family:var(--font-mono);font-size:0.72rem;color:var(--text-muted)}
+  </style>
+</head>
+<body>
+<div class="cam-header">
+  <div style="display:flex;align-items:center;gap:10px">
+    <div class="brand-icon" style="width:28px;height:28px;font-size:14px">📷</div>
+    <div>
+      <div style="font-size:0.9rem;font-weight:700;color:var(--text)" id="cam-name">Camera {{ camera_id }}</div>
+      <div style="font-size:0.7rem;color:var(--text-muted)">CarVision Capture Device</div>
+    </div>
+  </div>
+</div>
+
+<div class="capture-frame">
+  <video id="video" autoplay muted playsinline></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div id="status-bar">
+  <div style="display:flex;align-items:center;gap:6px">
+    <div id="status-dot" style="width:8px;height:8px;border-radius:50%;background:var(--denied-text)"></div>
+    <span id="status-text">Starting camera…</span>
+  </div>
+  <span id="fps-display">0 fps</span>
+</div>
+
+<div id="controls">
+  <button id="start-btn" class="btn btn-primary">▶ Start Streaming</button>
+  <button id="stop-btn" class="btn btn-danger" style="display:none">⏹ Stop</button>
+  <button id="flip-btn" class="btn btn-secondary">🔄 Flip Camera</button>
+  <button id="fallback-btn" class="btn btn-secondary">📸 Capture Fallback</button>
+  <input id="fallback-input" type="file" accept="image/*" capture="environment" style="display:none">
+</div>
+<div id="secure-help">
+  <div style="font-size:0.82rem;color:var(--warn-text);font-weight:700">iPhone/Safari camera requires HTTPS</div>
+  <div style="font-size:0.76rem;color:var(--text)">Open this page using HTTPS with a trusted certificate to enable live camera streaming.</div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <a id="https-link" class="btn btn-sm btn-secondary" href="#">Open HTTPS URL</a>
+    <button id="retry-btn" class="btn btn-sm btn-secondary" type="button">Retry Camera</button>
+  </div>
+</div>
+<div id="debug-steps">
+  <span class="text-muted" style="font-size:12px">Debug steps will appear after detection.</span>
+</div>
+
+<canvas id="canvas" style="display:none"></canvas>
+
+<script>
+(function(){const root=document.documentElement;const saved=localStorage.getItem('carvision-theme');root.setAttribute('data-theme',saved||'dark');})();
+
+const CAMERA_ID={{ camera_id }};
+const TOKEN='{{ token }}';
+const INGEST_URL='/ingest/'+CAMERA_ID+'?token='+TOKEN;
+const FPS=8;
+const OVERLAY_URL='/capture/'+CAMERA_ID+'/overlay?token='+TOKEN;
+let streaming=false,intervalId=null,overlayIntervalId=null,facingMode='environment',stream=null;
+let frameCount=0,lastFpsUpdate=Date.now();
+
+const video=document.getElementById('video');
+const overlay=document.getElementById('overlay');
+const octx=overlay.getContext('2d');
+const canvas=document.getElementById('canvas');
+const ctx=canvas.getContext('2d');
+const statusDot=document.getElementById('status-dot');
+const statusText=document.getElementById('status-text');
+const fpsDisplay=document.getElementById('fps-display');
+const debugSteps=document.getElementById('debug-steps');
+const secureHelp=document.getElementById('secure-help');
+const httpsLink=document.getElementById('https-link');
+const fallbackBtn=document.getElementById('fallback-btn');
+const fallbackInput=document.getElementById('fallback-input');
+const retryBtn=document.getElementById('retry-btn');
+
+function buildHttpsUrl(){
+  const host=window.location.host;
+  return 'https://' + host + window.location.pathname + window.location.search;
+}
+
+function showSecureHelp(show){
+  if(!secureHelp) return;
+  secureHelp.style.display=show ? 'flex' : 'none';
+}
+
+async function startCamera(){
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    setStatus('Camera unavailable in this browser context. On iPhone, use HTTPS.', 'var(--denied-text)');
+    showSecureHelp(true);
+    return false;
+  }
+  try{
+    if(stream){stream.getTracks().forEach(t=>t.stop());}
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode,width:{ideal:1280},height:{ideal:720}},audio:false});
+    video.srcObject=stream;
+    setStatus('Camera ready','var(--warn-text)');
+    showSecureHelp(false);
+    return true;
+  }catch(e){
+    const msg=(e && e.message) ? e.message : 'Unknown camera error';
+    if(window.location.protocol !== 'https:'){
+      setStatus('Camera blocked on HTTP. Open this page on HTTPS.', 'var(--denied-text)');
+      showSecureHelp(true);
+    }else{
+      setStatus('Camera error: '+msg,'var(--denied-text)');
+    }
+    return false;
+  }
+}
+
+function setStatus(msg,color){statusText.textContent=msg;statusDot.style.background=color||'var(--allowed-text)';}
+
+function resizeOverlay(){
+  overlay.width=video.videoWidth||video.clientWidth;
+  overlay.height=video.videoHeight||video.clientHeight;
+}
+
+function drawOverlay(det){
+  octx.clearRect(0,0,overlay.width,overlay.height);
+  if(!det||!det.bbox) return;
+  const bbox=det.bbox;
+  let x1,y1,x2,y2;
+  if(bbox.x1!==undefined){
+    x1=bbox.x1;y1=bbox.y1;x2=bbox.x2;y2=bbox.y2;
+  }else if(bbox.x!==undefined){
+    x1=bbox.x;y1=bbox.y;x2=bbox.x+bbox.w;y2=bbox.y+bbox.h;
+  }else{
+    return;
+  }
+  const scaleX=overlay.width/(video.videoWidth||overlay.width);
+  const scaleY=overlay.height/(video.videoHeight||overlay.height);
+  x1*=scaleX;y1*=scaleY;x2*=scaleX;y2*=scaleY;
+  octx.strokeStyle='rgba(0,255,120,0.9)';
+  octx.lineWidth=2;
+  octx.strokeRect(x1,y1,(x2-x1),(y2-y1));
+  const label=`${det.plate_text||''} ${det.status||''} ${det.detector||''}`.trim();
+  if(label){
+    octx.fillStyle='rgba(0,0,0,0.6)';
+    octx.fillRect(x1,Math.max(0,y1-18),Math.min(overlay.width-x1,180),18);
+    octx.fillStyle='#fff';
+    octx.font='12px sans-serif';
+    octx.fillText(label,x1+4,Math.max(12,y1-5));
+  }
+}
+
+async function pollOverlay(){
+  try{
+    const r=await fetch(OVERLAY_URL);
+    if(!r.ok) return;
+    const d=await r.json();
+    if(!d.ok) return;
+    drawOverlay(d.detection);
+    renderDebugSteps(d.detection);
+  }catch(e){}
+}
+
+function renderDebugSteps(det){
+  if(!debugSteps) return;
+  const steps=(det && Array.isArray(det.debug_steps)?det.debug_steps:[]).filter(s=>s && s.path);
+  if(!steps.length){
+    debugSteps.innerHTML='<span class="text-muted" style="font-size:12px">No debug steps yet.</span>';
+    return;
+  }
+  debugSteps.innerHTML=steps.map(step=>`
+    <a class="debug-thumb" href="/media/${step.path}" target="_blank">
+      <img src="/media/${step.path}" alt="${step.label}">
+      <span>${step.label}</span>
+    </a>
+  `).join('');
+}
+
+async function sendFrame(){
+  if(!video.videoWidth)return;
+  canvas.width=video.videoWidth;canvas.height=video.videoHeight;
+  ctx.drawImage(video,0,0);
+  canvas.toBlob(async blob=>{
+    if(!blob)return;
+    try{
+      await fetch(INGEST_URL,{method:'POST',headers:{'Content-Type':'image/jpeg'},body:blob});
+      frameCount++;
+      const now=Date.now();
+      if(now-lastFpsUpdate>=1000){fpsDisplay.textContent=frameCount+' fps';frameCount=0;lastFpsUpdate=now;}
+    }catch(e){}
+  },'image/jpeg',0.7);
+}
+
+document.getElementById('start-btn').addEventListener('click',async()=>{
+  const ok = await startCamera();
+  if(!ok) return;
+  streaming=true;
+  if(intervalId) clearInterval(intervalId);
+  if(overlayIntervalId) clearInterval(overlayIntervalId);
+  intervalId=setInterval(sendFrame,1000/FPS);
+  overlayIntervalId=setInterval(pollOverlay,500);
+  setStatus('Streaming live','var(--allowed-text)');
+  document.getElementById('start-btn').style.display='none';
+  document.getElementById('stop-btn').style.display='';
+});
+
+document.getElementById('stop-btn').addEventListener('click',()=>{
+  if(intervalId) clearInterval(intervalId);
+  if(overlayIntervalId) clearInterval(overlayIntervalId);
+  streaming=false;
+  setStatus('Stopped','var(--denied-text)');
+  document.getElementById('start-btn').style.display='';
+  document.getElementById('stop-btn').style.display='none';
+});
+
+document.getElementById('flip-btn').addEventListener('click',async()=>{
+  facingMode=facingMode==='environment'?'user':'environment';
+  if(streaming) await startCamera();
+});
+
+fallbackBtn?.addEventListener('click',()=>fallbackInput?.click());
+fallbackInput?.addEventListener('change',async()=>{
+  const file=fallbackInput.files && fallbackInput.files[0];
+  if(!file) return;
+  try{
+    setStatus('Uploading fallback capture…','var(--warn-text)');
+    const blob=await file.arrayBuffer();
+    await fetch(INGEST_URL,{method:'POST',headers:{'Content-Type':file.type||'image/jpeg'},body:blob});
+    setStatus('Fallback capture uploaded','var(--allowed-text)');
+    pollOverlay();
+  }catch(e){
+    setStatus('Fallback upload failed','var(--denied-text)');
+  }finally{
+    fallbackInput.value='';
+  }
+});
+
+retryBtn?.addEventListener('click',()=>startCamera());
+if(httpsLink) httpsLink.href = buildHttpsUrl();
+startCamera();
+video.addEventListener('loadedmetadata',resizeOverlay);
+window.addEventListener('resize',resizeOverlay);
+</script>
+</body>
+</html>
