@@ -12,5 +12,6 @@ python-dotenv==1.0.1
 onvif-zeep==0.2.12
 wsdiscovery==2.0.0
 ultralytics==8.2.79
+huggingface_hub==0.31.2
 itsdangerous==2.2.0
 PyJWT==2.9.0

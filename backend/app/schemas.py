@@ -9,7 +9,7 @@ class CameraCreate(BaseModel):
     source: str
     location: Optional[str] = None
     enabled: bool = True
-    scan_interval: float = 1.0
+    scan_interval: float = 0.15
     cooldown_seconds: float = 10.0
     save_snapshot: bool = True
     save_clip: bool = False

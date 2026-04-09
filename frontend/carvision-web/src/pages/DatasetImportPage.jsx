@@ -37,8 +37,17 @@ export default function DatasetImportPage() {
         headers: { Authorization: `Bearer ${token}` },
         body: fd,
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.detail || 'Dataset import failed');
+      const raw = await res.text();
+      let data = {};
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        data = {};
+      }
+      if (!res.ok) {
+        const detail = data?.detail || data?.error || raw || 'Dataset import failed';
+        throw new Error(`Dataset import failed (${res.status}): ${String(detail).slice(0, 300)}`);
+      }
       setResult(data);
       if (data?.batch_id) {
         navigate(`/training-data?batch=${encodeURIComponent(data.batch_id)}`);
@@ -66,7 +75,7 @@ export default function DatasetImportPage() {
         </div>
 
         <div className="row two">
-          <label className="panel glass" style={{ cursor: 'pointer' }}>
+          <label className="panel glass" style={{ cursor: 'pointer' }} title="Import many standalone image files to create training samples.">
             <div className="row"><FileImage size={16} /> Upload Images</div>
             <div className="tiny muted">Select multiple images</div>
             <input
@@ -74,28 +83,31 @@ export default function DatasetImportPage() {
               accept="image/*"
               multiple
               hidden
+              title="Select one or more image files."
               onChange={(e) => setImages(Array.from(e.target.files || []))}
             />
             <div className="tiny">{images.length ? `${images.length} selected` : 'None selected'}</div>
           </label>
 
-          <label className="panel glass" style={{ cursor: 'pointer' }}>
+          <label className="panel glass" style={{ cursor: 'pointer' }} title="Import a ZIP package that may include images and YOLO label files.">
             <div className="row"><Archive size={16} /> Upload ZIP</div>
             <div className="tiny muted">Supports images + YOLO txt labels</div>
             <input
               type="file"
               accept=".zip,application/zip,application/x-zip-compressed"
               hidden
+              title="Select a ZIP archive for batch import."
               onChange={(e) => setZipFile(e.target.files?.[0] || null)}
             />
             <div className="tiny">{zipFile ? zipFile.name : 'None selected'}</div>
           </label>
         </div>
 
-        <label className="row tiny">
+        <label className="row tiny" title="Enable this if your files already include YOLO annotation labels.">
           <input
             type="checkbox"
             checked={hasAnnotations}
+            title="Dataset already contains labels; importer will attach them directly."
             onChange={(e) => setHasAnnotations(e.target.checked)}
           />
           This dataset already has YOLO annotations

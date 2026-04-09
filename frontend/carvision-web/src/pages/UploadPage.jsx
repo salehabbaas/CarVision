@@ -85,19 +85,19 @@ export default function UploadPage() {
         <div className="panel-head"><h3><UploadCloud size={16} /> Upload & Test</h3></div>
         <div className="row two">
           <div>
-            <label>Image or Video</label>
-            <input type="file" accept="image/*,video/*" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+            <label title="Choose a file to test detection on a single image or a video clip.">Image or Video</label>
+            <input title="Supported: image or video files." type="file" accept="image/*,video/*" onChange={(e) => setFile(e.target.files?.[0] || null)} />
           </div>
           <div className="row">
             <div>
-              <label>Sample (sec)</label>
-              <input type="number" step="0.1" min="0.1" value={sampleSeconds} onChange={(e) => setSampleSeconds(e.target.value)} />
+              <label title="How often to sample frames from the uploaded video.">Sample (sec)</label>
+              <input title="Lower value scans more frames and increases load." type="number" step="0.1" min="0.1" value={sampleSeconds} onChange={(e) => setSampleSeconds(e.target.value)} />
             </div>
             <div>
-              <label>Max frames</label>
-              <input type="number" min="1" max="2000" value={maxFrames} onChange={(e) => setMaxFrames(e.target.value)} />
+              <label title="Maximum number of frames to process from the video.">Max frames</label>
+              <input title="Caps processing work to keep jobs fast." type="number" min="1" max="2000" value={maxFrames} onChange={(e) => setMaxFrames(e.target.value)} />
             </div>
-            <label className="row tiny"><input type="checkbox" checked={showDebug} onChange={(e) => setShowDebug(e.target.checked)} /> Include debug steps</label>
+            <label className="row tiny" title="Attach intermediate processing outputs for troubleshooting OCR/detection quality."><input title="Enable debug images in upload result." type="checkbox" checked={showDebug} onChange={(e) => setShowDebug(e.target.checked)} /> Include debug steps</label>
           </div>
         </div>
         <div className="row end">

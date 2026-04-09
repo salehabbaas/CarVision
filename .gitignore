@@ -24,3 +24,7 @@ datasets/media/
 .DS_Store
 .vscode/
 .idea/
+
+# Deploy tracking (machine-local, not committed)
+.build-version
+.last-deploy-commit

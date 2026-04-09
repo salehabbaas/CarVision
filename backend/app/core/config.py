@@ -17,3 +17,6 @@ API_CORS_ORIGINS = [o.strip() for o in os.getenv("API_CORS_ORIGINS", "*").split(
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
+FRONTEND_PUBLIC_BASE_URL = os.getenv("FRONTEND_PUBLIC_BASE_URL", "").strip()
+FRONTEND_PUBLIC_SCHEME = os.getenv("FRONTEND_PUBLIC_SCHEME", "http").strip().lower() or "http"
+FRONTEND_PUBLIC_PORT = os.getenv("FRONTEND_PUBLIC_PORT", "8081").strip()

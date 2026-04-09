@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
-import { CheckCircle2, MessageSquareMore, RefreshCw, Search, Wrench, Trash2 } from 'lucide-react';
+import { CheckCircle2, ChevronLeft, ChevronRight, MessageSquareMore, RefreshCw, Search, Wrench, Trash2 } from 'lucide-react';
 import { request, mediaPath } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
-import { Link } from 'react-router-dom';
+import { LoadingState, ErrorState } from '../components/PageState';
+import { Link, useSearchParams } from 'react-router-dom';
 
 function badgeClass(status) {
   if (status === 'allowed') return 'ok';
@@ -23,10 +24,19 @@ function feedbackLabel(row) {
   return 'Pending';
 }
 
+const DEBUG_STEP_ORDER = [
+  { key: 'color', label: 'Color Crop' },
+  { key: 'bw', label: 'Threshold' },
+  { key: 'gray', label: 'Gray' },
+  { key: 'edged', label: 'Edges' },
+  { key: 'mask', label: 'Mask' },
+];
+
 export default function DetectionsPage() {
   const { token } = useAuth();
+  const [searchParams] = useSearchParams();
   const [items, setItems] = useState([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);  // true on mount — data hasn't arrived yet
   const [error, setError] = useState('');
   const [q, setQ] = useState('');
   const [status, setStatus] = useState('');
@@ -51,7 +61,15 @@ export default function DetectionsPage() {
   const [feedbackMode, setFeedbackMode] = useState('correct');
   const [feedbackExpected, setFeedbackExpected] = useState('');
   const [feedbackNotes, setFeedbackNotes] = useState('');
+  const [feedbackInitial, setFeedbackInitial] = useState({ mode: 'correct', expected: '', notes: '' });
   const [createdSampleId, setCreatedSampleId] = useState(null);
+  const [focusedRowId, setFocusedRowId] = useState(null);
+
+  const focusDetectionId = useMemo(() => {
+    const raw = searchParams.get('detection_id');
+    const num = Number(raw);
+    return Number.isFinite(num) && num > 0 ? num : null;
+  }, [searchParams]);
 
   async function load() {
     setLoading(true);
@@ -76,12 +94,44 @@ export default function DetectionsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, feedback, trained]);
 
+  useEffect(() => {
+    if (!focusDetectionId) return;
+    const exists = items.some((row) => row.id === focusDetectionId);
+    if (!exists) return;
+    setSelected((prev) => ({ ...prev, [focusDetectionId]: true }));
+    setFocusedRowId(focusDetectionId);
+    const node = document.getElementById(`detection-row-${focusDetectionId}`);
+    if (node) {
+      node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    const timer = setTimeout(() => setFocusedRowId(null), 5000);
+    return () => clearTimeout(timer);
+  }, [focusDetectionId, items]);
+
   const visibleIds = useMemo(() => items.map((x) => x.id), [items]);
   const selectedIds = useMemo(
     () => Object.keys(selected).filter((id) => selected[id]).map((id) => Number(id)),
     [selected]
   );
   const targetIds = selectedIds.length ? selectedIds : visibleIds;
+  const feedbackRowIndex = useMemo(
+    () => (feedbackRow ? items.findIndex((row) => row.id === feedbackRow.id) : -1),
+    [feedbackRow, items]
+  );
+  const feedbackHasPrev = feedbackRowIndex > 0;
+  const feedbackHasNext = feedbackRowIndex >= 0 && feedbackRowIndex < items.length - 1;
+  const feedbackDebugSteps = useMemo(() => {
+    if (!feedbackRow?.debug_steps?.length) return [];
+    return feedbackRow.debug_steps;
+  }, [feedbackRow]);
+  const feedbackDebugGrid = useMemo(() => {
+    const byKey = new Map(feedbackDebugSteps.map((step) => [step.key, step]));
+    return DEBUG_STEP_ORDER.map((entry) => ({ ...entry, step: byKey.get(entry.key) || null }));
+  }, [feedbackDebugSteps]);
+  const feedbackDirty =
+    feedbackMode !== feedbackInitial.mode ||
+    (feedbackExpected || '') !== (feedbackInitial.expected || '') ||
+    (feedbackNotes || '') !== (feedbackInitial.notes || '');
 
   function toggleAll(v) {
     const next = { ...selected };
@@ -204,12 +254,29 @@ export default function DetectionsPage() {
   }
 
   function openFeedback(row) {
+    const mode = row.feedback_status || 'correct';
+    const expected = row.plate_text || '';
+    const notes = row.feedback_note || '';
     setFeedbackRow(row);
-    setFeedbackMode(row.feedback_status || 'correct');
-    setFeedbackExpected(row.plate_text || '');
-    setFeedbackNotes(row.feedback_note || '');
+    setFeedbackMode(mode);
+    setFeedbackExpected(expected);
+    setFeedbackNotes(notes);
+    setFeedbackInitial({ mode, expected, notes });
     setCreatedSampleId(null);
     setFeedbackOpen(true);
+  }
+
+  function navigateFeedback(delta) {
+    if (!feedbackRow) return;
+    const idx = items.findIndex((row) => row.id === feedbackRow.id);
+    if (idx < 0) return;
+    const nextIdx = idx + delta;
+    if (nextIdx < 0 || nextIdx >= items.length) return;
+    if (feedbackDirty) {
+      const confirmed = window.confirm('You have unsaved feedback changes. Move to another detection anyway?');
+      if (!confirmed) return;
+    }
+    openFeedback(items[nextIdx]);
   }
 
   async function saveFeedback(e) {
@@ -233,6 +300,19 @@ export default function DetectionsPage() {
     }
   }
 
+  useEffect(() => {
+    if (!feedbackOpen || !feedbackRow) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      const tag = String(event.target?.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+      event.preventDefault();
+      navigateFeedback(event.key === 'ArrowRight' ? 1 : -1);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [feedbackOpen, feedbackRow, items, feedbackDirty]);
+
   function openDebugPreview(row, startIndex = 0) {
     const steps = row?.debug_steps || [];
     if (!steps.length) return;
@@ -244,9 +324,17 @@ export default function DetectionsPage() {
     });
   }
 
+  // Show loading skeleton on initial load (items empty + loading)
+  if (loading && items.length === 0) return <LoadingState rows={5} message="Loading detections…" />;
+
+  // Show full-page error only if we have no data at all
+  if (error && items.length === 0) {
+    return <ErrorState error={{ message: error, type: 'unknown' }} onRetry={load} />;
+  }
+
   return (
     <div className="stack">
-      {error ? <div className="alert error">{error}</div> : null}
+      {error ? <div className="alert error">{error} <button className="btn ghost" style={{ marginLeft: 8 }} onClick={load}>Retry</button></div> : null}
       {toast ? <div className="alert success">{toast}</div> : null}
 
       <div className="panel glass toolbar">
@@ -256,20 +344,21 @@ export default function DetectionsPage() {
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="Search plate/camera/location"
+            title="Search detections by plate text, camera name, or location."
           />
         </div>
-        <select value={status} onChange={(e) => setStatus(e.target.value)}>
+        <select title="Filter detections by allow/deny decision status." value={status} onChange={(e) => setStatus(e.target.value)}>
           <option value="">All status</option>
           <option value="allowed">Allowed</option>
           <option value="denied">Denied</option>
         </select>
-        <select value={feedback} onChange={(e) => setFeedback(e.target.value)}>
+        <select title="Filter by feedback workflow state." value={feedback} onChange={(e) => setFeedback(e.target.value)}>
           <option value="">All feedback</option>
           <option value="annotated">Annotated</option>
           <option value="pending">Pending</option>
           <option value="ignored">Ignored</option>
         </select>
-        <select value={trained} onChange={(e) => setTrained(e.target.value)}>
+        <select title="Filter by whether detection sample has been used for training." value={trained} onChange={(e) => setTrained(e.target.value)}>
           <option value="">All training</option>
           <option value="trained">Trained</option>
           <option value="not_trained">Not trained</option>
@@ -302,7 +391,7 @@ export default function DetectionsPage() {
           <table>
             <thead>
               <tr>
-                <th><input type="checkbox" onChange={(e) => toggleAll(e.target.checked)} /></th>
+                <th><input title="Select or unselect all currently filtered detections." type="checkbox" onChange={(e) => toggleAll(e.target.checked)} /></th>
                 <th>ID</th>
                 <th>Snapshot</th>
                 <th>Time</th>
@@ -320,6 +409,8 @@ export default function DetectionsPage() {
               {items.map((row) => (
                 <motion.tr
                   key={row.id}
+                  id={`detection-row-${row.id}`}
+                  className={focusedRowId === row.id ? 'selected-row detection-row-focus' : ''}
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
                   onClick={(e) => {
@@ -332,6 +423,7 @@ export default function DetectionsPage() {
                     <input
                       type="checkbox"
                       className="big-check"
+                      title="Select this detection for bulk actions."
                       checked={Boolean(selected[row.id])}
                       onChange={(e) =>
                         setSelected((prev) => ({ ...prev, [row.id]: e.target.checked }))
@@ -432,27 +524,29 @@ export default function DetectionsPage() {
             <p className="muted">
               Apply to {targetIds.length} events ({selectedIds.length ? 'selected' : 'filtered'}).
             </p>
-            <label>Mode</label>
-            <select value={bulkMode} onChange={(e) => setBulkMode(e.target.value)}>
+            <label title="Choose how selected detections should be labeled.">Mode</label>
+            <select title="Feedback mode applied to selected detections." value={bulkMode} onChange={(e) => setBulkMode(e.target.value)}>
               <option value="correct">Correct</option>
               <option value="corrected">Corrected</option>
               <option value="no_plate">No Plate</option>
             </select>
             {bulkMode === 'corrected' && (
               <>
-                <label>Expected plate</label>
+                <label title="Correct plate text when mode is set to corrected.">Expected plate</label>
                 <input
                   value={bulkExpected}
                   onChange={(e) => setBulkExpected(e.target.value)}
                   placeholder="ABC123"
+                  title="Plate text to save as the corrected ground truth."
                 />
               </>
             )}
-            <label>Notes</label>
+            <label title="Optional comments explaining this bulk feedback action.">Notes</label>
             <textarea
               value={bulkNotes}
               onChange={(e) => setBulkNotes(e.target.value)}
               placeholder="Optional annotation note"
+              title="Stored with feedback for later review and training traceability."
             />
             <div className="row end">
               <button type="button" className="btn ghost" onClick={() => setBulkOpen(false)}>
@@ -475,7 +569,33 @@ export default function DetectionsPage() {
           >
             <div className="panel-head">
               <h3>Detection #{feedbackRow.id} Feedback</h3>
-              <span className={`tag ${feedbackClass(feedbackRow)}`}>{feedbackLabel(feedbackRow)}</span>
+              <div className="row">
+                <span className="tiny muted">
+                  {feedbackRowIndex >= 0 ? `${feedbackRowIndex + 1} / ${items.length}` : '-'}
+                </span>
+                <span className={`tag ${feedbackClass(feedbackRow)}`}>{feedbackLabel(feedbackRow)}</span>
+              </div>
+            </div>
+            <div className="row between">
+              <div className="tiny muted">Use arrow keys or buttons to move quickly.</div>
+              <div className="row">
+                <button
+                  type="button"
+                  className="btn ghost"
+                  onClick={() => navigateFeedback(-1)}
+                  disabled={!feedbackHasPrev}
+                >
+                  <ChevronLeft size={14} /> Previous
+                </button>
+                <button
+                  type="button"
+                  className="btn ghost"
+                  onClick={() => navigateFeedback(1)}
+                  disabled={!feedbackHasNext}
+                >
+                  Next <ChevronRight size={14} />
+                </button>
+              </div>
             </div>
             <div className="row two">
               <div>
@@ -491,27 +611,29 @@ export default function DetectionsPage() {
                 <div className="tiny muted">Plate: {feedbackRow.plate_text || '-'}</div>
                 <div className="tiny muted">Camera: {feedbackRow.camera_name || '-'}</div>
                 <div className="tiny muted">Last feedback: {feedbackRow.feedback_status || 'none'}</div>
-                <label>Mode</label>
-                <select value={feedbackMode} onChange={(e) => setFeedbackMode(e.target.value)}>
+                <label title="Choose whether the current detection was correct, corrected, or no-plate.">Mode</label>
+                <select title="Feedback mode for this detection event." value={feedbackMode} onChange={(e) => setFeedbackMode(e.target.value)}>
                   <option value="correct">Correct</option>
                   <option value="corrected">Corrected</option>
                   <option value="no_plate">No Plate</option>
                 </select>
                 {feedbackMode === 'corrected' && (
                   <>
-                    <label>Expected plate</label>
+                    <label title="Enter the true plate text if OCR result is wrong.">Expected plate</label>
                     <input
                       value={feedbackExpected}
                       onChange={(e) => setFeedbackExpected(e.target.value)}
                       placeholder="ABC123"
+                      title="Correct plate value saved to the training sample."
                     />
                   </>
                 )}
-                <label>Notes</label>
+                <label title="Optional operator note for audit and model-improvement context.">Notes</label>
                 <textarea
                   value={feedbackNotes}
                   onChange={(e) => setFeedbackNotes(e.target.value)}
                   placeholder="Correction note"
+                  title="Free-form note attached to this feedback action."
                 />
                 <div className="row">
                   {createdSampleId ? (
@@ -528,19 +650,29 @@ export default function DetectionsPage() {
               </div>
             </div>
             <div>
-              <div className="tiny muted">Debug steps</div>
-              <div className="row">
-                {feedbackRow.debug_steps?.map((step, idx) => (
-                  <button
-                    type="button"
-                    key={`modal-${feedbackRow.id}-${step.key}`}
-                    className="tiny-link btn-link"
-                    onClick={() => openDebugPreview(feedbackRow, idx)}
-                  >
-                    {step.label}
-                  </button>
-                ))}
-                {!feedbackRow.debug_steps?.length && <span className="tiny muted">No debug steps.</span>}
+              <div className="tiny muted">Debug steps (all together)</div>
+              <div className="feedback-debug-grid">
+                {feedbackDebugGrid.map((entry) => {
+                  const idx = feedbackDebugSteps.findIndex((s) => s.key === entry.key);
+                  return (
+                    <button
+                      type="button"
+                      key={`modal-${feedbackRow.id}-${entry.key}`}
+                      className={`feedback-debug-card ${entry.step?.path ? '' : 'is-missing'}`}
+                      onClick={() => {
+                        if (idx >= 0) openDebugPreview(feedbackRow, idx);
+                      }}
+                      disabled={idx < 0}
+                    >
+                      <div className="tiny">{entry.label}</div>
+                      {entry.step?.path ? (
+                        <img src={mediaPath(entry.step.path)} alt={`${entry.label}-${feedbackRow.id}`} />
+                      ) : (
+                        <div className="tiny muted">Not available</div>
+                      )}
+                    </button>
+                  );
+                })}
               </div>
             </div>
             <div className="row end">

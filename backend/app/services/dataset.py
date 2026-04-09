@@ -94,8 +94,11 @@ def bbox_xywh_to_xyxy(bbox: Dict[str, int]) -> Dict[str, int]:
     return {"x1": x, "y1": y, "x2": x + w, "y2": y + h}
 
 
-def build_yolo_dataset(db: Session) -> Dict[str, object]:
-    dataset_root = Path(MEDIA_DIR) / "training_yolo"
+def _build_yolo_dataset_from_rows(
+    db: Session,
+    samples: List[TrainingSample],
+    dataset_root: Path,
+) -> Dict[str, object]:
     images_train = dataset_root / "images" / "train"
     images_val = dataset_root / "images" / "val"
     labels_train = dataset_root / "labels" / "train"
@@ -107,7 +110,6 @@ def build_yolo_dataset(db: Session) -> Dict[str, object]:
     labels_train.mkdir(parents=True, exist_ok=True)
     labels_val.mkdir(parents=True, exist_ok=True)
 
-    samples = db.query(TrainingSample).order_by(TrainingSample.id.asc()).all()
     counts = {
         "total": len(samples),
         "ignored": 0,
@@ -196,6 +198,59 @@ def build_yolo_dataset(db: Session) -> Dict[str, object]:
     return counts
 
 
+def build_yolo_dataset(db: Session) -> Dict[str, object]:
+    dataset_root = Path(MEDIA_DIR) / "training_yolo"
+    samples = db.query(TrainingSample).order_by(TrainingSample.id.asc()).all()
+    return _build_yolo_dataset_from_rows(db, samples, dataset_root)
+
+
+def build_yolo_dataset_for_sample_ids(
+    db: Session,
+    sample_ids: List[int],
+    dataset_subdir: str = "training_yolo",
+) -> Dict[str, object]:
+    ids = [int(x) for x in sample_ids if int(x) > 0]
+    if not ids:
+        dataset_root = Path(MEDIA_DIR) / dataset_subdir
+        shutil.rmtree(dataset_root, ignore_errors=True)
+        (dataset_root / "images" / "train").mkdir(parents=True, exist_ok=True)
+        (dataset_root / "images" / "val").mkdir(parents=True, exist_ok=True)
+        (dataset_root / "labels" / "train").mkdir(parents=True, exist_ok=True)
+        (dataset_root / "labels" / "val").mkdir(parents=True, exist_ok=True)
+        data_yaml = dataset_root / "data.yaml"
+        data_yaml.write_text(
+            "\n".join(
+                [
+                    f"path: {dataset_root.as_posix()}",
+                    "train: images/train",
+                    "val: images/val",
+                    "nc: 1",
+                    "names: [plate]",
+                    "",
+                ]
+            )
+        )
+        return {
+            "total": 0,
+            "ignored": 0,
+            "pending": 0,
+            "positives": 0,
+            "negatives": 0,
+            "exported": 0,
+            "train": 0,
+            "val": 0,
+            "dataset_root": str(dataset_root),
+            "data_yaml": str(data_yaml),
+            "sample_ids": [],
+        }
+
+    dataset_root = Path(MEDIA_DIR) / dataset_subdir
+    order_case = {sid: idx for idx, sid in enumerate(ids)}
+    rows = db.query(TrainingSample).filter(TrainingSample.id.in_(ids)).all()
+    rows.sort(key=lambda row: order_case.get(int(row.id), 10**9))
+    return _build_yolo_dataset_from_rows(db, rows, dataset_root)
+
+
 def is_image_filename(name: str) -> bool:
     ext = Path(name.lower()).suffix
     return ext in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -232,10 +287,51 @@ def extract_yolo_bbox(label_text: str, width: int, height: int) -> Optional[Dict
     return None
 
 
+def extract_yolo_bboxes(label_text: str, width: int, height: int) -> List[Dict[str, int]]:
+    boxes: List[Dict[str, int]] = []
+    if not label_text:
+        return boxes
+    for raw_line in label_text.splitlines():
+        line = (raw_line or "").strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        try:
+            cx = float(parts[1])
+            cy = float(parts[2])
+            nw = float(parts[3])
+            nh = float(parts[4])
+        except Exception:
+            continue
+        if width <= 0 or height <= 0 or nw <= 0 or nh <= 0:
+            continue
+        w = int(round(nw * width))
+        h = int(round(nh * height))
+        x = int(round((cx - nw / 2.0) * width))
+        y = int(round((cy - nh / 2.0) * height))
+        x = max(0, min(x, max(0, width - 1)))
+        y = max(0, min(y, max(0, height - 1)))
+        w = max(1, min(w, width - x))
+        h = max(1, min(h, height - y))
+        boxes.append({"x": x, "y": y, "w": w, "h": h})
+    return boxes
+
+
 def zip_label_candidates(path: str) -> List[str]:
-    p = path.replace("\\", "/")
-    base, _ = os.path.splitext(p)
+    p = path.replace("\\", "/").strip("/")
+    low = p.lower()
+    base, _ = os.path.splitext(low)
     candidates = [f"{base}.txt"]
-    if "/images/" in p:
+
+    # Handle common YOLO dataset layouts:
+    # - images/train/a.jpg <-> labels/train/a.txt
+    # - dataset/images/train/a.jpg <-> dataset/labels/train/a.txt
+    # - images/a.jpg <-> labels/a.txt
+    if "/images/" in low:
         candidates.append(f"{base.replace('/images/', '/labels/', 1)}.txt")
+    if low.startswith("images/"):
+        candidates.append(f"{base.replace('images/', 'labels/', 1)}.txt")
+
     return list(dict.fromkeys(candidates))

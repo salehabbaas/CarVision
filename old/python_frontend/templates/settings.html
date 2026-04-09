@@ -10,6 +10,12 @@
   </div>
 </div>
 
+{% if saved %}
+<div class="alert alert-success">
+  Settings saved. Restart the backend server to make sure the new CPU/GPU inference selection is applied cleanly.
+</div>
+{% endif %}
+
 <form method="post" action="/admin/settings">
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
     <div>
@@ -46,6 +52,14 @@
               <option value="contour" {% if detector_mode == 'contour' %}selected{% endif %}>Contour Only — Traditional OpenCV</option>
             </select>
             <span class="form-hint">Cameras set to "inherit" will use this mode. YOLO requires a trained model file at <code>models/plate.pt</code></span>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Inference Device</label>
+            <select name="inference_device" class="form-control">
+              <option value="cpu" {% if inference_device == 'cpu' %}selected{% endif %}>CPU</option>
+              <option value="gpu" {% if inference_device == 'gpu' %}selected{% endif %}>GPU</option>
+            </select>
+            <span class="form-hint">Choose whether live detection and OCR should prefer the CPU or GPU. Save the setting, then restart the backend server to apply it cleanly.</span>
           </div>
           <div class="alert alert-info">
             💡 YOLO mode is more accurate but requires placing a <code>plate.pt</code> model file in the <code>models/</code> directory.
@@ -196,6 +210,10 @@
           <div class="camera-meta-item">
             <div class="camera-meta-key">OCR Languages</div>
             <div class="camera-meta-value">{{ ocr_langs or 'en' }}</div>
+          </div>
+          <div class="camera-meta-item">
+            <div class="camera-meta-key">Inference Device</div>
+            <div class="camera-meta-value">{{ inference_device|upper }}</div>
           </div>
           <div class="camera-meta-item">
             <div class="camera-meta-key">Frame Preprocessing</div>

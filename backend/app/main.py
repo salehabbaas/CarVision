@@ -1,26 +1,36 @@
 import os
+import re
+import json
+import subprocess
+import threading
 import time
 import secrets
 import shutil
 import zipfile
+import ipaddress
+import socket
+import signal
+import sys
+import tempfile
 from io import BytesIO
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict
-from urllib.parse import quote_plus
+from typing import Optional, List, Tuple, Dict, Callable
+from urllib.parse import quote_plus, urlparse
 from difflib import SequenceMatcher
+from zoneinfo import ZoneInfo
 
 import cv2
 import numpy as np
 import jwt
 from fastapi import Depends, FastAPI, Form, Request, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import or_, and_, func, case
 from sqlalchemy.exc import IntegrityError
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -30,11 +40,17 @@ from api.schemas import (
     ApiBulkIdsBody,
     ApiCameraCreateBody,
     ApiCameraPatchBody,
+    ApiCameraTestBody,
     ApiDiscoveryResolveBody,
     ApiLayoutBody,
+    ApiClipControlBody,
     ApiLoginBody,
+    ApiModelTestBody,
+    ApiTrainingSettingsBody,
     ApiTrainingAnnotateBody,
     ApiTrainingIgnoreBody,
+    ApiTrainingSampleIdsBody,
+    ApiTrainingStartBody,
 )
 from camera_manager import CameraManager
 from core.config import (
@@ -46,13 +62,16 @@ from core.config import (
     API_JWT_ALGORITHM,
     API_JWT_EXPIRE_MINUTES,
     API_JWT_SECRET,
+    FRONTEND_PUBLIC_BASE_URL,
+    FRONTEND_PUBLIC_PORT,
+    FRONTEND_PUBLIC_SCHEME,
     LEGACY_FRONTEND_DIR,
     MEDIA_DIR,
     PROJECT_ROOT,
     PUBLIC_BASE_URL,
 )
 from db import Base, engine, get_db, ensure_schema, SessionLocal
-from models import AllowedPlate, Camera, Detection, AppSetting, TrainingSample, Notification
+from models import AllowedPlate, Camera, Detection, AppSetting, TrainingSample, Notification, ClipRecord, TrainingJob
 from onvif_discovery import discover_onvif, resolve_rtsp_for_xaddr
 from onvif_ptz import continuous_move, stop as ptz_stop
 from plate_detector import detect_plate, reload_yolo_model
@@ -62,9 +81,11 @@ from services.dataset import (
     build_yolo_dataset as _build_yolo_dataset,
     copy_training_image as _copy_training_image,
     extract_yolo_bbox as _extract_yolo_bbox,
+    extract_yolo_bboxes as _extract_yolo_bboxes,
     is_image_filename as _is_image_filename,
     load_image_size as _load_image_size,
     zip_label_candidates as _zip_label_candidates,
+    build_yolo_dataset_for_sample_ids as _build_yolo_dataset_for_sample_ids,
 )
 from services.debug_assets import (
     build_training_debug as _build_training_debug,
@@ -78,6 +99,12 @@ from services.file_utils import (
     hash_file as _hash_file,
     safe_filename as _safe_filename,
 )
+from services.camera_edit import (
+    apply_camera_patch as _apply_camera_patch,
+    normalize_camera_source as _normalize_camera_source_service,
+    validate_camera_type as _validate_camera_type,
+    validate_detector_mode as _validate_detector_mode,
+)
 from services.state import (
     cleanup_upload_jobs as _cleanup_upload_jobs,
     create_upload_job as _create_upload_job,
@@ -86,8 +113,142 @@ from services.state import (
     set_training_status as _set_training_status,
     update_upload_job as _update_upload_job,
 )
-from anpr import read_plate_text, crop_from_bbox
+from anpr import read_plate_text, crop_from_bbox, set_anpr_config
 from stream_manager import StreamManager
+
+
+class ManualClipManager:
+    def __init__(self, media_dir: str, stream_manager: StreamManager):
+        self.media_dir = Path(media_dir)
+        self.media_dir.mkdir(parents=True, exist_ok=True)
+        self.stream_manager = stream_manager
+        self._lock = threading.Lock()
+        self._sessions: Dict[int, Dict] = {}
+
+    def start(self, camera: Camera) -> Dict[str, object]:
+        with self._lock:
+            current = self._sessions.get(camera.id)
+            if current and current.get("running"):
+                return {"ok": True, "already_running": True, "camera_id": camera.id}
+
+            started_at = datetime.utcnow()
+            ts = started_at.strftime("%Y%m%d_%H%M%S")
+            token = secrets.token_hex(4)
+            rel_path = f"clips/{camera.id}_{ts}_{token}.mp4"
+            abs_path = self.media_dir / rel_path
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+
+            stop_event = threading.Event()
+            session = {
+                "camera_id": camera.id,
+                "camera_type": camera.type,
+                "source": camera.source,
+                "started_at": started_at,
+                "file_path": rel_path,
+                "abs_path": abs_path,
+                "stop_event": stop_event,
+                "running": True,
+                "frames": 0,
+                "fps": 10.0,
+                "writer_started": False,
+                "stopped_at": None,
+            }
+
+            def run():
+                writer = None
+                fps = float(session["fps"])
+                frame_interval = 1.0 / max(1.0, fps)
+                try:
+                    while not stop_event.is_set():
+                        frame = self.stream_manager.get_frame(camera.id, camera.type, camera.source)
+                        if frame is None:
+                            time.sleep(0.03)
+                            continue
+                        if writer is None:
+                            height, width = frame.shape[:2]
+                            writer = cv2.VideoWriter(
+                                str(abs_path),
+                                cv2.VideoWriter_fourcc(*"mp4v"),
+                                fps,
+                                (width, height),
+                            )
+                            session["writer_started"] = True
+                        writer.write(frame)
+                        session["frames"] += 1
+                        time.sleep(frame_interval)
+                finally:
+                    if writer is not None:
+                        writer.release()
+                    session["running"] = False
+                    session["stopped_at"] = datetime.utcnow()
+
+            thread = threading.Thread(target=run, daemon=True)
+            session["thread"] = thread
+            self._sessions[camera.id] = session
+            thread.start()
+            return {"ok": True, "already_running": False, "camera_id": camera.id, "file_path": rel_path}
+
+    def stop(self, camera_id: int) -> Optional[Dict[str, object]]:
+        with self._lock:
+            session = self._sessions.get(camera_id)
+            if not session:
+                return None
+            session["stop_event"].set()
+            thread = session.get("thread")
+        if thread:
+            thread.join(timeout=8)
+        with self._lock:
+            self._sessions.pop(camera_id, None)
+
+        abs_path = Path(session["abs_path"])
+        frames = int(session.get("frames") or 0)
+        if not session.get("writer_started") or frames <= 0:
+            try:
+                abs_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "camera_id": camera_id,
+                "error": "No frames captured",
+                "started_at": session.get("started_at"),
+                "ended_at": session.get("stopped_at") or datetime.utcnow(),
+            }
+
+        ended_at = session.get("stopped_at") or datetime.utcnow()
+        started_at = session.get("started_at") or ended_at
+        duration = max(0.0, (ended_at - started_at).total_seconds())
+        size_bytes = abs_path.stat().st_size if abs_path.exists() else 0
+        return {
+            "ok": True,
+            "camera_id": camera_id,
+            "file_path": session.get("file_path"),
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_seconds": duration,
+            "size_bytes": int(size_bytes),
+        }
+
+    def active(self) -> List[Dict[str, object]]:
+        with self._lock:
+            rows = []
+            for camera_id, session in self._sessions.items():
+                if not session.get("running"):
+                    continue
+                rows.append(
+                    {
+                        "camera_id": camera_id,
+                        "file_path": session.get("file_path"),
+                        "started_at": session.get("started_at"),
+                        "frames": int(session.get("frames") or 0),
+                    }
+                )
+            return rows
+
+    def stop_all(self):
+        for active in list(self.active()):
+            self.stop(int(active["camera_id"]))
+
 
 app = FastAPI(title="CarVision by SpinelTech")
 
@@ -105,8 +266,246 @@ app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
 templates = Jinja2Templates(directory=str(LEGACY_FRONTEND_DIR / "templates"))
 
 stream_manager = StreamManager()
+manual_clip_manager = ManualClipManager(media_dir=MEDIA_DIR, stream_manager=stream_manager)
 camera_manager = CameraManager(media_dir=MEDIA_DIR, stream_manager=stream_manager)
 API_TOKEN_SCHEME = HTTPBearer(auto_error=False)
+LIVE_STREAM_JPEG_PARAMS = [int(cv2.IMWRITE_JPEG_QUALITY), 82]
+TRAIN_PIPELINE_LOCK = threading.Lock()
+TRAIN_PIPELINE_THREAD: Optional[threading.Thread] = None
+TRAIN_PIPELINE_STOP = threading.Event()
+TRAIN_PIPELINE_PROC_LOCK = threading.Lock()
+TRAIN_PIPELINE_PROC: Optional[subprocess.Popen] = None
+TRAIN_SCHEDULER_LOCK = threading.Lock()
+TRAIN_SCHEDULER_THREAD: Optional[threading.Thread] = None
+TRAIN_SCHEDULER_STOP = threading.Event()
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _job_payload(job: Optional[TrainingJob]) -> Dict[str, object]:
+    if not job:
+        return {
+            "id": None,
+            "status": "idle",
+            "mode": None,
+            "stage": "idle",
+            "progress": 0,
+            "message": "Idle",
+            "total_samples": 0,
+            "trained_samples": 0,
+            "ocr_scanned": 0,
+            "ocr_updated": 0,
+            "chunk_size": 0,
+            "chunk_index": 0,
+            "chunk_total": 0,
+            "run_dir": None,
+            "model_path": None,
+            "details": {},
+            "error": None,
+            "started_at": None,
+            "updated_at": None,
+            "finished_at": None,
+            "run_started_at": None,
+        }
+    return {
+        "id": job.id,
+        "kind": job.kind,
+        "status": job.status,
+        "mode": job.mode,
+        "stage": job.stage,
+        "progress": int(max(0.0, min(100.0, float(job.progress or 0.0)))),
+        "message": job.message or "",
+        "total_samples": int(job.total_samples or 0),
+        "trained_samples": int(job.trained_samples or 0),
+        "ocr_scanned": int(job.ocr_scanned or 0),
+        "ocr_updated": int(job.ocr_updated or 0),
+        "chunk_size": int(job.chunk_size or 0),
+        "chunk_index": int(job.chunk_index or 0),
+        "chunk_total": int(job.chunk_total or 0),
+        "run_dir": job.run_dir,
+        "model_path": job.model_path,
+        "details": job.details or {},
+        "error": job.error,
+        "run_started_at": job.run_started_at.isoformat() if job.run_started_at else None,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+    }
+
+
+def _job_duration_seconds(job: TrainingJob) -> Optional[float]:
+    start = job.run_started_at or job.started_at
+    if not start:
+        return None
+    end = job.finished_at or datetime.utcnow()
+    try:
+        return max(0.0, float((end - start).total_seconds()))
+    except Exception:
+        return None
+
+
+def _job_history_payload(job: TrainingJob) -> Dict[str, object]:
+    payload = _job_payload(job)
+    payload["duration_seconds"] = _job_duration_seconds(job)
+    return payload
+
+
+def _append_training_job_log(job: TrainingJob, message: str) -> None:
+    details = dict(job.details or {})
+    logs = details.get("logs")
+    if not isinstance(logs, list):
+        logs = []
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    logs.append(f"[{ts}] {message}")
+    details["logs"] = logs[-120:]
+    job.details = details
+
+
+def _latest_training_job(db: Session) -> Optional[TrainingJob]:
+    return (
+        db.query(TrainingJob)
+        .filter(TrainingJob.kind == "pipeline")
+        .order_by(TrainingJob.started_at.desc(), TrainingJob.id.desc())
+        .first()
+    )
+
+
+def _active_training_job(db: Session) -> Optional[TrainingJob]:
+    return (
+        db.query(TrainingJob)
+        .filter(TrainingJob.kind == "pipeline", TrainingJob.status.in_(("queued", "running")))
+        .order_by(TrainingJob.started_at.desc(), TrainingJob.id.desc())
+        .first()
+    )
+
+
+def _touch_training_job(
+    db: Session,
+    job: TrainingJob,
+    *,
+    status: Optional[str] = None,
+    stage: Optional[str] = None,
+    progress: Optional[float] = None,
+    message: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    if status is not None:
+        job.status = status
+    if stage is not None:
+        job.stage = stage
+    if progress is not None:
+        try:
+            job.progress = max(0.0, min(100.0, float(progress)))
+        except Exception:
+            pass
+    if message is not None:
+        job.message = str(message)[:600]
+        _append_training_job_log(job, job.message)
+        _set_training_status(job.status or "running", job.message, run_dir=job.run_dir, model_path=job.model_path)
+    if error is not None:
+        job.error = str(error)[:2000]
+    job.updated_at = datetime.utcnow()
+    if (job.status or "") in {"complete", "failed", "stopped"} and not job.finished_at:
+        job.finished_at = datetime.utcnow()
+    db.add(job)
+    db.commit()
+
+
+def _set_training_proc(proc: Optional[subprocess.Popen]) -> None:
+    global TRAIN_PIPELINE_PROC
+    with TRAIN_PIPELINE_PROC_LOCK:
+        TRAIN_PIPELINE_PROC = proc
+
+
+def _stop_training_proc(force: bool = False) -> bool:
+    with TRAIN_PIPELINE_PROC_LOCK:
+        proc = TRAIN_PIPELINE_PROC
+    if not proc or proc.poll() is not None:
+        return False
+    try:
+        if force:
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+        return True
+    except Exception:
+        try:
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+            return True
+        except Exception:
+            return False
+
+
+def _resume_pipeline_if_needed() -> None:
+    try:
+        with SessionLocal() as db:
+            active = _active_training_job(db)
+            if active:
+                _start_training_pipeline_thread(active.id)
+    except Exception:
+        pass
+
+
+def _training_scheduler_loop() -> None:
+    while not TRAIN_SCHEDULER_STOP.is_set():
+        try:
+            with SessionLocal() as db:
+                enabled = _as_bool(_get_app_setting(db, "train_nightly_enabled", "1"), True)
+                if enabled:
+                    try:
+                        hh = max(0, min(23, int(_get_app_setting(db, "train_nightly_hour", "0") or "0")))
+                    except Exception:
+                        hh = 0
+                    try:
+                        mm = max(0, min(59, int(_get_app_setting(db, "train_nightly_minute", "0") or "0")))
+                    except Exception:
+                        mm = 0
+                    tz_name = (_get_app_setting(db, "train_schedule_tz", "America/Toronto") or "America/Toronto").strip()
+                    try:
+                        now_local = datetime.now(ZoneInfo(tz_name))
+                    except Exception:
+                        now_local = datetime.utcnow()
+                        tz_name = "UTC"
+                    today = now_local.strftime("%Y-%m-%d")
+                    last_day = _get_app_setting(db, "train_nightly_last_date", "")
+                    if now_local.hour == hh and now_local.minute == mm and last_day != today:
+                        result = _start_training_pipeline_from_request(db, mode="new_only", trigger="nightly")
+                        _set_app_setting(db, "train_nightly_last_date", today)
+                        db.commit()
+                        if result.get("ok"):
+                            try:
+                                _create_notification(
+                                    db,
+                                    title="Nightly training started",
+                                    message=f"Nightly job started ({tz_name} {hh:02d}:{mm:02d})",
+                                    level="info",
+                                    kind="training",
+                                )
+                                db.commit()
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+        TRAIN_SCHEDULER_STOP.wait(20)
+
+
+def _start_training_scheduler() -> None:
+    global TRAIN_SCHEDULER_THREAD
+    with TRAIN_SCHEDULER_LOCK:
+        if TRAIN_SCHEDULER_THREAD and TRAIN_SCHEDULER_THREAD.is_alive():
+            return
+        TRAIN_SCHEDULER_STOP.clear()
+        TRAIN_SCHEDULER_THREAD = threading.Thread(target=_training_scheduler_loop, daemon=True)
+        TRAIN_SCHEDULER_THREAD.start()
 
 
 def _api_create_token(username: str) -> str:
@@ -151,9 +550,13 @@ def _api_training_sample_payload(row: TrainingSample) -> Dict[str, object]:
         "bbox": row.bbox,
         "notes": row.notes,
         "no_plate": bool(row.no_plate),
+        "unclear_plate": bool(getattr(row, "unclear_plate", False)),
         "ignored": bool(row.ignored),
         "import_batch": row.import_batch,
+        "processed_at": row.processed_at.isoformat() if getattr(row, "processed_at", None) else None,
+        "processed": bool(getattr(row, "processed_at", None)),
         "last_trained_at": row.last_trained_at.isoformat() if row.last_trained_at else None,
+        "trained": bool(row.last_trained_at),
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
@@ -194,6 +597,16 @@ def _ensure_capture_token(camera: Camera, db: Session):
         db.commit()
 
 
+def _get_browser_camera_by_token(camera_id: int, token: Optional[str], db: Session) -> Camera:
+    camera = db.get(Camera, camera_id)
+    if not camera or camera.type != "browser":
+        raise HTTPException(status_code=404, detail="Camera not found")
+    _ensure_capture_token(camera, db)
+    if not token or token != camera.capture_token:
+        raise HTTPException(status_code=403, detail="Invalid token")
+    return camera
+
+
 def _public_urls(request: Request):
     base = PUBLIC_BASE_URL or str(request.base_url)
     if not base.endswith("/"):
@@ -204,16 +617,28 @@ def _public_urls(request: Request):
     return base, https_base
 
 
+def _frontend_capture_url(request: Request, camera_id: int, token: str) -> str:
+    token_q = quote_plus(token or "")
+    if FRONTEND_PUBLIC_BASE_URL:
+        return f"{FRONTEND_PUBLIC_BASE_URL.rstrip('/')}/capture/{camera_id}?token={token_q}"
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL.rstrip('/')}/capture/{camera_id}?token={token_q}"
+    try:
+        parsed = urlparse(str(request.base_url).rstrip("/"))
+        host = parsed.hostname or request.url.hostname or "localhost"
+        scheme = FRONTEND_PUBLIC_SCHEME if FRONTEND_PUBLIC_SCHEME in {"http", "https"} else "http"
+        port = FRONTEND_PUBLIC_PORT or ("443" if scheme == "https" else "80")
+        if (scheme == "http" and port == "80") or (scheme == "https" and port == "443"):
+            netloc = host
+        else:
+            netloc = f"{host}:{port}"
+        return f"{scheme}://{netloc}/capture/{camera_id}?token={token_q}"
+    except Exception:
+        return f"/capture/{camera_id}?token={token_q}"
+
+
 def _normalize_camera_source(camera_type: str, source: str) -> str:
-    if not source:
-        return source
-    normalized = source.strip()
-    if camera_type == "http_mjpeg":
-        if normalized.startswith("tcp://"):
-            normalized = "http://" + normalized[len("tcp://") :]
-        if not normalized.startswith("http://") and not normalized.startswith("https://"):
-            normalized = "http://" + normalized
-    return normalized
+    return _normalize_camera_source_service(camera_type, source)
 
 
 def _jwt_subject_from_token(token: Optional[str]) -> Optional[str]:
@@ -270,6 +695,7 @@ def on_startup():
             "yolo_imgsz": "640",
             "yolo_iou": "0.45",
             "yolo_max_det": "5",
+            "inference_device": "cpu",
             "ocr_max_width": "1280",
             "ocr_langs": "en",
             "contour_canny_low": "30",
@@ -297,17 +723,48 @@ def on_startup():
             "train_fliplr": "0.5",
             "train_mosaic": "0.5",
             "train_mixup": "0.1",
+            "plate_region": "generic",
+            "plate_min_length": "5",
+            "plate_max_length": "8",
+            "plate_charset": "alnum",
+            "plate_pattern_regex": "",
+            "plate_shape_hint": "standard",
+            "plate_reference_date": "",
+            "ocr_char_map": "{}",
+            "allowed_stationary_enabled": "1",
+            "allowed_stationary_motion_threshold": "7.0",
+            "allowed_stationary_hold_seconds": "0",
+            "train_chunk_size": "1000",
+            "train_chunk_epochs": "8",
+            "train_new_only_default": "1",
+            "train_nightly_enabled": "1",
+            "train_nightly_hour": "0",
+            "train_nightly_minute": "0",
+            "train_schedule_tz": "America/Toronto",
+            "train_nightly_last_date": "",
         }
         for key, value in defaults.items():
             if not db.get(AppSetting, key):
                 db.add(AppSetting(key=key, value=value))
+        # Migrate cameras that still have the old 1.0s scan_interval default
+        # to the faster 0.15s value so detection works at real-time speed.
+        db.query(Camera).filter(Camera.scan_interval >= 1.0).update(
+            {Camera.scan_interval: 0.15}, synchronize_session=False
+        )
         db.commit()
+        _refresh_anpr_config(db)
     camera_manager.start()
+    _resume_pipeline_if_needed()
+    _start_training_scheduler()
 
 
 @app.on_event("shutdown")
 def on_shutdown():
     camera_manager.stop()
+    manual_clip_manager.stop_all()
+    TRAIN_PIPELINE_STOP.set()
+    _stop_training_proc(force=False)
+    TRAIN_SCHEDULER_STOP.set()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -343,7 +800,7 @@ def capture_page(camera_id: int, request: Request, db: Session = Depends(get_db)
     token = request.query_params.get("token")
     if not token or token != camera.capture_token:
         return JSONResponse({"error": "invalid token"}, status_code=403)
-    return templates.TemplateResponse("capture.html", {"request": request, "camera_id": camera_id, "token": token})
+    return RedirectResponse(_frontend_capture_url(request, camera_id, token), status_code=302)
 
 
 @app.get("/capture", response_class=HTMLResponse)
@@ -370,12 +827,10 @@ def capture_list(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/ingest/{camera_id}")
 async def ingest_frame(camera_id: int, request: Request, db: Session = Depends(get_db)):
-    camera = db.get(Camera, camera_id)
-    if not camera or camera.type != "browser":
-        return JSONResponse({"ok": False, "error": "camera not found"}, status_code=404)
-    token = request.query_params.get("token")
-    if not token or token != camera.capture_token:
-        return JSONResponse({"ok": False, "error": "invalid token"}, status_code=403)
+    try:
+        _get_browser_camera_by_token(camera_id, request.query_params.get("token"), db)
+    except HTTPException as exc:
+        return JSONResponse({"ok": False, "error": exc.detail}, status_code=exc.status_code)
 
     data = await request.body()
     if not data:
@@ -391,12 +846,87 @@ async def ingest_frame(camera_id: int, request: Request, db: Session = Depends(g
 
 @app.get("/capture/{camera_id}/overlay")
 def capture_overlay(camera_id: int, request: Request, db: Session = Depends(get_db)):
-    camera = db.get(Camera, camera_id)
-    if not camera or camera.type != "browser":
-        return JSONResponse({"ok": False, "error": "camera not found"}, status_code=404)
-    token = request.query_params.get("token")
-    if not token or token != camera.capture_token:
-        return JSONResponse({"ok": False, "error": "invalid token"}, status_code=403)
+    try:
+        _get_browser_camera_by_token(camera_id, request.query_params.get("token"), db)
+    except HTTPException as exc:
+        return JSONResponse({"ok": False, "error": exc.detail}, status_code=exc.status_code)
+
+    det = stream_manager.get_detection(camera_id)
+    if not det:
+        return {"ok": True, "detection": None}
+    if isinstance(det, dict) and not det.get("debug_steps"):
+        debug_map = {
+            "color": det.get("debug_color_path"),
+            "bw": det.get("debug_bw_path"),
+            "gray": det.get("debug_gray_path"),
+            "edged": det.get("debug_edged_path"),
+            "mask": det.get("debug_mask_path"),
+        }
+        det["debug_steps"] = _debug_steps_from_paths(debug_map)
+    return {"ok": True, "detection": det}
+
+
+@app.get("/capture/{camera_id}/session")
+def capture_session(camera_id: int, request: Request, db: Session = Depends(get_db)):
+    camera = _get_browser_camera_by_token(camera_id, request.query_params.get("token"), db)
+    return {
+        "ok": True,
+        "camera": {
+            "id": camera.id,
+            "name": camera.name,
+            "location": camera.location,
+            "online": stream_manager.is_external_online(camera.id),
+        },
+    }
+
+
+@app.get("/api/v1/capture/{camera_id:int}")
+def api_v1_capture_session(
+    camera_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    camera = _get_browser_camera_by_token(camera_id, request.query_params.get("token"), db)
+    return {
+        "ok": True,
+        "camera": {
+            "id": camera.id,
+            "name": camera.name,
+            "location": camera.location,
+            "online": stream_manager.is_external_online(camera.id),
+        },
+    }
+
+
+@app.post("/api/v1/capture/{camera_id:int}/ingest")
+async def api_v1_capture_ingest(
+    camera_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    camera = _get_browser_camera_by_token(camera_id, request.query_params.get("token"), db)
+    del camera
+
+    data = await request.body()
+    if not data:
+        return JSONResponse({"ok": False, "error": "empty"}, status_code=400)
+
+    frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        return JSONResponse({"ok": False, "error": "invalid image"}, status_code=400)
+
+    stream_manager.set_external_frame(camera_id, frame, data)
+    return {"ok": True}
+
+
+@app.get("/api/v1/capture/{camera_id:int}/overlay")
+def api_v1_capture_overlay(
+    camera_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    camera = _get_browser_camera_by_token(camera_id, request.query_params.get("token"), db)
+    del camera
 
     det = stream_manager.get_detection(camera_id)
     if not det:
@@ -473,6 +1003,31 @@ def _notification_payload(row: Notification) -> Dict[str, object]:
         "detection_id": row.detection_id,
         "extra": row.extra or {},
     }
+
+
+def _clip_record_payload(row: ClipRecord, camera_name: Optional[str] = None) -> Dict[str, object]:
+    return {
+        "id": row.id,
+        "camera_id": row.camera_id,
+        "camera_name": camera_name,
+        "kind": row.kind,
+        "file_path": row.file_path,
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "ended_at": row.ended_at.isoformat() if row.ended_at else None,
+        "duration_seconds": row.duration_seconds,
+        "size_bytes": row.size_bytes,
+        "detection_count": row.detection_count,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _clip_abs_path(rel_path: Optional[str]) -> Optional[Path]:
+    if not rel_path:
+        return None
+    clean = str(rel_path).replace("\\", "/").lstrip("/")
+    if clean.startswith("media/"):
+        clean = clean[len("media/") :]
+    return Path(MEDIA_DIR) / clean
 
 
 @app.get("/admin/notifications", response_class=HTMLResponse)
@@ -665,9 +1220,25 @@ def api_stream_health(db: Session = Depends(get_db)):
     items = {}
     for cam in cameras:
         last_ok = stream_manager.get_last_ok(cam.id, cam.type, cam.source)
+        age = (now - last_ok) if last_ok else None
+        reason = None
+        online = bool(last_ok and age is not None and age <= 5.0)
+        if cam.type == "webcam":
+            try:
+                webcam_idx = int(cam.source)
+            except Exception:
+                webcam_idx = 0
+            if not Path(f"/dev/video{webcam_idx}").exists():
+                online = False
+                reason = f"webcam /dev/video{webcam_idx} not found"
+        elif cam.type == "browser" and not stream_manager.is_external_online(cam.id):
+            online = False
+            reason = "waiting for phone stream"
         items[cam.id] = {
             "last_ok": last_ok,
-            "age": (now - last_ok) if last_ok else None,
+            "age": age,
+            "online": online,
+            "reason": reason,
         }
     return {"items": items}
 
@@ -702,7 +1273,7 @@ def create_camera(
     source: str = Form(...),
     location: Optional[str] = Form(None),
     enabled: Optional[bool] = Form(False),
-    scan_interval: float = Form(1.0),
+    scan_interval: float = Form(0.15),
     cooldown_seconds: float = Form(10.0),
     save_snapshot: Optional[bool] = Form(False),
     save_clip: Optional[bool] = Form(False),
@@ -716,8 +1287,7 @@ def create_camera(
     detector_mode: str = Form("inherit"),
     db: Session = Depends(get_db),
 ):
-    if detector_mode not in {"inherit", "auto", "contour", "yolo"}:
-        detector_mode = "inherit"
+    detector_mode = _validate_detector_mode(detector_mode or "inherit")
     source = _normalize_camera_source(type, source)
     camera = Camera(
         name=name,
@@ -753,7 +1323,7 @@ def update_camera(
     source: str = Form(...),
     location: Optional[str] = Form(None),
     enabled: Optional[bool] = Form(False),
-    scan_interval: float = Form(1.0),
+    scan_interval: float = Form(0.15),
     cooldown_seconds: float = Form(10.0),
     save_snapshot: Optional[bool] = Form(False),
     save_clip: Optional[bool] = Form(False),
@@ -767,8 +1337,7 @@ def update_camera(
     detector_mode: str = Form("inherit"),
     db: Session = Depends(get_db),
 ):
-    if detector_mode not in {"inherit", "auto", "contour", "yolo"}:
-        detector_mode = "inherit"
+    detector_mode = _validate_detector_mode(detector_mode or "inherit")
     camera = db.get(Camera, camera_id)
     if camera:
         source = _normalize_camera_source(type, source)
@@ -861,8 +1430,10 @@ def admin_settings(request: Request, db: Session = Depends(get_db)):
         "settings.html",
         {
             "request": request,
+            "saved": request.query_params.get("saved") == "1",
             "detector_mode": detector.value if detector else "contour",
             "max_live": max_live.value if max_live else "16",
+            "inference_device": _get("inference_device", "cpu"),
             "yolo_conf": _get("yolo_conf", "0.25"),
             "yolo_imgsz": _get("yolo_imgsz", "640"),
             "yolo_iou": _get("yolo_iou", "0.45"),
@@ -885,6 +1456,7 @@ def admin_settings(request: Request, db: Session = Depends(get_db)):
 def update_settings(
     detector_mode: str = Form("contour"),
     max_live_cameras: int = Form(16),
+    inference_device: str = Form("cpu"),
     yolo_conf: float = Form(0.25),
     yolo_imgsz: int = Form(640),
     yolo_iou: float = Form(0.45),
@@ -904,6 +1476,9 @@ def update_settings(
     detector_mode = detector_mode.lower()
     if detector_mode not in {"auto", "contour", "yolo"}:
         detector_mode = "contour"
+    inference_device = str(inference_device or "cpu").strip().lower()
+    if inference_device not in {"cpu", "gpu"}:
+        inference_device = "cpu"
     setting = db.get(AppSetting, "detector_mode")
     if not setting:
         setting = AppSetting(key="detector_mode", value=detector_mode)
@@ -926,6 +1501,7 @@ def update_settings(
         else:
             setting.value = str(value)
 
+    _save_setting("inference_device", inference_device)
     _save_setting("yolo_conf", max(0.01, min(float(yolo_conf), 0.99)))
     _save_setting("yolo_imgsz", max(320, min(int(yolo_imgsz), 1280)))
     _save_setting("yolo_iou", max(0.05, min(float(yolo_iou), 0.95)))
@@ -941,7 +1517,8 @@ def update_settings(
     _save_setting("contour_pad_ratio", max(0.05, min(float(contour_pad_ratio), 0.5)))
     _save_setting("contour_pad_min", max(4, min(int(contour_pad_min), 100)))
     db.commit()
-    return RedirectResponse("/admin/settings", status_code=303)
+    _refresh_anpr_config(db)
+    return RedirectResponse("/admin/settings?saved=1", status_code=303)
 
 
 def _get_upload_camera(db: Session) -> Camera:
@@ -954,7 +1531,7 @@ def _get_upload_camera(db: Session) -> Camera:
         source="upload",
         location="Uploads",
         enabled=False,
-        scan_interval=1.0,
+        scan_interval=0.15,
         cooldown_seconds=0.0,
         save_snapshot=True,
         save_clip=False,
@@ -995,13 +1572,55 @@ def _known_plate_candidates(db: Session) -> List[str]:
     return [p for p in pool if len(p) >= 5]
 
 
+def _apply_plate_policy(
+    plate_text: str,
+    min_len: int,
+    max_len: int,
+    charset: str,
+    pattern_regex: str,
+) -> str:
+    out = "".join(ch for ch in str(plate_text or "").upper() if ch.isalnum())
+    if charset == "digits":
+        out = "".join(ch for ch in out if ch.isdigit())
+    elif charset == "letters":
+        out = "".join(ch for ch in out if ch.isalpha())
+    if len(out) < min_len:
+        return out
+    if len(out) > max_len:
+        out = out[:max_len]
+    if pattern_regex:
+        try:
+            if not re.fullmatch(pattern_regex, out):
+                return out
+        except re.error:
+            pass
+    return out
+
+
 def _match_known_plate(db: Session, plate_text: str) -> Tuple[str, Optional[float]]:
-    normalized = (plate_text or "").strip().upper()
-    if len(normalized) < 5:
+    try:
+        min_len = int(_get_app_setting(db, "plate_min_length", "5"))
+    except Exception:
+        min_len = 5
+    try:
+        max_len = int(_get_app_setting(db, "plate_max_length", "8"))
+    except Exception:
+        max_len = 8
+    if min_len > max_len:
+        min_len, max_len = max_len, min_len
+    charset = _get_app_setting(db, "plate_charset", "alnum").strip().lower()
+    if charset not in {"alnum", "digits", "letters"}:
+        charset = "alnum"
+    pattern_regex = _get_app_setting(db, "plate_pattern_regex", "").strip()
+
+    normalized = _apply_plate_policy(plate_text, min_len=min_len, max_len=max_len, charset=charset, pattern_regex=pattern_regex)
+    if len(normalized) < min_len:
         return normalized, None
     candidates = _known_plate_candidates(db)
     if not candidates:
         return normalized, None
+    candidates = [_apply_plate_policy(c, min_len=min_len, max_len=max_len, charset=charset, pattern_regex=pattern_regex) for c in candidates]
+    candidates = [c for c in candidates if c and len(c) >= min_len]
     if normalized in candidates:
         return normalized, 1.0
     best = normalized
@@ -1706,6 +2325,54 @@ def _append_query(url: str, **params) -> str:
     return f"{url}{sep}{'&'.join(pairs)}"
 
 
+def _parse_discovery_subnets(raw_value: Optional[str]) -> Tuple[List[object], List[str]]:
+    if not raw_value:
+        return [], []
+    networks: List[object] = []
+    invalid: List[str] = []
+    for token in str(raw_value).split(","):
+        item = token.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except Exception:
+            invalid.append(item)
+    return networks, invalid
+
+
+def _xaddr_host_port(xaddr: str) -> Tuple[Optional[str], Optional[int]]:
+    try:
+        parsed = urlparse(str(xaddr))
+    except Exception:
+        return None, None
+    host = parsed.hostname
+    if not host:
+        return None, None
+    if parsed.port:
+        return host, int(parsed.port)
+    return host, 443 if parsed.scheme == "https" else 80
+
+
+def _host_in_subnets(host: str, subnets: List[object]) -> bool:
+    if not subnets:
+        return True
+    try:
+        ip_value = ipaddress.ip_address(host)
+    except Exception:
+        return False
+    return any(ip_value in net for net in subnets)
+
+
+def _probe_tcp_port(host: str, port: int, timeout: float = 0.35) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            return sock.connect_ex((host, int(port))) == 0
+    except Exception:
+        return False
+
+
 def _parse_detection_ids(raw: Optional[str]) -> List[int]:
     if not raw:
         return []
@@ -1921,6 +2588,330 @@ def _get_app_setting(db: Session, key: str, default: str) -> str:
     return str(setting.value)
 
 
+def _set_app_setting(db: Session, key: str, value: str) -> None:
+    setting = db.get(AppSetting, key)
+    if not setting:
+        setting = AppSetting(key=key, value=value)
+        db.add(setting)
+    else:
+        setting.value = value
+
+
+def _batch_ocr_job_key(batch_id: str) -> str:
+    return f"batch_ocr_job:{(batch_id or '').strip()[:80]}"
+
+
+def _batch_ocr_stop_key(batch_id: str) -> str:
+    return f"batch_ocr_stop:{(batch_id or '').strip()[:80]}"
+
+
+def _utc_iso_now() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def _parse_iso_datetime(value: object) -> Optional[datetime]:
+    if not value:
+        return None
+    txt = str(value).strip()
+    if not txt:
+        return None
+    try:
+        return datetime.fromisoformat(txt.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _batch_ocr_stop_requested(db: Session, batch_id: str) -> bool:
+    return _as_bool(_get_app_setting(db, _batch_ocr_stop_key(batch_id), "0"), False)
+
+
+def _set_batch_ocr_stop(db: Session, batch_id: str, value: bool) -> None:
+    _set_app_setting(db, _batch_ocr_stop_key(batch_id), "1" if value else "0")
+
+
+def _finalize_batch_ocr_job_view(
+    db: Session,
+    batch_id: str,
+    data: Dict[str, object],
+    *,
+    persist_if_stale: bool = True,
+) -> Dict[str, object]:
+    status = str(data.get("status") or "").strip().lower()
+    started_at = _parse_iso_datetime(data.get("started_at"))
+    updated_at = _parse_iso_datetime(data.get("updated_at"))
+    finished_at = _parse_iso_datetime(data.get("finished_at"))
+    processed = int(data.get("processed") or 0)
+    total = max(0, int(data.get("total") or 0))
+    stale_seconds = None
+    now = datetime.utcnow()
+    if updated_at:
+        stale_seconds = max(0, int((now - updated_at).total_seconds()))
+    if status in {"running", "stopping"} and stale_seconds is not None and stale_seconds >= 180:
+        data["status"] = "stale"
+        data["message"] = (str(data.get("message") or "").strip() or "No heartbeat from worker")
+        data["error"] = str(data.get("error") or "").strip() or "Worker heartbeat stale"
+        if persist_if_stale:
+            _write_batch_ocr_job(db, batch_id, data)
+            db.commit()
+    if started_at and (status in {"running", "stopping", "stale"} or not finished_at):
+        elapsed = max(1.0, (now - started_at).total_seconds())
+    elif started_at and finished_at:
+        elapsed = max(1.0, (finished_at - started_at).total_seconds())
+    else:
+        elapsed = None
+    speed_sps = None
+    eta_seconds = None
+    if elapsed and processed > 0:
+        speed_sps = round(float(processed) / float(elapsed), 3)
+        if total > processed and speed_sps > 0:
+            eta_seconds = int((total - processed) / speed_sps)
+    data["stale_seconds"] = stale_seconds
+    data["speed_sps"] = speed_sps
+    data["eta_seconds"] = eta_seconds
+    return data
+
+
+def _get_batch_ocr_job(db: Session, batch_id: str) -> Optional[Dict[str, object]]:
+    key = _batch_ocr_job_key(batch_id)
+    raw = _get_app_setting(db, key, "")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _finalize_batch_ocr_job_view(db, batch_id, data, persist_if_stale=True)
+
+
+def _write_batch_ocr_job(db: Session, batch_id: str, payload: Dict[str, object]) -> None:
+    compact = {
+        "id": str(payload.get("id") or ""),
+        "batch": str(payload.get("batch") or batch_id),
+        "status": str(payload.get("status") or "unknown"),
+        "progress": int(max(0, min(100, int(payload.get("progress") or 0)))),
+        "processed": int(payload.get("processed") or 0),
+        "updated": int(payload.get("updated") or 0),
+        "skipped": int(payload.get("skipped") or 0),
+        "total": int(payload.get("total") or 0),
+        "chunk_size": int(payload.get("chunk_size") or 1000),
+        "message": str(payload.get("message") or "")[:160],
+        "started_at": str(payload.get("started_at") or ""),
+        "updated_at": str(payload.get("updated_at") or ""),
+        "heartbeat_at": str(payload.get("heartbeat_at") or payload.get("updated_at") or ""),
+        "finished_at": str(payload.get("finished_at") or ""),
+        "error": str(payload.get("error") or "")[:180],
+        "last_id": int(payload.get("last_id") or 0),
+        "chunk_index": int(payload.get("chunk_index") or 0),
+        "chunk_total": int(payload.get("chunk_total") or 0),
+        "speed_sps": float(payload.get("speed_sps") or 0),
+        "eta_seconds": int(payload.get("eta_seconds") or 0),
+        "current_sample_id": int(payload.get("current_sample_id") or 0),
+        "resumed_from": int(payload.get("resumed_from") or 0),
+    }
+    # app_settings.value is VARCHAR(500), so keep serialized payload safely under that size.
+    compact["message"] = str(compact.get("message") or "")[:80]
+    compact["error"] = str(compact.get("error") or "")[:80]
+    raw = json.dumps(compact, separators=(",", ":"))
+    if len(raw) > 480:
+        for key in ("current_sample_id", "eta_seconds", "speed_sps", "resumed_from", "chunk_total", "chunk_index"):
+            compact.pop(key, None)
+        compact["message"] = str(compact.get("message") or "")[:56]
+        compact["error"] = str(compact.get("error") or "")[:56]
+        raw = json.dumps(compact, separators=(",", ":"))
+    if len(raw) > 480:
+        compact["message"] = ""
+        compact["error"] = ""
+        raw = json.dumps(compact, separators=(",", ":"))
+    _set_app_setting(db, _batch_ocr_job_key(batch_id), raw)
+
+
+def _refresh_anpr_config(db: Session) -> None:
+    set_anpr_config(
+        {
+            "inference_device": _get_app_setting(db, "inference_device", "cpu"),
+            "ocr_max_width": _get_app_setting(db, "ocr_max_width", "1280"),
+            "ocr_langs": _get_app_setting(db, "ocr_langs", "en"),
+            "contour_canny_low": _get_app_setting(db, "contour_canny_low", "30"),
+            "contour_canny_high": _get_app_setting(db, "contour_canny_high", "200"),
+            "contour_bilateral_d": _get_app_setting(db, "contour_bilateral_d", "11"),
+            "contour_bilateral_sigma_color": _get_app_setting(db, "contour_bilateral_sigma_color", "17"),
+            "contour_bilateral_sigma_space": _get_app_setting(db, "contour_bilateral_sigma_space", "17"),
+            "contour_approx_eps": _get_app_setting(db, "contour_approx_eps", "0.018"),
+            "contour_pad_ratio": _get_app_setting(db, "contour_pad_ratio", "0.15"),
+            "contour_pad_min": _get_app_setting(db, "contour_pad_min", "18"),
+            "plate_min_length": _get_app_setting(db, "plate_min_length", "5"),
+            "plate_max_length": _get_app_setting(db, "plate_max_length", "8"),
+            "plate_charset": _get_app_setting(db, "plate_charset", "alnum"),
+            "plate_pattern_regex": _get_app_setting(db, "plate_pattern_regex", ""),
+            "plate_shape_hint": _get_app_setting(db, "plate_shape_hint", "standard"),
+            "plate_reference_date": _get_app_setting(db, "plate_reference_date", ""),
+            "ocr_char_map": _get_app_setting(db, "ocr_char_map", "{}"),
+        }
+    )
+
+
+def _training_settings_payload(db: Session) -> Dict[str, str]:
+    return {
+        "train_model": _get_app_setting(db, "train_model", "yolov8n.pt"),
+        "train_epochs": _get_app_setting(db, "train_epochs", "50"),
+        "train_imgsz": _get_app_setting(db, "train_imgsz", "640"),
+        "train_batch": _get_app_setting(db, "train_batch", "-1"),
+        "train_device": _get_app_setting(db, "train_device", "auto"),
+        "train_patience": _get_app_setting(db, "train_patience", "15"),
+        "plate_region": _get_app_setting(db, "plate_region", "generic"),
+        "plate_min_length": _get_app_setting(db, "plate_min_length", "5"),
+        "plate_max_length": _get_app_setting(db, "plate_max_length", "8"),
+        "plate_charset": _get_app_setting(db, "plate_charset", "alnum"),
+        "plate_pattern_regex": _get_app_setting(db, "plate_pattern_regex", ""),
+        "plate_shape_hint": _get_app_setting(db, "plate_shape_hint", "standard"),
+        "plate_reference_date": _get_app_setting(db, "plate_reference_date", ""),
+        "allowed_stationary_enabled": _get_app_setting(db, "allowed_stationary_enabled", "1"),
+        "allowed_stationary_motion_threshold": _get_app_setting(db, "allowed_stationary_motion_threshold", "7.0"),
+        "allowed_stationary_hold_seconds": _get_app_setting(db, "allowed_stationary_hold_seconds", "0"),
+        "train_chunk_size": _get_app_setting(db, "train_chunk_size", "1000"),
+        "train_chunk_epochs": _get_app_setting(db, "train_chunk_epochs", "8"),
+        "train_new_only_default": _get_app_setting(db, "train_new_only_default", "1"),
+        "train_nightly_enabled": _get_app_setting(db, "train_nightly_enabled", "1"),
+        "train_nightly_hour": _get_app_setting(db, "train_nightly_hour", "0"),
+        "train_nightly_minute": _get_app_setting(db, "train_nightly_minute", "0"),
+        "train_schedule_tz": _get_app_setting(db, "train_schedule_tz", "America/Toronto"),
+    }
+
+
+def _sanitize_training_settings(payload: Dict[str, object]) -> Dict[str, str]:
+    train_model = str(payload.get("train_model") or "yolov8n.pt").strip() or "yolov8n.pt"
+    train_device = str(payload.get("train_device") or "auto").strip() or "auto"
+    plate_region = str(payload.get("plate_region") or "generic").strip()[:80] or "generic"
+    plate_charset = str(payload.get("plate_charset") or "alnum").strip().lower()
+    if plate_charset not in {"alnum", "digits", "letters"}:
+        plate_charset = "alnum"
+    plate_shape_hint = str(payload.get("plate_shape_hint") or "standard").strip().lower()
+    if plate_shape_hint not in {"standard", "long", "square", "motorcycle"}:
+        plate_shape_hint = "standard"
+    plate_pattern_regex = str(payload.get("plate_pattern_regex") or "").strip()[:200]
+    plate_reference_date = str(payload.get("plate_reference_date") or "").strip()[:40]
+    raw_stationary_enabled = payload.get("allowed_stationary_enabled", True)
+    if isinstance(raw_stationary_enabled, str):
+        allowed_stationary_enabled = raw_stationary_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        allowed_stationary_enabled = bool(raw_stationary_enabled)
+    try:
+        allowed_stationary_motion_threshold = max(
+            0.5,
+            min(
+                50.0,
+                float(
+                    payload.get("allowed_stationary_motion_threshold")
+                    if payload.get("allowed_stationary_motion_threshold") is not None
+                    else 7.0
+                ),
+            ),
+        )
+    except Exception:
+        allowed_stationary_motion_threshold = 7.0
+    try:
+        allowed_stationary_hold_seconds = max(
+            0.0,
+            min(
+                3600.0,
+                float(
+                    payload.get("allowed_stationary_hold_seconds")
+                    if payload.get("allowed_stationary_hold_seconds") is not None
+                    else 0.0
+                ),
+            ),
+        )
+    except Exception:
+        allowed_stationary_hold_seconds = 0.0
+
+    try:
+        plate_min_length = max(1, min(12, int(payload.get("plate_min_length") if payload.get("plate_min_length") is not None else 5)))
+    except Exception:
+        plate_min_length = 5
+    try:
+        plate_max_length = max(1, min(16, int(payload.get("plate_max_length") if payload.get("plate_max_length") is not None else 8)))
+    except Exception:
+        plate_max_length = 8
+    if plate_min_length > plate_max_length:
+        plate_min_length, plate_max_length = plate_max_length, plate_min_length
+
+    try:
+        train_epochs = max(1, int(payload.get("train_epochs") if payload.get("train_epochs") is not None else 50))
+    except Exception:
+        train_epochs = 50
+    try:
+        train_imgsz = max(160, int(payload.get("train_imgsz") if payload.get("train_imgsz") is not None else 640))
+    except Exception:
+        train_imgsz = 640
+    try:
+        train_batch = int(payload.get("train_batch") if payload.get("train_batch") is not None else -1)
+    except Exception:
+        train_batch = -1
+    try:
+        train_patience = max(1, int(payload.get("train_patience") if payload.get("train_patience") is not None else 15))
+    except Exception:
+        train_patience = 15
+    try:
+        train_chunk_size = max(100, min(5000, int(payload.get("train_chunk_size") if payload.get("train_chunk_size") is not None else 1000)))
+    except Exception:
+        train_chunk_size = 1000
+    try:
+        train_chunk_epochs = max(1, min(50, int(payload.get("train_chunk_epochs") if payload.get("train_chunk_epochs") is not None else 8)))
+    except Exception:
+        train_chunk_epochs = 8
+    raw_new_only = payload.get("train_new_only_default", True)
+    if isinstance(raw_new_only, str):
+        train_new_only_default = raw_new_only.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        train_new_only_default = bool(raw_new_only)
+    raw_nightly_enabled = payload.get("train_nightly_enabled", True)
+    if isinstance(raw_nightly_enabled, str):
+        train_nightly_enabled = raw_nightly_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        train_nightly_enabled = bool(raw_nightly_enabled)
+    try:
+        train_nightly_hour = max(0, min(23, int(payload.get("train_nightly_hour") if payload.get("train_nightly_hour") is not None else 0)))
+    except Exception:
+        train_nightly_hour = 0
+    try:
+        train_nightly_minute = max(0, min(59, int(payload.get("train_nightly_minute") if payload.get("train_nightly_minute") is not None else 0)))
+    except Exception:
+        train_nightly_minute = 0
+    train_schedule_tz = str(payload.get("train_schedule_tz") or "America/Toronto").strip()[:80] or "America/Toronto"
+    try:
+        ZoneInfo(train_schedule_tz)
+    except Exception:
+        train_schedule_tz = "America/Toronto"
+
+    return {
+        "train_model": train_model,
+        "train_epochs": str(train_epochs),
+        "train_imgsz": str(train_imgsz),
+        "train_batch": str(train_batch),
+        "train_device": train_device,
+        "train_patience": str(train_patience),
+        "plate_region": plate_region,
+        "plate_min_length": str(plate_min_length),
+        "plate_max_length": str(plate_max_length),
+        "plate_charset": plate_charset,
+        "plate_pattern_regex": plate_pattern_regex,
+        "plate_shape_hint": plate_shape_hint,
+        "plate_reference_date": plate_reference_date,
+        "allowed_stationary_enabled": "1" if allowed_stationary_enabled else "0",
+        "allowed_stationary_motion_threshold": str(allowed_stationary_motion_threshold),
+        "allowed_stationary_hold_seconds": str(allowed_stationary_hold_seconds),
+        "train_chunk_size": str(train_chunk_size),
+        "train_chunk_epochs": str(train_chunk_epochs),
+        "train_new_only_default": "1" if train_new_only_default else "0",
+        "train_nightly_enabled": "1" if train_nightly_enabled else "0",
+        "train_nightly_hour": str(train_nightly_hour),
+        "train_nightly_minute": str(train_nightly_minute),
+        "train_schedule_tz": train_schedule_tz,
+    }
+
+
 def _resolve_train_device(requested: str) -> str:
     if not requested:
         requested = "auto"
@@ -1936,192 +2927,740 @@ def _resolve_train_device(requested: str) -> str:
     return requested
 
 
-def _train_yolo_task(data_yaml: str, run_root: Path, sample_ids: List[int]):
+def _resolve_train_model_source(model_spec: str) -> str:
+    spec = str(model_spec or "").strip()
+    if not spec:
+        return "yolov8n.pt"
+    if spec.startswith(("http://", "https://")):
+        return spec
+    if Path(spec).exists() or spec.endswith(".pt"):
+        return spec
+
+    repo_id = None
+    filename = ""
+    if spec.startswith("hf://"):
+        rest = spec[5:].strip("/")
+        parts = rest.split("/")
+        if len(parts) >= 2:
+            repo_id = f"{parts[0]}/{parts[1]}"
+            filename = "/".join(parts[2:]).strip()
+    elif re.fullmatch(r"[\w.-]+/[\w.-]+(?::[^:]+)?", spec):
+        repo_id, _, filename = spec.partition(":")
+        filename = filename.strip()
+
+    if not repo_id:
+        return spec
+
     try:
-        _set_training_status("running", "Launching YOLO training...")
-        try:
-            from ultralytics import YOLO
-        except Exception:
-            _set_training_status("failed", "Ultralytics not available. Install dependencies first.")
-            return
-        with SessionLocal() as db:
-            model_name = _get_app_setting(db, "train_model", "yolov8n.pt")
-            epochs = int(_get_app_setting(db, "train_epochs", "50"))
-            imgsz = int(_get_app_setting(db, "train_imgsz", "640"))
-            batch = int(_get_app_setting(db, "train_batch", "-1"))
-            device_setting = _get_app_setting(db, "train_device", "auto")
-            patience = int(_get_app_setting(db, "train_patience", "15"))
-            aug = {
-                "hsv_h": float(_get_app_setting(db, "train_hsv_h", "0.015")),
-                "hsv_s": float(_get_app_setting(db, "train_hsv_s", "0.7")),
-                "hsv_v": float(_get_app_setting(db, "train_hsv_v", "0.4")),
-                "degrees": float(_get_app_setting(db, "train_degrees", "5.0")),
-                "translate": float(_get_app_setting(db, "train_translate", "0.1")),
-                "scale": float(_get_app_setting(db, "train_scale", "0.5")),
-                "shear": float(_get_app_setting(db, "train_shear", "2.0")),
-                "perspective": float(_get_app_setting(db, "train_perspective", "0.0005")),
-                "fliplr": float(_get_app_setting(db, "train_fliplr", "0.5")),
-                "mosaic": float(_get_app_setting(db, "train_mosaic", "0.5")),
-                "mixup": float(_get_app_setting(db, "train_mixup", "0.1")),
-            }
-        device = _resolve_train_device(device_setting)
+        from huggingface_hub import HfApi, hf_hub_download
+    except Exception as exc:
+        raise RuntimeError("Hugging Face model source requires huggingface_hub package.") from exc
 
-        _set_training_status(
-            "running",
-            f"Training config: model={model_name}, epochs={epochs}, imgsz={imgsz}, batch={batch}, device={device}, patience={patience}.",
-        )
-        model = YOLO(model_name)
-        run_name = datetime.utcnow().strftime("run_%Y%m%d_%H%M%S")
-        model.train(
-            data=data_yaml,
-            epochs=epochs,
-            imgsz=imgsz,
-            batch=batch,
-            device=device,
-            project=str(run_root),
-            name=run_name,
-            exist_ok=True,
-            verbose=False,
-            patience=patience,
-            amp=False,
-            hsv_h=aug["hsv_h"],
-            hsv_s=aug["hsv_s"],
-            hsv_v=aug["hsv_v"],
-            degrees=aug["degrees"],
-            translate=aug["translate"],
-            scale=aug["scale"],
-            shear=aug["shear"],
-            perspective=aug["perspective"],
-            fliplr=aug["fliplr"],
-            mosaic=aug["mosaic"],
-            mixup=aug["mixup"],
-        )
+    api = HfApi()
+    if not filename:
+        files = api.list_repo_files(repo_id=repo_id, repo_type="model")
+        preferred = [
+            "best.pt",
+            "weights/best.pt",
+            "model.pt",
+            "last.pt",
+            "weights/last.pt",
+        ]
+        for candidate in preferred:
+            if candidate in files:
+                filename = candidate
+                break
+        if not filename:
+            pt_files = [f for f in files if str(f).lower().endswith(".pt")]
+            if not pt_files:
+                raise RuntimeError(
+                    f"No .pt weight file found in Hugging Face repo '{repo_id}'. "
+                    "Use repo:filename.pt format."
+                )
+            filename = pt_files[0]
 
-        save_dir = None
-        if hasattr(model, "trainer") and getattr(model.trainer, "save_dir", None):
-            save_dir = Path(model.trainer.save_dir)
-        if not save_dir:
-            run_dirs = sorted(run_root.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
-            save_dir = run_dirs[0] if run_dirs else None
-        if not save_dir:
+    local_dir = PROJECT_ROOT / "models" / "hf_cache"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    return hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        repo_type="model",
+        local_dir=str(local_dir),
+        local_dir_use_symlinks=False,
+    )
+
+
+def _training_pending_filter(mode: str, run_started_at: datetime):
+    if mode == "all":
+        return or_(TrainingSample.last_trained_at.is_(None), TrainingSample.last_trained_at < run_started_at)
+    return or_(
+        TrainingSample.last_trained_at.is_(None),
+        and_(
+            TrainingSample.processed_at.isnot(None),
+            or_(TrainingSample.last_trained_at.is_(None), TrainingSample.last_trained_at < TrainingSample.processed_at),
+        ),
+    )
+
+
+def _learn_ocr_corrections_from_db(db: Session) -> Dict[str, object]:
+    rows = (
+        db.query(TrainingSample)
+        .filter(
+            TrainingSample.ignored.is_(False),
+            TrainingSample.no_plate.is_(False),
+            TrainingSample.plate_text.isnot(None),
+            TrainingSample.notes.isnot(None),
+        )
+        .all()
+    )
+
+    stats: Dict[str, Dict[str, int]] = {}
+    pairs = 0
+    for row in rows:
+        notes = str(row.notes or "")
+        raw = ""
+        if "OCR_PREFILL_RAW:" in notes:
+            raw = notes.split("OCR_PREFILL_RAW:", 1)[1].splitlines()[0].strip().upper()
+        elif "OCR_BATCH_RAW:" in notes:
+            raw = notes.split("OCR_BATCH_RAW:", 1)[1].splitlines()[0].strip().upper()
+        corrected = str(row.plate_text or "").strip().upper()
+        if not raw or not corrected or len(raw) != len(corrected):
+            continue
+        pairs += 1
+        for a, b in zip(raw, corrected):
+            if not a.isalnum() or not b.isalnum():
+                continue
+            bucket = stats.setdefault(a, {})
+            bucket[b] = bucket.get(b, 0) + 1
+
+    learned: Dict[str, str] = {}
+    for src, targets in stats.items():
+        best_char = src
+        best_count = 0
+        for dst, count in targets.items():
+            if count > best_count:
+                best_count = count
+                best_char = dst
+        if best_char != src and best_count >= 2:
+            learned[src] = best_char
+
+    setting = db.get(AppSetting, "ocr_char_map")
+    if not setting:
+        setting = AppSetting(key="ocr_char_map", value="{}")
+        db.add(setting)
+    setting.value = json.dumps(learned, separators=(",", ":"))
+    db.commit()
+    _refresh_anpr_config(db)
+    return {"pairs": pairs, "learned_map": learned, "replacements": len(learned)}
+
+
+def _compact_training_error_text(raw: object, fallback: str = "Training process failed") -> str:
+    text = str(raw or "").replace("\r", "\n")
+    lines = [line.strip() for line in text.splitlines() if line and line.strip()]
+    if not lines:
+        return fallback
+
+    cleaned: List[str] = []
+    for line in lines:
+        lowered = line.lower()
+        # Drop tqdm/progress-bar noise and repetitive transfer meter lines.
+        if (
+            "complete" in lowered and "|" in line and "%" in line
+        ) or (
+            "<?, ?b/s]" in lowered
+        ) or (
+            "/s]" in lowered and "%" in lowered and "|" in line
+        ):
+            continue
+        # Drop generic deprecation/future warnings from the user-facing status.
+        if "futurewarning:" in lowered or "deprecationwarning:" in lowered:
+            continue
+        cleaned.append(line)
+
+    if not cleaned:
+        return fallback
+
+    preferred = None
+    for line in reversed(cleaned):
+        lowered = line.lower()
+        if any(token in lowered for token in ("error", "exception", "failed", "not found", "no module named", "out of memory")):
+            preferred = line
+            break
+    message = preferred or cleaned[-1]
+    message = re.sub(r"\s+", " ", message).strip(" :-")
+    if len(message) > 220:
+        message = f"{message[:217]}..."
+    return message or fallback
+
+
+def _train_chunk_with_yolo(
+    *,
+    data_yaml: str,
+    run_root: Path,
+    model_source: str,
+    run_name: str,
+    epochs: int,
+    imgsz: int,
+    batch: int,
+    device: str,
+    patience: int,
+    aug: Dict[str, float],
+    stop_event: Optional[threading.Event] = None,
+    heartbeat: Optional[Callable[[int, int], None]] = None,
+) -> Tuple[Path, Path]:
+    worker = Path(__file__).resolve().parent / "services" / "yolo_train_worker.py"
+    with tempfile.NamedTemporaryFile(prefix="carvision_train_", suffix=".json", delete=False) as fh:
+        result_path = Path(fh.name)
+    cmd = [
+        sys.executable,
+        str(worker),
+        "--data-yaml", str(data_yaml),
+        "--run-root", str(run_root),
+        "--model-source", str(model_source),
+        "--run-name", str(run_name),
+        "--epochs", str(int(epochs)),
+        "--imgsz", str(int(imgsz)),
+        "--batch", str(int(batch)),
+        "--device", str(device),
+        "--patience", str(int(patience)),
+        "--aug-json", json.dumps(aug, separators=(",", ":")),
+        "--result-json", str(result_path),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    _set_training_proc(proc)
+    started_at = time.time()
+    last_beat = 0.0
+    try:
+        while proc.poll() is None:
+            if stop_event and stop_event.is_set():
+                _stop_training_proc(force=False)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _stop_training_proc(force=True)
+                raise InterruptedError("Training stop requested by admin")
+            now = time.time()
+            if heartbeat and (now - last_beat >= 2.0):
+                heartbeat(proc.pid, int(now - started_at))
+                last_beat = now
+            time.sleep(0.25)
+        stderr = (proc.stderr.read() or "").strip() if proc.stderr else ""
+        if proc.returncode != 0:
+            summary = _compact_training_error_text(stderr, fallback=f"Training process failed with exit code {proc.returncode}")
+            raise RuntimeError(summary)
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        save_dir = Path(str(payload.get("save_dir") or ""))
+        best = Path(str(payload.get("best") or ""))
+        if not save_dir.exists():
             raise RuntimeError("Could not locate training run directory.")
-
-        best = save_dir / "weights" / "best.pt"
         if not best.exists():
             raise RuntimeError("Training completed but best.pt not found.")
+        return save_dir, best
+    finally:
+        _set_training_proc(None)
+        try:
+            result_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-        model_dest = PROJECT_ROOT / "models" / "plate.pt"
-        model_dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(best, model_dest)
-        if sample_ids:
-            with SessionLocal() as db:
-                now = datetime.utcnow()
-                db.query(TrainingSample).filter(TrainingSample.id.in_(sample_ids)).update(
-                    {TrainingSample.last_trained_at: now},
-                    synchronize_session=False,
+
+def _run_training_pipeline_job(job_id: str) -> None:
+    local_db = SessionLocal()
+    try:
+        job = local_db.get(TrainingJob, job_id)
+        if not job:
+            return
+        if (job.status or "") not in {"queued", "running"}:
+            return
+
+        run_started_at = job.run_started_at or datetime.utcnow()
+        job.run_started_at = run_started_at
+        _touch_training_job(local_db, job, status="running", stage="prepare", progress=1, message="Preparing training pipeline")
+
+        settings = _training_settings_payload(local_db)
+        mode = (job.mode or "new_only").strip().lower()
+        if mode not in {"new_only", "all"}:
+            mode = "new_only"
+        chunk_size = int(job.chunk_size or int(settings.get("train_chunk_size") or 1000))
+        chunk_size = max(100, min(5000, chunk_size))
+        chunk_epochs = int((job.details or {}).get("chunk_epochs") or int(settings.get("train_chunk_epochs") or 8))
+        chunk_epochs = max(1, min(50, chunk_epochs))
+        run_ocr_prefill = _as_bool((job.details or {}).get("run_ocr_prefill"), True)
+        run_ocr_learn = _as_bool((job.details or {}).get("run_ocr_learn"), True)
+
+        base_q = local_db.query(TrainingSample).filter(
+            TrainingSample.ignored.is_(False),
+            or_(TrainingSample.bbox.isnot(None), TrainingSample.no_plate.is_(True)),
+        )
+        pending_filter = _training_pending_filter(mode, run_started_at)
+        total_samples = base_q.filter(pending_filter).count()
+        positive_count = (
+            local_db.query(TrainingSample.id)
+            .filter(
+                TrainingSample.ignored.is_(False),
+                TrainingSample.no_plate.is_(False),
+                TrainingSample.bbox.isnot(None),
+                pending_filter,
+            )
+            .count()
+        )
+        if positive_count <= 0:
+            _touch_training_job(
+                local_db,
+                job,
+                status="failed",
+                stage="prepare",
+                progress=100,
+                message="No positive annotated samples available for training",
+                error="no_positive_samples",
+            )
+            return
+        if total_samples <= 0:
+            _touch_training_job(local_db, job, status="complete", stage="complete", progress=100, message="No pending samples to train")
+            return
+
+        job.total_samples = int(total_samples)
+        job.chunk_size = int(chunk_size)
+        job.chunk_total = int((total_samples + chunk_size - 1) // chunk_size)
+        job.details = {**(job.details or {}), "chunk_epochs": chunk_epochs, "run_ocr_prefill": run_ocr_prefill, "run_ocr_learn": run_ocr_learn}
+        local_db.add(job)
+        local_db.commit()
+
+        run_root = Path(MEDIA_DIR) / "training_runs"
+        run_root.mkdir(parents=True, exist_ok=True)
+        job.run_dir = str(run_root)
+        model_name = settings.get("train_model") or "yolov8n.pt"
+        try:
+            from ultralytics import YOLO  # noqa: F401
+        except Exception:
+            _touch_training_job(local_db, job, status="failed", stage="prepare", progress=100, message="Ultralytics not available", error="ultralytics_missing")
+            return
+        try:
+            current_model_source = str(PROJECT_ROOT / "models" / "plate.pt") if (PROJECT_ROOT / "models" / "plate.pt").exists() else _resolve_train_model_source(model_name)
+        except Exception as exc:
+            _touch_training_job(local_db, job, status="failed", stage="prepare", progress=100, message=f"Model source error: {exc}", error=str(exc))
+            return
+
+        epochs = int(settings.get("train_epochs") or 50)
+        imgsz = int(settings.get("train_imgsz") or 640)
+        batch = int(settings.get("train_batch") or -1)
+        device = _resolve_train_device(settings.get("train_device") or "auto")
+        patience = int(settings.get("train_patience") or 15)
+        aug = {
+            "hsv_h": float(_get_app_setting(local_db, "train_hsv_h", "0.015")),
+            "hsv_s": float(_get_app_setting(local_db, "train_hsv_s", "0.7")),
+            "hsv_v": float(_get_app_setting(local_db, "train_hsv_v", "0.4")),
+            "degrees": float(_get_app_setting(local_db, "train_degrees", "5.0")),
+            "translate": float(_get_app_setting(local_db, "train_translate", "0.1")),
+            "scale": float(_get_app_setting(local_db, "train_scale", "0.5")),
+            "shear": float(_get_app_setting(local_db, "train_shear", "2.0")),
+            "perspective": float(_get_app_setting(local_db, "train_perspective", "0.0005")),
+            "fliplr": float(_get_app_setting(local_db, "train_fliplr", "0.5")),
+            "mosaic": float(_get_app_setting(local_db, "train_mosaic", "0.5")),
+            "mixup": float(_get_app_setting(local_db, "train_mixup", "0.1")),
+        }
+        _touch_training_job(
+            local_db,
+            job,
+            status="running",
+            stage="detect_train",
+            progress=5,
+            message=f"Detection training started ({total_samples} samples, chunk {chunk_size}, mode={mode})",
+        )
+
+        trained_samples = int(job.trained_samples or 0)
+        chunk_index = int(job.chunk_index or 0)
+        while True:
+            if TRAIN_PIPELINE_STOP.is_set():
+                _touch_training_job(local_db, job, status="stopped", stage="stopped", progress=job.progress or 0, message="Training stop requested by admin")
+                return
+            pending_rows = (
+                local_db.query(TrainingSample)
+                .filter(
+                    TrainingSample.ignored.is_(False),
+                    or_(TrainingSample.bbox.isnot(None), TrainingSample.no_plate.is_(True)),
+                    _training_pending_filter(mode, run_started_at),
                 )
-                db.commit()
+                .order_by(TrainingSample.id.asc())
+                .limit(chunk_size)
+                .all()
+            )
+            if not pending_rows:
+                break
+
+            chunk_index += 1
+            chunk_ids = [int(s.id) for s in pending_rows]
+            chunk_positive = sum(1 for s in pending_rows if bool(s.bbox) and not bool(s.no_plate))
+            job.chunk_index = chunk_index
+            local_db.add(job)
+            local_db.commit()
+            _touch_training_job(
+                local_db,
+                job,
+                status="running",
+                stage="detect_train",
+                progress=10 + ((chunk_index - 1) / max(1, job.chunk_total)) * 65,
+                message=f"Chunk {chunk_index}/{job.chunk_total}: preparing dataset ({len(chunk_ids)} samples)",
+            )
+
+            dataset_subdir = f"training_yolo_jobs/{job.id}/chunk_{chunk_index:04d}"
+            counts = _build_yolo_dataset_for_sample_ids(local_db, chunk_ids, dataset_subdir=dataset_subdir)
+            if chunk_positive > 0 and int(counts.get("positives") or 0) > 0:
+                run_name = f"{job.id}_c{chunk_index:04d}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+                _touch_training_job(
+                    local_db,
+                    job,
+                    status="running",
+                    stage="detect_train",
+                    progress=12 + ((chunk_index - 1) / max(1, job.chunk_total)) * 65,
+                    message=f"Chunk {chunk_index}/{job.chunk_total}: training detector for {chunk_epochs} epochs",
+                )
+                def _chunk_heartbeat(pid: int, elapsed_seconds: int) -> None:
+                    details = dict(job.details or {})
+                    details["backend"] = {
+                        "activity": "detector_training",
+                        "pid": int(pid),
+                        "elapsed_seconds": int(elapsed_seconds),
+                        "chunk_index": int(chunk_index),
+                        "chunk_total": int(job.chunk_total or 0),
+                    }
+                    job.details = details
+                    local_db.add(job)
+                    local_db.commit()
+                    _touch_training_job(
+                        local_db,
+                        job,
+                        status="running",
+                        stage="detect_train",
+                        progress=12 + ((chunk_index - 1) / max(1, job.chunk_total)) * 65,
+                        message=f"Chunk {chunk_index}/{job.chunk_total}: detector training running ({elapsed_seconds}s, pid {pid})",
+                    )
+                save_dir, best = _train_chunk_with_yolo(
+                    data_yaml=str(counts.get("data_yaml")),
+                    run_root=run_root,
+                    model_source=current_model_source,
+                    run_name=run_name,
+                    epochs=chunk_epochs,
+                    imgsz=imgsz,
+                    batch=batch,
+                    device=device,
+                    patience=max(1, min(patience, max(2, chunk_epochs))),
+                    aug=aug,
+                    stop_event=TRAIN_PIPELINE_STOP,
+                    heartbeat=_chunk_heartbeat,
+                )
+                model_dest = PROJECT_ROOT / "models" / "plate.pt"
+                model_dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(best, model_dest)
+                current_model_source = str(model_dest)
+                job.run_dir = str(save_dir)
+                job.model_path = str(model_dest)
+                details = dict(job.details or {})
+                details["backend"] = {
+                    "activity": "detector_training_complete",
+                    "chunk_index": int(chunk_index),
+                    "chunk_total": int(job.chunk_total or 0),
+                }
+                job.details = details
+                local_db.add(job)
+                local_db.commit()
+
+            now = datetime.utcnow()
+            local_db.query(TrainingSample).filter(TrainingSample.id.in_(chunk_ids)).update(
+                {TrainingSample.last_trained_at: now},
+                synchronize_session=False,
+            )
+            local_db.commit()
+            trained_samples += len(chunk_ids)
+            job.trained_samples = int(trained_samples)
+            local_db.add(job)
+            local_db.commit()
+            _touch_training_job(
+                local_db,
+                job,
+                status="running",
+                stage="detect_train",
+                progress=10 + (trained_samples / max(1, total_samples)) * 70,
+                message=f"Chunk {chunk_index}/{job.chunk_total} complete ({trained_samples}/{total_samples} samples)",
+            )
+
+        if run_ocr_prefill:
+            _touch_training_job(local_db, job, status="running", stage="ocr_prefill", progress=82, message="OCR pass: extracting plate text from annotated boxes")
+            ocr_scanned = 0
+            ocr_updated = 0
+            last_ocr_id = 0
+            while True:
+                if TRAIN_PIPELINE_STOP.is_set():
+                    _touch_training_job(local_db, job, status="stopped", stage="stopped", progress=job.progress or 0, message="Training stop requested by admin")
+                    return
+                rows = (
+                    local_db.query(TrainingSample)
+                    .filter(
+                        TrainingSample.ignored.is_(False),
+                        TrainingSample.no_plate.is_(False),
+                        TrainingSample.bbox.isnot(None),
+                        TrainingSample.last_trained_at.isnot(None),
+                        TrainingSample.last_trained_at >= run_started_at,
+                        TrainingSample.id > last_ocr_id,
+                    )
+                    .order_by(TrainingSample.id.asc())
+                    .limit(chunk_size)
+                    .all()
+                )
+                if not rows:
+                    break
+                changed_ids: List[int] = []
+                for sample in rows:
+                    ocr_scanned += 1
+                    if (sample.plate_text or "").strip():
+                        continue
+                    frame = cv2.imread(str(Path(MEDIA_DIR) / str(sample.image_path or "")))
+                    if frame is None:
+                        continue
+                    crop = crop_from_bbox(frame, _bbox_xywh_to_xyxy(sample.bbox or {}))
+                    if crop is None:
+                        continue
+                    ocr = read_plate_text(crop) or {}
+                    text = str(ocr.get("plate_text") or "").strip().upper()
+                    if not text:
+                        continue
+                    raw = str(ocr.get("raw_text") or text).strip()
+                    sample.plate_text = text
+                    sample.unclear_plate = False
+                    sample.processed_at = datetime.utcnow()
+                    sample.notes = f"OCR_BATCH_RAW:{raw}\n{(sample.notes or '').strip()}".strip()
+                    local_db.add(sample)
+                    changed_ids.append(sample.id)
+                    ocr_updated += 1
+                if changed_ids:
+                    local_db.commit()
+                else:
+                    local_db.rollback()
+                last_ocr_id = max(int(r.id) for r in rows)
+                job.ocr_scanned = int(ocr_scanned)
+                job.ocr_updated = int(ocr_updated)
+                local_db.add(job)
+                local_db.commit()
+                _touch_training_job(local_db, job, status="running", stage="ocr_prefill", progress=82 + min(10, (ocr_scanned / max(1, total_samples)) * 10), message=f"OCR prefill: scanned {ocr_scanned}, updated {ocr_updated}")
+
+        if run_ocr_learn:
+            _touch_training_job(local_db, job, status="running", stage="ocr_learn", progress=95, message="Learning OCR corrections from manual fixes")
+            learn = _learn_ocr_corrections_from_db(local_db)
+            details = dict(job.details or {})
+            details["ocr_learn"] = {
+                "pairs": int(learn.get("pairs") or 0),
+                "replacements": int(learn.get("replacements") or 0),
+            }
+            job.details = details
+            local_db.add(job)
+            local_db.commit()
+
         try:
             reload_yolo_model()
         except Exception:
             pass
-        _set_training_status(
-            "complete",
-            "Training complete. Model saved.",
-            run_dir=str(save_dir),
-            model_path=str(model_dest),
+        _touch_training_job(
+            local_db,
+            job,
+            status="complete",
+            stage="complete",
+            progress=100,
+            message="Training pipeline completed successfully",
         )
         try:
-            with SessionLocal() as db:
-                _create_notification(
-                    db,
-                    title="Training completed",
-                    message=f"New model saved to {model_dest}",
-                    level="success",
-                    kind="training",
-                    extra={"run_dir": str(save_dir), "model_path": str(model_dest)},
-                )
+            _create_notification(
+                local_db,
+                title="Training completed",
+                message=f"New model saved to {job.model_path or (PROJECT_ROOT / 'models' / 'plate.pt')}",
+                level="success",
+                kind="training",
+                extra={"job_id": job.id, "run_dir": job.run_dir, "model_path": job.model_path},
+            )
+            local_db.commit()
+        except Exception:
+            pass
+    except InterruptedError:
+        try:
+            job = local_db.get(TrainingJob, job_id)
+            if job:
+                _touch_training_job(local_db, job, status="stopped", stage="stopped", progress=job.progress or 0, message="Training stopped")
         except Exception:
             pass
     except Exception as exc:
-        _set_training_status("failed", f"Training failed: {exc}")
         try:
-            with SessionLocal() as db:
-                _create_notification(
-                    db,
-                    title="Training failed",
-                    message=str(exc),
-                    level="error",
-                    kind="training",
-                )
+            job = local_db.get(TrainingJob, job_id)
+            if job:
+                summary = _compact_training_error_text(exc, fallback="Training failed")
+                _touch_training_job(local_db, job, status="failed", stage="failed", progress=100, message=f"Training failed: {summary}", error=summary)
         except Exception:
             pass
+    finally:
+        _set_training_proc(None)
+        local_db.close()
+        global TRAIN_PIPELINE_THREAD
+        with TRAIN_PIPELINE_LOCK:
+            TRAIN_PIPELINE_THREAD = None
 
 
-@app.post("/admin/training/train")
-def training_train(db: Session = Depends(get_db)):
-    status = _get_training_status()
-    if status.get("status") == "running":
-        return JSONResponse({"ok": False, "error": "Training already running."}, status_code=409)
+def _start_training_pipeline_thread(job_id: str) -> bool:
+    global TRAIN_PIPELINE_THREAD
+    with TRAIN_PIPELINE_LOCK:
+        if TRAIN_PIPELINE_THREAD and TRAIN_PIPELINE_THREAD.is_alive():
+            return False
+        TRAIN_PIPELINE_STOP.clear()
+        TRAIN_PIPELINE_THREAD = threading.Thread(target=_run_training_pipeline_job, args=(job_id,), daemon=True)
+        TRAIN_PIPELINE_THREAD.start()
+        return True
 
-    positives = (
-        db.query(TrainingSample)
-        .filter(TrainingSample.ignored.is_(False))
-        .filter(TrainingSample.bbox.isnot(None))
-        .filter(TrainingSample.no_plate.is_(False))
-        .count()
+
+def _create_training_job(
+    db: Session,
+    *,
+    mode: str,
+    chunk_size: int,
+    chunk_epochs: int,
+    run_ocr_prefill: bool,
+    run_ocr_learn: bool,
+    trigger: str,
+) -> TrainingJob:
+    job = TrainingJob(
+        id=secrets.token_urlsafe(14),
+        kind="pipeline",
+        status="queued",
+        mode=mode,
+        stage="queued",
+        progress=0,
+        message=f"Queued ({trigger})",
+        chunk_size=chunk_size,
+        chunk_index=0,
+        chunk_total=0,
+        total_samples=0,
+        trained_samples=0,
+        ocr_scanned=0,
+        ocr_updated=0,
+        run_started_at=datetime.utcnow(),
+        details={
+            "trigger": trigger,
+            "chunk_epochs": chunk_epochs,
+            "run_ocr_prefill": bool(run_ocr_prefill),
+            "run_ocr_learn": bool(run_ocr_learn),
+        },
+        error=None,
     )
-    if positives == 0:
-        return JSONResponse({"ok": False, "error": "No annotated samples available."}, status_code=400)
+    _append_training_job_log(job, f"Queued by {trigger}")
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    _set_training_status("running", f"Queued training job {job.id}")
+    return job
 
-    counts = _build_yolo_dataset(db)
-    if counts.get("positives", 0) == 0:
-        return JSONResponse({"ok": False, "error": "No positive labels were exported."}, status_code=400)
 
-    run_root = Path(MEDIA_DIR) / "training_runs"
-    run_root.mkdir(parents=True, exist_ok=True)
-    _set_training_status("running", "Queued training...", run_dir=str(run_root))
+def _start_training_pipeline_from_request(
+    db: Session,
+    *,
+    mode: Optional[str] = None,
+    chunk_size: Optional[int] = None,
+    chunk_epochs: Optional[int] = None,
+    run_ocr_prefill: Optional[bool] = None,
+    run_ocr_learn: Optional[bool] = None,
+    trigger: str = "manual",
+) -> Dict[str, object]:
+    running = _active_training_job(db)
+    if running:
+        _start_training_pipeline_thread(running.id)
+        return {"ok": True, "job": _job_payload(running), "already_running": True}
+
+    settings = _training_settings_payload(db)
+    mode_resolved = (mode or ("new_only" if _as_bool(settings.get("train_new_only_default"), True) else "all")).strip().lower()
+    if mode_resolved not in {"new_only", "all"}:
+        mode_resolved = "new_only"
+    chunk_size_resolved = int(chunk_size or int(settings.get("train_chunk_size") or 1000))
+    chunk_size_resolved = max(100, min(5000, chunk_size_resolved))
+    chunk_epochs_resolved = int(chunk_epochs or int(settings.get("train_chunk_epochs") or 8))
+    chunk_epochs_resolved = max(1, min(50, chunk_epochs_resolved))
+    ocr_prefill_resolved = _as_bool(run_ocr_prefill, True)
+    ocr_learn_resolved = _as_bool(run_ocr_learn, True)
+
+    job = _create_training_job(
+        db,
+        mode=mode_resolved,
+        chunk_size=chunk_size_resolved,
+        chunk_epochs=chunk_epochs_resolved,
+        run_ocr_prefill=ocr_prefill_resolved,
+        run_ocr_learn=ocr_learn_resolved,
+        trigger=trigger,
+    )
+    _start_training_pipeline_thread(job.id)
     try:
         _create_notification(
             db,
             title="Training queued",
-            message=f"YOLO training queued with dataset {counts.get('dataset_root')}",
+            message=f"Training job {job.id} queued ({mode_resolved}, chunk={chunk_size_resolved})",
             level="info",
             kind="training",
-            extra={"dataset_root": counts.get("dataset_root")},
+            extra={"job_id": job.id, "mode": mode_resolved, "chunk_size": chunk_size_resolved},
         )
+        db.commit()
     except Exception:
         pass
+    return {"ok": True, "job": _job_payload(job), "already_running": False}
 
-    data_yaml = str(counts.get("data_yaml"))
-    sample_ids = counts.get("sample_ids") or []
-    thread = threading.Thread(target=_train_yolo_task, args=(data_yaml, run_root, sample_ids), daemon=True)
-    thread.start()
-    return JSONResponse({"ok": True, "message": "Training started.", "data_yaml": data_yaml})
+
+def _resume_training_pipeline_job(db: Session, job: TrainingJob) -> Dict[str, object]:
+    if (job.status or "") not in {"stopped", "queued"}:
+        raise HTTPException(status_code=400, detail="Only stopped or queued training jobs can be resumed")
+    job.status = "queued"
+    job.stage = "queued"
+    job.message = "Queued (resume requested)"
+    job.error = None
+    job.finished_at = None
+    details = dict(job.details or {})
+    details["resumed_at"] = datetime.utcnow().isoformat()
+    job.details = details
+    db.add(job)
+    db.commit()
+    _append_training_job_log(job, "Resume requested")
+    db.add(job)
+    db.commit()
+    started = _start_training_pipeline_thread(job.id)
+    if not started:
+        return {"ok": True, "job": _job_payload(job), "already_running": True}
+    return {"ok": True, "job": _job_payload(job), "already_running": False}
+
+
+@app.post("/admin/training/train")
+def training_train(db: Session = Depends(get_db)):
+    result = _start_training_pipeline_from_request(db, trigger="admin")
+    if result.get("already_running"):
+        return JSONResponse({"ok": False, "error": "Training already running.", "job": result.get("job")}, status_code=409)
+    return JSONResponse(result)
 
 
 @app.get("/admin/training/center", response_class=HTMLResponse)
 def training_center(request: Request, db: Session = Depends(get_db)):
     status = _get_training_status()
-    settings = {
-        "train_model": _get_app_setting(db, "train_model", "yolov8n.pt"),
-        "train_epochs": _get_app_setting(db, "train_epochs", "50"),
-        "train_imgsz": _get_app_setting(db, "train_imgsz", "640"),
-        "train_batch": _get_app_setting(db, "train_batch", "-1"),
-        "train_device": _get_app_setting(db, "train_device", "auto"),
-        "train_patience": _get_app_setting(db, "train_patience", "15"),
-        "train_hsv_h": _get_app_setting(db, "train_hsv_h", "0.015"),
-        "train_hsv_s": _get_app_setting(db, "train_hsv_s", "0.7"),
-        "train_hsv_v": _get_app_setting(db, "train_hsv_v", "0.4"),
-        "train_degrees": _get_app_setting(db, "train_degrees", "5.0"),
-        "train_translate": _get_app_setting(db, "train_translate", "0.1"),
-        "train_scale": _get_app_setting(db, "train_scale", "0.5"),
-        "train_shear": _get_app_setting(db, "train_shear", "2.0"),
-        "train_perspective": _get_app_setting(db, "train_perspective", "0.0005"),
-        "train_fliplr": _get_app_setting(db, "train_fliplr", "0.5"),
-        "train_mosaic": _get_app_setting(db, "train_mosaic", "0.5"),
-        "train_mixup": _get_app_setting(db, "train_mixup", "0.1"),
-    }
+    settings = _training_settings_payload(db)
+    settings.update(
+        {
+            "train_hsv_h": _get_app_setting(db, "train_hsv_h", "0.015"),
+            "train_hsv_s": _get_app_setting(db, "train_hsv_s", "0.7"),
+            "train_hsv_v": _get_app_setting(db, "train_hsv_v", "0.4"),
+            "train_degrees": _get_app_setting(db, "train_degrees", "5.0"),
+            "train_translate": _get_app_setting(db, "train_translate", "0.1"),
+            "train_scale": _get_app_setting(db, "train_scale", "0.5"),
+            "train_shear": _get_app_setting(db, "train_shear", "2.0"),
+            "train_perspective": _get_app_setting(db, "train_perspective", "0.0005"),
+            "train_fliplr": _get_app_setting(db, "train_fliplr", "0.5"),
+            "train_mosaic": _get_app_setting(db, "train_mosaic", "0.5"),
+            "train_mixup": _get_app_setting(db, "train_mixup", "0.1"),
+        }
+    )
     dataset_root = str(Path(MEDIA_DIR) / "training_yolo")
     run_root = str(Path(MEDIA_DIR) / "training_runs")
     return templates.TemplateResponse(
@@ -2155,15 +3694,40 @@ def training_settings_update(
     train_fliplr: float = Form(0.5),
     train_mosaic: float = Form(0.5),
     train_mixup: float = Form(0.1),
+    plate_region: str = Form("generic"),
+    plate_min_length: int = Form(5),
+    plate_max_length: int = Form(8),
+    plate_charset: str = Form("alnum"),
+    plate_pattern_regex: str = Form(""),
+    plate_shape_hint: str = Form("standard"),
+    plate_reference_date: str = Form(""),
+    allowed_stationary_enabled: bool = Form(True),
+    allowed_stationary_motion_threshold: float = Form(7.0),
+    allowed_stationary_hold_seconds: float = Form(0.0),
     db: Session = Depends(get_db),
 ):
-    values = {
-        "train_model": train_model.strip() or "yolov8n.pt",
-        "train_epochs": str(max(1, int(train_epochs))),
-        "train_imgsz": str(max(160, int(train_imgsz))),
-        "train_batch": str(int(train_batch)),
-        "train_device": train_device.strip() or "auto",
-        "train_patience": str(max(1, int(train_patience))),
+    values = _sanitize_training_settings(
+        {
+            "train_model": train_model,
+            "train_epochs": train_epochs,
+            "train_imgsz": train_imgsz,
+            "train_batch": train_batch,
+            "train_device": train_device,
+            "train_patience": train_patience,
+            "plate_region": plate_region,
+            "plate_min_length": plate_min_length,
+            "plate_max_length": plate_max_length,
+            "plate_charset": plate_charset,
+            "plate_pattern_regex": plate_pattern_regex,
+            "plate_shape_hint": plate_shape_hint,
+            "plate_reference_date": plate_reference_date,
+            "allowed_stationary_enabled": allowed_stationary_enabled,
+            "allowed_stationary_motion_threshold": allowed_stationary_motion_threshold,
+            "allowed_stationary_hold_seconds": allowed_stationary_hold_seconds,
+        }
+    )
+    values.update(
+        {
         "train_hsv_h": str(max(0.0, min(1.0, float(train_hsv_h)))),
         "train_hsv_s": str(max(0.0, min(1.0, float(train_hsv_s)))),
         "train_hsv_v": str(max(0.0, min(1.0, float(train_hsv_v)))),
@@ -2175,7 +3739,8 @@ def training_settings_update(
         "train_fliplr": str(max(0.0, min(1.0, float(train_fliplr)))),
         "train_mosaic": str(max(0.0, min(1.0, float(train_mosaic)))),
         "train_mixup": str(max(0.0, min(1.0, float(train_mixup)))),
-    }
+        }
+    )
     for key, val in values.items():
         setting = db.get(AppSetting, key)
         if not setting:
@@ -2372,11 +3937,15 @@ def _mjpeg_stream(camera: Camera, overlay: bool = True):
                 time.sleep(0.2)
                 continue
 
-        if frame is not None:
+        if overlay and frame is not None:
             if overlay:
                 detection = stream_manager.get_detection(camera.id)
                 frame = _draw_overlay(frame.copy(), detection)
-            ret, buffer = cv2.imencode(".jpg", frame)
+            ret, buffer = cv2.imencode(".jpg", frame, LIVE_STREAM_JPEG_PARAMS)
+            if ret:
+                jpeg = buffer.tobytes()
+        elif jpeg is None and frame is not None:
+            ret, buffer = cv2.imencode(".jpg", frame, LIVE_STREAM_JPEG_PARAMS)
             if ret:
                 jpeg = buffer.tobytes()
 
@@ -2393,7 +3962,15 @@ def stream_camera(camera_id: int, overlay: int = 1, db: Session = Depends(get_db
     camera = db.get(Camera, camera_id)
     if not camera or not camera.enabled:
         return JSONResponse({"error": "camera not found"}, status_code=404)
-    return StreamingResponse(_mjpeg_stream(camera, overlay=bool(int(overlay))), media_type="multipart/x-mixed-replace; boundary=frame")
+    return StreamingResponse(
+        _mjpeg_stream(camera, overlay=bool(int(overlay))),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/admin/ptz/{camera_id}/move")
@@ -2630,13 +4207,80 @@ def api_v1_dashboard_summary(
     user: str = Depends(_api_get_current_user),
 ):
     del user
+    now = datetime.utcnow()
+    since_24h = now - timedelta(hours=24)
+
     total_detections = db.query(Detection).count()
     total_cameras = db.query(Camera).count()
     active_cameras = db.query(Camera).filter(Camera.enabled.is_(True)).count()
     allowed_count = db.query(Detection).filter(Detection.status == "allowed").count()
     denied_count = db.query(Detection).filter(Detection.status == "denied").count()
     unread_notifications = db.query(Notification).filter(Notification.is_read.is_(False)).count()
+    other_count = max(0, total_detections - allowed_count - denied_count)
     training_status = _get_training_status()
+
+    recent = (
+        db.query(Detection, Camera)
+        .join(Camera, Detection.camera_id == Camera.id, isouter=True)
+        .filter(Detection.detected_at >= since_24h)
+        .all()
+    )
+
+    hour_starts = [since_24h + timedelta(hours=i + 1) for i in range(24)]
+    hour_labels = [h.strftime("%H:00") for h in hour_starts]
+    hourly_total = [0 for _ in hour_starts]
+    hourly_allowed = [0 for _ in hour_starts]
+    hourly_denied = [0 for _ in hour_starts]
+    camera_counts: Dict[str, int] = {}
+    plate_counts: Dict[str, int] = {}
+
+    for det, cam in recent:
+        if not det.detected_at:
+            continue
+        hour_idx = int((det.detected_at.replace(tzinfo=None) - since_24h).total_seconds() // 3600)
+        hour_idx = max(0, min(23, hour_idx))
+        hourly_total[hour_idx] += 1
+        if det.status == "allowed":
+            hourly_allowed[hour_idx] += 1
+        elif det.status == "denied":
+            hourly_denied[hour_idx] += 1
+
+        camera_name = (cam.name if cam and cam.name else f"Camera {det.camera_id or '-'}").strip()
+        camera_counts[camera_name] = camera_counts.get(camera_name, 0) + 1
+
+        plate_key = (det.plate_text or "").strip().upper()
+        if plate_key:
+            plate_counts[plate_key] = plate_counts.get(plate_key, 0) + 1
+
+    top_cameras = sorted(camera_counts.items(), key=lambda item: item[1], reverse=True)[:6]
+    top_plates = sorted(plate_counts.items(), key=lambda item: item[1], reverse=True)[:6]
+
+    latest_detections = (
+        db.query(Detection, Camera)
+        .join(Camera, Detection.camera_id == Camera.id, isouter=True)
+        .order_by(Detection.detected_at.desc())
+        .limit(8)
+        .all()
+    )
+    recent_events = [
+        {
+            "id": det.id,
+            "plate_text": det.plate_text,
+            "status": det.status,
+            "camera_name": cam.name if cam else None,
+            "detected_at": det.detected_at.isoformat() if det.detected_at else None,
+        }
+        for det, cam in latest_detections
+    ]
+
+    recent_total = len(recent)
+    recent_allowed = sum(1 for det, _ in recent if det.status == "allowed")
+    recent_denied = sum(1 for det, _ in recent if det.status == "denied")
+    allowed_rate_24h = round((recent_allowed / recent_total) * 100, 2) if recent_total else 0.0
+    denied_rate_24h = round((recent_denied / recent_total) * 100, 2) if recent_total else 0.0
+
+    future_labels = [(now - timedelta(days=i)).strftime("%a") for i in range(6, -1, -1)]
+
     return {
         "totals": {
             "detections": total_detections,
@@ -2644,7 +4288,45 @@ def api_v1_dashboard_summary(
             "active_cameras": active_cameras,
             "allowed": allowed_count,
             "denied": denied_count,
+            "other": other_count,
             "unread_notifications": unread_notifications,
+        },
+        "details": {
+            "recent_24h_total": recent_total,
+            "allowed_rate_24h": allowed_rate_24h,
+            "denied_rate_24h": denied_rate_24h,
+            "last_detection_at": recent_events[0]["detected_at"] if recent_events else None,
+        },
+        "charts": {
+            "hourly_activity": {
+                "labels": hour_labels,
+                "detections": hourly_total,
+                "allowed": hourly_allowed,
+                "denied": hourly_denied,
+            },
+            "status_breakdown": {
+                "labels": ["Allowed", "Denied", "Other"],
+                "values": [allowed_count, denied_count, other_count],
+            },
+            "top_cameras": {
+                "labels": [name for name, _ in top_cameras],
+                "values": [count for _, count in top_cameras],
+            },
+            "top_plates": {
+                "labels": [plate for plate, _ in top_plates],
+                "values": [count for _, count in top_plates],
+            },
+            "future_users_actions": {
+                "labels": future_labels,
+                "users": [0 for _ in future_labels],
+                "actions": [0 for _ in future_labels],
+            },
+        },
+        "recent_events": recent_events,
+        "future_metrics": {
+            "users": {"total": 0, "active": 0, "new_today": 0},
+            "actions": {"queued": 0, "completed": 0, "pending": 0},
+            "notes": "These metrics are placeholders for upcoming user/action tracking features.",
         },
         "training": training_status,
     }
@@ -2659,6 +4341,7 @@ def api_v1_cameras(
     mode_setting = db.get(AppSetting, "detector_mode")
     global_mode = mode_setting.value if mode_setting and mode_setting.value else "auto"
     rows = db.query(Camera).order_by(Camera.live_order.asc(), Camera.id.asc()).all()
+    active_manual = {int(item["camera_id"]) for item in manual_clip_manager.active()}
     out = []
     for cam in rows:
         if cam.type == "browser":
@@ -2675,9 +4358,15 @@ def api_v1_cameras(
                 "live_order": cam.live_order,
                 "scan_interval": cam.scan_interval,
                 "cooldown_seconds": cam.cooldown_seconds,
+                "save_clip": bool(cam.save_clip),
+                "clip_seconds": int(cam.clip_seconds or 0),
+                "onvif_xaddr": cam.onvif_xaddr,
+                "onvif_username": cam.onvif_username,
+                "onvif_profile": cam.onvif_profile,
                 "detector_mode": cam.detector_mode,
                 "effective_detector_mode": cam.detector_mode if cam.detector_mode != "inherit" else global_mode,
                 "browser_online": stream_manager.is_external_online(cam.id) if cam.type == "browser" else None,
+                "manual_recording": cam.id in active_manual,
                 "stream_url": f"/stream/{cam.id}?overlay=1",
                 "capture_token": cam.capture_token if cam.type == "browser" else None,
                 "capture_url": f"/capture/{cam.id}?token={cam.capture_token}" if cam.type == "browser" and cam.capture_token else None,
@@ -2693,14 +4382,13 @@ def api_v1_camera_create(
     user: str = Depends(_api_get_current_user),
 ):
     del user
-    cam_type = (body.type or "").strip().lower()
-    if cam_type not in {"webcam", "rtsp", "http_mjpeg", "browser", "upload"}:
-        raise HTTPException(status_code=400, detail="Invalid camera type")
-    detector_mode = (body.detector_mode or "inherit").strip().lower()
-    if detector_mode not in {"inherit", "auto", "contour", "yolo"}:
-        detector_mode = "inherit"
+    cam_type = _validate_camera_type(body.type or "")
+    detector_mode = _validate_detector_mode(body.detector_mode or "inherit")
 
-    source = _normalize_camera_source(cam_type, body.source or "")
+    raw_source = body.source or ""
+    if cam_type == "browser" and not raw_source.strip():
+        raw_source = "browser"
+    source = _normalize_camera_source(cam_type, raw_source)
     if not source:
         raise HTTPException(status_code=400, detail="Source is required")
 
@@ -2745,28 +4433,13 @@ def api_v1_camera_update(
     cam = db.get(Camera, camera_id)
     if not cam:
         raise HTTPException(status_code=404, detail="Camera not found")
-
-    if body.name is not None:
-        cam.name = body.name.strip()[:100] or cam.name
-    if body.location is not None:
-        cam.location = body.location.strip()[:200] if body.location else None
-    if body.enabled is not None:
-        cam.enabled = body.enabled
-    if body.live_view is not None:
-        cam.live_view = body.live_view
-    if body.live_order is not None:
-        cam.live_order = int(body.live_order)
-    if body.detector_mode is not None:
-        val = (body.detector_mode or "inherit").strip().lower()
-        if val not in {"inherit", "contour", "yolo", "ocr", "auto"}:
-            raise HTTPException(status_code=400, detail="Invalid detector mode")
-        cam.detector_mode = val
-    if body.scan_interval is not None:
-        cam.scan_interval = max(0.1, float(body.scan_interval))
-    if body.cooldown_seconds is not None:
-        cam.cooldown_seconds = max(0.0, float(body.cooldown_seconds))
+    _apply_camera_patch(cam, body.dict(exclude_unset=True))
     db.add(cam)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Camera name already exists")
     return {"ok": True}
 
 
@@ -2811,6 +4484,231 @@ def api_v1_live_stream_health(
 ):
     del user
     return api_stream_health(db)
+
+
+@app.post("/api/v1/cameras/test_connection")
+def api_v1_camera_test_connection(
+    body: ApiCameraTestBody,
+    user: str = Depends(_api_get_current_user),
+):
+    """Step-by-step network diagnostic: ping → TCP port → RTSP probe → full stream."""
+    del user
+    url = (body.url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    # Resolve host/port — prefer explicit fields, fall back to URL parsing
+    parsed = urlparse(url)
+    host = (body.host or "").strip() or parsed.hostname or ""
+    port = body.port or parsed.port or 554
+
+    if not host:
+        raise HTTPException(status_code=400, detail="Cannot determine host from URL")
+
+    steps: list = []
+
+    # ── Step 1: Ping ─────────────────────────────────────────────────────────
+    ping_ok = False
+    try:
+        ping_cmd = ["ping", "-c", "1", "-W", "2", "-w", "4", host]
+        pr = subprocess.run(ping_cmd, capture_output=True, text=True, timeout=6)
+        ping_ok = pr.returncode == 0
+        if ping_ok:
+            rtt_m = re.search(r"time[=<]([\d.]+)\s*ms", pr.stdout)
+            rtt_s = f" ({rtt_m.group(1)} ms)" if rtt_m else ""
+            steps.append({"step": "ping", "ok": True,
+                          "msg": f"Host {host} is reachable{rtt_s}"})
+        else:
+            steps.append({"step": "ping", "ok": False,
+                          "msg": f"No ping response from {host} — host may be down, wrong IP, or ICMP is blocked by firewall"})
+    except subprocess.TimeoutExpired:
+        steps.append({"step": "ping", "ok": False,
+                      "msg": f"Ping to {host} timed out — host unreachable or ICMP blocked"})
+    except FileNotFoundError:
+        steps.append({"step": "ping", "ok": None,
+                      "msg": "ping command not available in container — skipping"})
+    except Exception as exc:
+        steps.append({"step": "ping", "ok": False, "msg": f"Ping error: {exc}"})
+
+    # ── Step 2: TCP port reachability ────────────────────────────────────────
+    port_ok = False
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            pass
+        port_ok = True
+        steps.append({"step": "port", "ok": True,
+                      "msg": f"Port {port}/tcp is open on {host}"})
+    except socket.timeout:
+        steps.append({"step": "port", "ok": False,
+                      "msg": f"Port {port}/tcp timed out — firewall is blocking it or wrong port number"})
+    except ConnectionRefusedError:
+        steps.append({"step": "port", "ok": False,
+                      "msg": f"Port {port}/tcp refused — no RTSP service listening on that port. "
+                             f"Try 554, 8554, or check your NVR settings"})
+    except OSError as exc:
+        steps.append({"step": "port", "ok": False,
+                      "msg": f"Port {port}/tcp unreachable: {exc}"})
+
+    # ── Step 3: RTSP OPTIONS handshake (no auth needed) ──────────────────────
+    rtsp_ok = False
+    if port_ok:
+        try:
+            raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw.settimeout(5)
+            raw.connect((host, port))
+            probe = (
+                f"OPTIONS rtsp://{host}:{port}/ RTSP/1.0\r\n"
+                f"CSeq: 1\r\n"
+                f"User-Agent: CarVision/1.0\r\n\r\n"
+            )
+            raw.sendall(probe.encode())
+            resp = raw.recv(512).decode("utf-8", errors="replace")
+            raw.close()
+            first_line = resp.split("\r\n")[0] if resp else ""
+            if "RTSP/1.0" in resp:
+                rtsp_ok = True
+                if "401" in resp or "403" in resp:
+                    steps.append({"step": "rtsp", "ok": True,
+                                  "msg": f"RTSP server responded — auth required ({first_line}). "
+                                         f"Credentials will be verified in the next step"})
+                else:
+                    steps.append({"step": "rtsp", "ok": True,
+                                  "msg": f"RTSP server is running and responded: {first_line}"})
+            elif resp:
+                steps.append({"step": "rtsp", "ok": False,
+                              "msg": f"Port {port} responded but not with RTSP — "
+                                     f"this may be an HTTP or other service. First bytes: {resp[:80]!r}"})
+            else:
+                steps.append({"step": "rtsp", "ok": False,
+                              "msg": f"Port {port} is open but returned no data to RTSP OPTIONS"})
+        except socket.timeout:
+            steps.append({"step": "rtsp", "ok": False,
+                          "msg": "RTSP handshake timed out — service is not responding"})
+        except Exception as exc:
+            steps.append({"step": "rtsp", "ok": False, "msg": f"RTSP probe error: {exc}"})
+    else:
+        steps.append({"step": "rtsp", "ok": False,
+                      "msg": "Skipped — port is not reachable"})
+
+    # ── Step 4: ffprobe stream probe (handles Digest auth, gives real errors) ──
+    stream: dict = {"ok": False, "msg": "", "info": {}}
+    ffprobe_ok = False
+    try:
+        import shutil as _shutil
+        ffprobe_bin = _shutil.which("ffprobe")
+        if not ffprobe_bin:
+            raise FileNotFoundError("ffprobe not found")
+        ffprobe_cmd = [
+            ffprobe_bin,
+            "-v", "error",
+            "-rtsp_transport", "tcp",
+            "-timeout", "10000000",   # 10 s in µs
+            "-show_entries", "stream=codec_name,codec_type,width,height,r_frame_rate",
+            "-of", "json",
+            url,
+        ]
+        pr = subprocess.run(ffprobe_cmd, capture_output=True, text=True, timeout=14)
+        stderr = (pr.stderr or "").strip()
+        if pr.returncode == 0:
+            try:
+                data = json.loads(pr.stdout or "{}")
+            except Exception:
+                data = {}
+            streams = data.get("streams", [])
+            video = next((s for s in streams if s.get("codec_type") == "video"), None)
+            audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+            if video or streams:
+                stream["ok"] = True
+                ffprobe_ok = True
+                parts = []
+                if video:
+                    w, h = video.get("width"), video.get("height")
+                    if w and h:
+                        parts.append(f"{w}×{h}")
+                    codec = video.get("codec_name", "")
+                    if codec:
+                        parts.append(codec.upper())
+                    fps_raw = video.get("r_frame_rate", "")
+                    if fps_raw and "/" in fps_raw:
+                        n, d = fps_raw.split("/")
+                        try:
+                            fps = round(int(n) / int(d), 1)
+                            parts.append(f"{fps} fps")
+                        except Exception:
+                            pass
+                if audio:
+                    parts.append(f"+ audio ({audio.get('codec_name','?')})")
+                stream["msg"] = "Stream is live — " + (", ".join(parts) if parts else "connected")
+                stream["info"] = {"video": video, "audio": audio}
+            else:
+                stream["msg"] = "ffprobe connected but found no streams — camera may be offline"
+        else:
+            # Parse stderr for specific Dahua / RTSP error patterns
+            sl = stderr.lower()
+            if "401" in stderr or "unauthorized" in sl:
+                stream["msg"] = ("Authentication failed — wrong username or password. "
+                                 "For Dahua NVRs use the NVR admin credentials, not the camera's own credentials")
+            elif "403" in stderr or "forbidden" in sl:
+                stream["msg"] = "Access forbidden — account may not have RTSP stream permission"
+            elif "404" in stderr or "not found" in sl:
+                stream["msg"] = ("Stream path not found (404) — wrong channel number or path. "
+                                 "Try channel 1, or use the Dahua path with &unicast=true")
+            elif "connection refused" in sl:
+                stream["msg"] = f"Connection refused on port {port} — wrong port"
+            elif "no route" in sl or "unreachable" in sl or "network" in sl:
+                stream["msg"] = f"Network unreachable — VPN may be disconnected or route to {host} is missing"
+            elif "timeout" in sl or "timed out" in sl:
+                stream["msg"] = ("Connection timed out — camera is reachable but not streaming. "
+                                 "Check channel number and that the camera is powered and assigned in the NVR")
+            elif stderr:
+                # Return raw ffprobe error — it's always more useful than a generic message
+                stream["msg"] = f"Stream error: {stderr[:300]}"
+            else:
+                stream["msg"] = "Stream could not be opened (no error detail from ffprobe)"
+    except subprocess.TimeoutExpired:
+        stream["msg"] = ("ffprobe timed out after 14 s — RTSP server is reachable but not delivering video. "
+                         "Check channel number, stream path, and that the camera is assigned in the NVR")
+    except FileNotFoundError:
+        # ffprobe not available — fall back to OpenCV
+        cap = cv2.VideoCapture(url)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            if ret:
+                stream["ok"] = True
+                stream["msg"] = "Stream is live (OpenCV)"
+            else:
+                stream["msg"] = "Stream opened but no frame — check stream path and channel"
+        else:
+            stream["msg"] = "Could not open stream — check credentials and stream path"
+        cap.release()
+    except Exception as exc:
+        stream["msg"] = f"Stream probe error: {exc}"
+
+    steps.append({"step": "stream", "ok": stream["ok"], "msg": stream["msg"]})
+
+    # ── Overall summary ───────────────────────────────────────────────────────
+    ping_step_ok = steps[0].get("ok")
+    if stream["ok"]:
+        summary = stream["msg"]
+    elif ping_step_ok is False:
+        summary = (f"Cannot reach {host} — verify the IP address, "
+                   f"that your VPN is connected, and that the device is powered on")
+    elif not port_ok:
+        summary = (f"Host {host} is up but port {port}/tcp is closed — "
+                   f"check the port number (try 554 or 8554) and NVR firewall settings")
+    elif not rtsp_ok:
+        summary = (f"Port {port} is open but not serving RTSP — "
+                   f"make sure this is the RTSP port, not the web UI port (80/443)")
+    else:
+        summary = stream["msg"]
+
+    return {
+        "ok": stream["ok"],
+        "message": summary,
+        "steps": steps,
+        "host": host,
+        "port": port,
+    }
 
 
 @app.post("/api/v1/cameras/layout")
@@ -2976,6 +4874,12 @@ def api_v1_bulk_reprocess(
 
 
 def _delete_detection_row(db: Session, det: Detection) -> None:
+    db.query(Notification).filter(Notification.detection_id == det.id).delete(synchronize_session=False)
+    if det.video_path:
+        db.query(ClipRecord).filter(
+            ClipRecord.camera_id == det.camera_id,
+            ClipRecord.file_path == det.video_path,
+        ).delete(synchronize_session=False)
     for rel_path in [
         det.image_path,
         det.video_path,
@@ -3100,19 +5004,342 @@ def api_v1_bulk_feedback(
     return {"ok": True, "processed": success, "failed": failed, "sample_ids": sample_ids}
 
 
-@app.get("/api/v1/training/status")
-def api_v1_training_status(user: str = Depends(_api_get_current_user)):
+@app.get("/api/v1/training/dataset_stats")
+def api_v1_training_dataset_stats(
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    """Return detailed counts about the training dataset."""
     del user
-    return _get_training_status()
+    total = db.query(TrainingSample).count()
+    annotated = db.query(TrainingSample).filter(
+        TrainingSample.ignored.is_(False),
+        or_(TrainingSample.bbox.isnot(None), TrainingSample.no_plate.is_(True)),
+    ).count()
+    with_bbox = db.query(TrainingSample).filter(
+        TrainingSample.bbox.isnot(None),
+        TrainingSample.ignored.is_(False),
+    ).count()
+    with_text = db.query(TrainingSample).filter(
+        TrainingSample.plate_text.isnot(None),
+        TrainingSample.plate_text != "",
+        TrainingSample.ignored.is_(False),
+    ).count()
+    negative = db.query(TrainingSample).filter(
+        TrainingSample.no_plate.is_(True),
+        TrainingSample.ignored.is_(False),
+    ).count()
+    unclear = db.query(TrainingSample).filter(
+        TrainingSample.unclear_plate.is_(True),
+        TrainingSample.ignored.is_(False),
+    ).count()
+    pending = db.query(TrainingSample).filter(
+        TrainingSample.bbox.is_(None),
+        TrainingSample.no_plate.is_(False),
+        TrainingSample.ignored.is_(False),
+    ).count()
+    ignored = db.query(TrainingSample).filter(
+        TrainingSample.ignored.is_(True),
+    ).count()
+    trained = db.query(TrainingSample).filter(
+        TrainingSample.last_trained_at.isnot(None),
+    ).count()
+    from_system = db.query(TrainingSample).filter(
+        TrainingSample.import_batch.is_(None),
+    ).count()
+    from_dataset = db.query(TrainingSample).filter(
+        TrainingSample.import_batch.isnot(None),
+    ).count()
+    testable = db.query(TrainingSample).filter(
+        TrainingSample.bbox.isnot(None),
+        TrainingSample.plate_text.isnot(None),
+        TrainingSample.plate_text != "",
+        TrainingSample.ignored.is_(False),
+    ).count()
+    return {
+        "total": total,
+        "annotated": annotated,
+        "with_bbox": with_bbox,
+        "with_text": with_text,
+        "negative": negative,
+        "unclear": unclear,
+        "pending": pending,
+        "ignored": ignored,
+        "trained": trained,
+        "untrained": total - trained,
+        "from_system": from_system,
+        "from_dataset": from_dataset,
+        "testable": testable,
+        "annotation_rate": round(annotated / total * 100, 1) if total else 0,
+        "trained_rate": round(trained / total * 100, 1) if total else 0,
+    }
 
 
-@app.post("/api/v1/training/start")
-def api_v1_training_start(
+@app.post("/api/v1/training/test_model")
+def api_v1_training_test_model(
+    body: ApiModelTestBody,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    """Run the active model against manually annotated samples and report accuracy."""
+    del user
+    limit = max(1, min(500, int(body.limit or 100)))
+
+    qy = db.query(TrainingSample).filter(
+        TrainingSample.bbox.isnot(None),
+        TrainingSample.plate_text.isnot(None),
+        TrainingSample.plate_text != "",
+        TrainingSample.ignored.is_(False),
+    )
+    if body.sample_ids:
+        qy = qy.filter(TrainingSample.id.in_(body.sample_ids))
+    rows = qy.order_by(TrainingSample.id.desc()).limit(limit).all()
+
+    if not rows:
+        return {"ok": False, "error": "No annotated samples with plate text found to test.", "results": [], "summary": {}}
+
+    from difflib import SequenceMatcher
+
+    results = []
+    exact_matches = 0
+    fuzzy_total = 0.0
+    conf_total = 0.0
+    conf_count = 0
+    no_detection = 0
+
+    for row in rows:
+        image_abs = Path(row.image_path)
+        if not image_abs.is_absolute():
+            image_abs = Path(MEDIA_DIR) / row.image_path
+        expected = (row.plate_text or "").strip().upper()
+        entry: Dict = {
+            "sample_id": row.id,
+            "image_path": row.image_path,
+            "expected": expected,
+            "predicted": None,
+            "exact_match": False,
+            "similarity": 0.0,
+            "confidence": None,
+            "detector": None,
+            "error": None,
+        }
+        if not image_abs.exists():
+            entry["error"] = "image file not found"
+            results.append(entry)
+            no_detection += 1
+            continue
+        try:
+            frame = cv2.imread(str(image_abs))
+            if frame is None:
+                entry["error"] = "could not decode image"
+                results.append(entry)
+                no_detection += 1
+                continue
+            det = detect_plate(frame)
+            if not det:
+                entry["error"] = "no plate detected"
+                no_detection += 1
+                results.append(entry)
+                continue
+            predicted = (det.get("plate_text") or "").strip().upper()
+            conf = det.get("confidence")
+            sim = SequenceMatcher(None, expected, predicted).ratio()
+            exact = (predicted == expected)
+            entry["predicted"] = predicted
+            entry["exact_match"] = exact
+            entry["similarity"] = round(sim, 3)
+            entry["confidence"] = round(float(conf), 3) if conf is not None else None
+            entry["detector"] = det.get("detector")
+            if exact:
+                exact_matches += 1
+            fuzzy_total += sim
+            if conf is not None:
+                conf_total += float(conf)
+                conf_count += 1
+        except Exception as exc:
+            entry["error"] = str(exc)
+            no_detection += 1
+        results.append(entry)
+
+    tested = len(rows)
+    detected = tested - no_detection
+    return {
+        "ok": True,
+        "results": results,
+        "summary": {
+            "total_tested": tested,
+            "detected": detected,
+            "no_detection": no_detection,
+            "exact_matches": exact_matches,
+            "exact_accuracy": round(exact_matches / tested * 100, 1) if tested else 0,
+            "fuzzy_accuracy": round(fuzzy_total / tested * 100, 1) if tested else 0,
+            "avg_similarity": round(fuzzy_total / tested, 3) if tested else 0,
+            "avg_confidence": round(conf_total / conf_count, 3) if conf_count else None,
+            "detection_rate": round(detected / tested * 100, 1) if tested else 0,
+        },
+    }
+
+
+@app.get("/api/v1/training/status")
+def api_v1_training_status(
     db: Session = Depends(get_db),
     user: str = Depends(_api_get_current_user),
 ):
     del user
-    return training_train(db)
+    active = _active_training_job(db)
+    job = active or _latest_training_job(db)
+    payload = _job_payload(job)
+    return {
+        **payload,
+        "status": payload.get("status"),
+        "message": payload.get("message"),
+        "last_run_dir": payload.get("run_dir"),
+        "last_model_path": payload.get("model_path"),
+    }
+
+
+@app.get("/api/v1/training/jobs")
+def api_v1_training_jobs(
+    page: int = 1,
+    limit: int = 20,
+    status: str = "all",
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    page = max(1, int(page or 1))
+    limit = max(1, min(100, int(limit or 20)))
+    status = (status or "all").strip().lower()
+    allowed = {"all", "queued", "running", "stopping", "stopped", "failed", "complete"}
+    if status not in allowed:
+        status = "all"
+
+    qy = db.query(TrainingJob).filter(TrainingJob.kind == "pipeline")
+    if status != "all":
+        qy = qy.filter(TrainingJob.status == status)
+
+    total = qy.count()
+    pages = max(1, (total + limit - 1) // limit)
+    if page > pages:
+        page = pages
+    offset = (page - 1) * limit
+
+    rows = (
+        qy.order_by(TrainingJob.started_at.desc(), TrainingJob.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return {
+        "items": [_job_history_payload(row) for row in rows],
+        "total": int(total),
+        "page": int(page),
+        "pages": int(pages),
+        "limit": int(limit),
+        "status": status,
+    }
+
+
+@app.post("/api/v1/training/start")
+def api_v1_training_start(
+    body: Optional[ApiTrainingStartBody] = None,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    result = _start_training_pipeline_from_request(
+        db,
+        mode=(body.mode if body else None),
+        chunk_size=(body.chunk_size if body else None),
+        chunk_epochs=(body.chunk_epochs if body else None),
+        run_ocr_prefill=(body.run_ocr_prefill if body else None),
+        run_ocr_learn=(body.run_ocr_learn if body else None),
+        trigger="api",
+    )
+    return result
+
+
+@app.post("/api/v1/training/stop")
+def api_v1_training_stop(
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    job = _active_training_job(db)
+    if not job:
+        return {"ok": True, "stopped": False, "message": "No active job"}
+    TRAIN_PIPELINE_STOP.set()
+    _stop_training_proc(force=False)
+    _touch_training_job(db, job, status="running", stage="stopping", message="Stop requested")
+    return {"ok": True, "stopped": True, "job": _job_payload(job)}
+
+
+@app.post("/api/v1/training/resume")
+def api_v1_training_resume(
+    job_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    active = _active_training_job(db)
+    if active:
+        _start_training_pipeline_thread(active.id)
+        return {"ok": True, "job": _job_payload(active), "already_running": True}
+    job: Optional[TrainingJob] = None
+    if job_id:
+        job = db.get(TrainingJob, str(job_id).strip())
+    if not job:
+        job = (
+            db.query(TrainingJob)
+            .filter(TrainingJob.kind == "pipeline", TrainingJob.status.in_(("stopped", "queued")))
+            .order_by(TrainingJob.updated_at.desc(), TrainingJob.id.desc())
+            .first()
+        )
+    if not job:
+        raise HTTPException(status_code=404, detail="No stopped training job available to resume")
+    return _resume_training_pipeline_job(db, job)
+
+
+@app.get("/api/v1/training/model/download")
+def api_v1_training_model_download(
+    job_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    model_path: Optional[Path] = None
+    if job_id:
+        job = db.get(TrainingJob, str(job_id).strip())
+        if not job or job.kind != "pipeline":
+            raise HTTPException(status_code=404, detail="Training job not found")
+        candidates: List[Path] = []
+        if job.model_path:
+            candidates.append(Path(job.model_path))
+        if job.run_dir:
+            run_dir = Path(job.run_dir)
+            candidates.extend(
+                [
+                    run_dir / "weights" / "best.pt",
+                    run_dir / "best.pt",
+                ]
+            )
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                model_path = candidate
+                break
+        if not model_path:
+            raise HTTPException(status_code=404, detail="No model artifact found for this job")
+    else:
+        model_path = PROJECT_ROOT / "models" / "plate.pt"
+
+    if not model_path.exists():
+        raise HTTPException(status_code=404, detail="Trained model not found")
+    filename_suffix = (str(job_id).strip() if job_id else datetime.utcnow().strftime("%Y%m%d_%H%M%S")).replace("/", "_")
+    return FileResponse(
+        str(model_path),
+        media_type="application/octet-stream",
+        filename=f"carvision_plate_{filename_suffix}.pt",
+    )
 
 
 @app.get("/api/v1/training/settings")
@@ -3121,14 +5348,29 @@ def api_v1_training_settings(
     user: str = Depends(_api_get_current_user),
 ):
     del user
-    return {
-        "train_model": _get_app_setting(db, "train_model", "yolov8n.pt"),
-        "train_epochs": _get_app_setting(db, "train_epochs", "50"),
-        "train_imgsz": _get_app_setting(db, "train_imgsz", "640"),
-        "train_batch": _get_app_setting(db, "train_batch", "-1"),
-        "train_device": _get_app_setting(db, "train_device", "auto"),
-        "train_patience": _get_app_setting(db, "train_patience", "15"),
-    }
+    return _training_settings_payload(db)
+
+
+@app.post("/api/v1/training/settings")
+def api_v1_training_settings_update(
+    body: ApiTrainingSettingsBody,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    current = _training_settings_payload(db)
+    incoming = body.dict(exclude_none=True)
+    merged = {**current, **incoming}
+    values = _sanitize_training_settings(merged)
+    for key, val in values.items():
+        setting = db.get(AppSetting, key)
+        if not setting:
+            db.add(AppSetting(key=key, value=val))
+        else:
+            setting.value = val
+    db.commit()
+    _refresh_anpr_config(db)
+    return {"ok": True, "settings": _training_settings_payload(db)}
 
 
 @app.get("/api/v1/training/samples")
@@ -3136,20 +5378,50 @@ def api_v1_training_samples(
     status: str = "all",
     q: str = "",
     batch: str = "",
-    limit: int = 500,
+    source: str = "system",
+    has_text: str = "all",
+    processed: str = "all",
+    trained: str = "all",
+    sort_by: str = "created_at",
+    sort_dir: str = "desc",
+    page: int = 1,
+    page_size: int = 50,
     db: Session = Depends(get_db),
     user: str = Depends(_api_get_current_user),
 ):
     del user
     status = (status or "all").strip().lower()
-    if status not in {"all", "annotated", "pending", "negative", "ignored"}:
+    if status not in {"all", "annotated", "pending", "negative", "ignored", "unclear"}:
         status = "all"
-    limit = max(1, min(2000, int(limit)))
+    page = max(1, int(page or 1))
+    page_size = max(10, min(200, int(page_size or 50)))
+    source = (source or "system").strip().lower()
+    if source not in {"all", "system", "dataset"}:
+        source = "system"
+    has_text = (has_text or "all").strip().lower()
+    if has_text not in {"all", "yes", "no"}:
+        has_text = "all"
+    processed = (processed or "all").strip().lower()
+    if processed not in {"all", "yes", "no"}:
+        processed = "all"
+    trained = (trained or "all").strip().lower()
+    if trained not in {"all", "yes", "no"}:
+        trained = "all"
+    sort_by = (sort_by or "created_at").strip().lower()
+    if sort_by not in {"id", "created_at", "updated_at", "plate_text", "processed_at", "last_trained_at"}:
+        sort_by = "created_at"
+    sort_dir = (sort_dir or "desc").strip().lower()
+    if sort_dir not in {"asc", "desc"}:
+        sort_dir = "desc"
 
     batch_filter = (batch or "").strip()[:80]
     base_query = db.query(TrainingSample)
     if batch_filter:
         base_query = base_query.filter(TrainingSample.import_batch == batch_filter)
+    elif source == "system":
+        base_query = base_query.filter(TrainingSample.import_batch.is_(None))
+    elif source == "dataset":
+        base_query = base_query.filter(TrainingSample.import_batch.isnot(None))
     counts = {
         "total": base_query.count(),
         "annotated": base_query.filter(
@@ -3162,6 +5434,7 @@ def api_v1_training_samples(
             TrainingSample.no_plate.is_(False),
             TrainingSample.ignored.is_(False),
         ).count(),
+        "unclear": base_query.filter(TrainingSample.unclear_plate.is_(True), TrainingSample.ignored.is_(False)).count(),
         "ignored": base_query.filter(TrainingSample.ignored.is_(True)).count(),
     }
 
@@ -3180,6 +5453,8 @@ def api_v1_training_samples(
         )
     elif status == "ignored":
         qy = qy.filter(TrainingSample.ignored.is_(True))
+    elif status == "unclear":
+        qy = qy.filter(TrainingSample.unclear_plate.is_(True), TrainingSample.ignored.is_(False))
 
     if q:
         q_like = f"%{q.strip()}%"
@@ -3190,9 +5465,57 @@ def api_v1_training_samples(
                 TrainingSample.notes.ilike(q_like),
             )
         )
+    if not batch_filter:
+        if source == "system":
+            qy = qy.filter(TrainingSample.import_batch.is_(None))
+        elif source == "dataset":
+            qy = qy.filter(TrainingSample.import_batch.isnot(None))
+    if has_text == "yes":
+        qy = qy.filter(TrainingSample.plate_text.isnot(None), TrainingSample.plate_text != "")
+    elif has_text == "no":
+        qy = qy.filter(or_(TrainingSample.plate_text.is_(None), TrainingSample.plate_text == ""))
+    if processed == "yes":
+        qy = qy.filter(TrainingSample.processed_at.isnot(None))
+    elif processed == "no":
+        qy = qy.filter(TrainingSample.processed_at.is_(None))
+    if trained == "yes":
+        qy = qy.filter(TrainingSample.last_trained_at.isnot(None))
+    elif trained == "no":
+        qy = qy.filter(TrainingSample.last_trained_at.is_(None))
 
-    rows = qy.order_by(TrainingSample.created_at.desc()).limit(limit).all()
-    return {"counts": counts, "items": [_api_training_sample_payload(r) for r in rows], "batch": batch_filter or None}
+    total_filtered = qy.count()
+    pages = max(1, (total_filtered + page_size - 1) // page_size)
+    if page > pages:
+        page = pages
+    offset = (page - 1) * page_size
+    sort_map = {
+        "id": TrainingSample.id,
+        "created_at": TrainingSample.created_at,
+        "updated_at": TrainingSample.updated_at,
+        "plate_text": TrainingSample.plate_text,
+        "processed_at": TrainingSample.processed_at,
+        "last_trained_at": TrainingSample.last_trained_at,
+    }
+    sort_col = sort_map.get(sort_by, TrainingSample.created_at)
+    sort_expr = sort_col.asc() if sort_dir == "asc" else sort_col.desc()
+    rows = qy.order_by(sort_expr).offset(offset).limit(page_size).all()
+    return {
+        "counts": counts,
+        "items": [_api_training_sample_payload(r) for r in rows],
+        "batch": batch_filter or None,
+        "source": source,
+        "has_text": has_text,
+        "processed": processed,
+        "trained": trained,
+        "sort_by": sort_by,
+        "sort_dir": sort_dir,
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total_items": total_filtered,
+            "total_pages": pages,
+        },
+    }
 
 
 @app.get("/api/v1/training/samples/{sample_id:int}")
@@ -3262,51 +5585,145 @@ async def api_v1_training_import(
 
     batch_id = f"import_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
     created_ids: List[int] = []
+    updated_existing = 0
     annotated = 0
     negatives = 0
     pending = 0
+    annotations_detected = False
+    existing_by_hash: Dict[str, Optional[TrainingSample]] = {}
+
+    def _resolve_size_for_sample(sample: TrainingSample, width: int, height: int) -> Tuple[int, int]:
+        if (width <= 0 or height <= 0) and sample.image_path:
+            try:
+                src = Path(MEDIA_DIR) / str(sample.image_path)
+                size = _load_image_size(src)
+                if size:
+                    width, height = int(size[0]), int(size[1])
+                    sample.image_width = width
+                    sample.image_height = height
+            except Exception:
+                pass
+        return int(width or 0), int(height or 0)
+
+    def _label_to_entries(label_text: Optional[str], width: int, height: int) -> List[Dict[str, object]]:
+        text = (label_text or "").strip()
+        if not text:
+            return [{"kind": "negative"}]
+        boxes = _extract_yolo_bboxes(text, width, height)
+        if boxes:
+            return [{"kind": "bbox", "bbox": b} for b in boxes]
+        return [{"kind": "pending"}]
+
+    def apply_entry_to_sample(sample: TrainingSample, entry: Dict[str, object], width: int, height: int) -> str:
+        width, height = _resolve_size_for_sample(sample, width, height)
+        kind = str(entry.get("kind") or "pending")
+        if kind == "negative":
+            sample.no_plate = True
+            sample.unclear_plate = False
+            sample.bbox = None
+            sample.plate_text = None
+            sample.notes = "Imported as negative sample from empty YOLO label."
+            return "negative"
+        if kind == "bbox":
+            bbox = entry.get("bbox")
+            if isinstance(bbox, dict):
+                sample.no_plate = False
+                sample.unclear_plate = False
+                sample.bbox = bbox
+                sample.notes = "Imported YOLO bbox. Add/correct plate text before training."
+                return "annotated"
+            sample.notes = "Label file found but YOLO bbox could not be parsed."
+            return "pending"
+        sample.notes = "Imported sample pending annotation."
+        return "pending"
 
     def add_sample(image_bytes: bytes, filename: str, label_text: Optional[str] = None):
-        nonlocal annotated, negatives, pending
+        nonlocal annotated, negatives, pending, updated_existing
         if not image_bytes:
             return
         image_hash = _hash_bytes(image_bytes)
+        existing = existing_by_hash.get(image_hash)
+        if image_hash not in existing_by_hash:
+            existing = (
+                db.query(TrainingSample)
+                .filter(TrainingSample.image_hash == image_hash)
+                .order_by(TrainingSample.updated_at.desc(), TrainingSample.id.desc())
+                .first()
+            )
+            existing_by_hash[image_hash] = existing
+
+        # If this image already exists, merge annotations into existing sample instead of duplicating.
+        if existing is not None:
+            if label_text is not None:
+                entries = _label_to_entries(label_text, int(existing.image_width or 0), int(existing.image_height or 0))
+                primary = entries[0] if entries else {"kind": "pending"}
+                state = apply_entry_to_sample(existing, primary, int(existing.image_width or 0), int(existing.image_height or 0))
+                if state == "annotated":
+                    annotated += 1
+                elif state == "negative":
+                    negatives += 1
+                else:
+                    pending += 1
+                updated_existing += 1
+                db.add(existing)
+
+                for extra in entries[1:]:
+                    extra_sample = TrainingSample(
+                        image_path=existing.image_path,
+                        image_hash=existing.image_hash,
+                        image_width=existing.image_width,
+                        image_height=existing.image_height,
+                        import_batch=batch_id,
+                    )
+                    extra_state = apply_entry_to_sample(
+                        extra_sample,
+                        extra,
+                        int(existing.image_width or 0),
+                        int(existing.image_height or 0),
+                    )
+                    if extra_state == "annotated":
+                        annotated += 1
+                    elif extra_state == "negative":
+                        negatives += 1
+                    else:
+                        pending += 1
+                    db.add(extra_sample)
+                    db.flush()
+                    created_ids.append(extra_sample.id)
+            return
+
         rel_path, width, height = _save_training_upload(image_bytes, filename or "import.jpg")
         if not rel_path:
             return
+        entries: List[Dict[str, object]]
+        if label_text is not None:
+            entries = _label_to_entries(label_text, int(width or 0), int(height or 0))
+        else:
+            entries = [{"kind": "pending"}]
 
-        sample = TrainingSample(
-            image_path=rel_path,
-            image_hash=image_hash,
-            image_width=width,
-            image_height=height,
-            import_batch=batch_id,
-        )
-
-        if bool(has_annotations) and label_text is not None:
-            text = (label_text or "").strip()
-            if not text:
-                sample.no_plate = True
-                sample.bbox = None
-                sample.plate_text = None
-                sample.notes = "Imported as negative sample from empty YOLO label."
+        first_sample: Optional[TrainingSample] = None
+        for idx, entry in enumerate(entries):
+            sample = TrainingSample(
+                image_path=rel_path,
+                image_hash=image_hash,
+                image_width=width,
+                image_height=height,
+                import_batch=batch_id,
+            )
+            state = apply_entry_to_sample(sample, entry, int(width or 0), int(height or 0))
+            if state == "annotated":
+                annotated += 1
+            elif state == "negative":
                 negatives += 1
             else:
-                bbox = _extract_yolo_bbox(text, width or 0, height or 0)
-                if bbox:
-                    sample.no_plate = False
-                    sample.bbox = bbox
-                    sample.notes = "Imported YOLO bbox. Add/correct plate text before training."
-                    annotated += 1
-                else:
-                    sample.notes = "Label file found but YOLO bbox could not be parsed."
-                    pending += 1
-        else:
-            pending += 1
-
-        db.add(sample)
-        db.flush()
-        created_ids.append(sample.id)
+                pending += 1
+            db.add(sample)
+            db.flush()
+            created_ids.append(sample.id)
+            if idx == 0:
+                first_sample = sample
+        if first_sample is not None:
+            existing_by_hash[image_hash] = first_sample
 
     if image_files:
         text_map: Dict[str, str] = {}
@@ -3319,19 +5736,33 @@ async def api_v1_training_import(
             if _is_image_filename(name) or (file.content_type and file.content_type.startswith("image/")):
                 image_payloads.append((name, content))
                 continue
-            if bool(has_annotations) and Path(name).suffix.lower() == ".txt":
+            if Path(name).suffix.lower() == ".txt":
                 text_map[Path(name).stem.lower()] = content.decode("utf-8", errors="ignore")
+        if text_map:
+            annotations_detected = True
+        use_annotations = bool(has_annotations) or bool(text_map)
 
         for name, content in image_payloads:
-            label = text_map.get(Path(name).stem.lower()) if bool(has_annotations) else None
+            label = text_map.get(Path(name).stem.lower()) if use_annotations else None
             add_sample(content, name, label)
 
     if dataset_zip is not None:
-        zip_bytes = await dataset_zip.read()
-        if zip_bytes:
+        temp_dir = Path(MEDIA_DIR) / "temp_imports"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_zip = temp_dir / f"dataset_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(4)}.zip"
+        try:
+            with temp_zip.open("wb") as f:
+                while True:
+                    chunk = await dataset_zip.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            if not temp_zip.exists() or temp_zip.stat().st_size == 0:
+                raise HTTPException(status_code=400, detail="Empty ZIP file")
             try:
-                with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
+                with zipfile.ZipFile(temp_zip) as zf:
                     text_map: Dict[str, str] = {}
+                    text_by_stem: Dict[str, str] = {}
                     image_entries = []
                     for info in zf.infolist():
                         if info.is_dir():
@@ -3340,11 +5771,18 @@ async def api_v1_training_import(
                         low = name.lower()
                         if _is_image_filename(low):
                             image_entries.append(info)
-                        elif bool(has_annotations) and low.endswith(".txt"):
+                        elif low.endswith(".txt"):
                             try:
-                                text_map[low] = zf.read(info).decode("utf-8", errors="ignore")
+                                txt = zf.read(info).decode("utf-8", errors="ignore")
+                                text_map[low] = txt
+                                stem = Path(low).stem.lower()
+                                if stem and stem not in text_by_stem:
+                                    text_by_stem[stem] = txt
                             except Exception:
                                 text_map[low] = ""
+                    if text_map:
+                        annotations_detected = True
+                    use_annotations = bool(has_annotations) or bool(text_map)
 
                     for info in image_entries:
                         name = info.filename.replace("\\", "/")
@@ -3353,14 +5791,21 @@ async def api_v1_training_import(
                         except Exception:
                             continue
                         label = None
-                        if bool(has_annotations):
+                        if use_annotations:
                             for cand in _zip_label_candidates(name):
                                 label = text_map.get(cand.lower())
                                 if label is not None:
                                     break
+                            if label is None:
+                                label = text_by_stem.get(Path(name).stem.lower())
                         add_sample(content, Path(name).name, label)
             except zipfile.BadZipFile:
                 raise HTTPException(status_code=400, detail="Invalid ZIP file")
+        finally:
+            try:
+                temp_zip.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     if created_ids:
         db.commit()
@@ -3369,11 +5814,592 @@ async def api_v1_training_import(
         "ok": True,
         "created": len(created_ids),
         "ids": created_ids,
-        "batch_id": batch_id if created_ids else None,
-        "has_annotations": bool(has_annotations),
+        "batch_id": batch_id if (created_ids or updated_existing) else None,
+        "has_annotations": bool(has_annotations) or bool(annotations_detected),
+        "annotations_detected": bool(annotations_detected),
+        "updated_existing": updated_existing,
         "annotated": annotated,
         "negatives": negatives,
         "pending": pending,
+    }
+
+
+@app.get("/api/v1/training/import_batches")
+def api_v1_training_import_batches(
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    safe_limit = max(1, min(int(limit or 200), 1000))
+    rows = (
+        db.query(
+            TrainingSample.import_batch.label("batch"),
+            func.count(TrainingSample.id).label("total"),
+            func.sum(case((TrainingSample.no_plate.is_(True), 1), else_=0)).label("negatives"),
+            func.sum(case((TrainingSample.bbox.isnot(None), 1), else_=0)).label("annotated"),
+            func.max(TrainingSample.updated_at).label("updated_at"),
+            func.min(TrainingSample.created_at).label("created_at"),
+        )
+        .filter(TrainingSample.import_batch.isnot(None))
+        .group_by(TrainingSample.import_batch)
+        .order_by(func.max(TrainingSample.updated_at).desc())
+        .limit(safe_limit)
+        .all()
+    )
+    items = []
+    for row in rows:
+        total = int(row.total or 0)
+        negatives = int(row.negatives or 0)
+        annotated = int(row.annotated or 0)
+        pending = max(0, total - negatives - annotated)
+        items.append(
+            {
+                "batch": row.batch,
+                "total": total,
+                "annotated": annotated,
+                "negatives": negatives,
+                "pending": pending,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+                "ocr_job": _get_batch_ocr_job(db, row.batch),
+            }
+        )
+    return {"items": items}
+
+
+@app.delete("/api/v1/training/import_batches/{batch_id}")
+def api_v1_training_delete_import_batch(
+    batch_id: str,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    batch = (batch_id or "").strip()
+    if not batch:
+        raise HTTPException(status_code=400, detail="Batch id is required")
+
+    rows = (
+        db.query(TrainingSample)
+        .filter(TrainingSample.import_batch == batch)
+        .order_by(TrainingSample.id.asc())
+        .all()
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Import batch not found")
+
+    image_paths = {str(r.image_path or "").strip() for r in rows if r.image_path}
+    deleted = len(rows)
+    for row in rows:
+        db.delete(row)
+    db.flush()
+
+    removed_files = 0
+    for rel in image_paths:
+        still_used = db.query(TrainingSample.id).filter(TrainingSample.image_path == rel).first() is not None
+        if still_used:
+            continue
+        abs_path = Path(MEDIA_DIR) / rel
+        try:
+            if abs_path.exists():
+                abs_path.unlink()
+                removed_files += 1
+        except Exception:
+            # Keep DB delete successful even if filesystem cleanup fails.
+            pass
+
+    db.commit()
+    return {"ok": True, "batch_id": batch, "deleted": deleted, "removed_files": removed_files}
+
+
+@app.post("/api/v1/training/import_batches/{batch_id}/ocr/reprocess")
+def api_v1_training_reprocess_import_batch_ocr(
+    batch_id: str,
+    chunk_size: int = 1000,
+    resume: bool = True,
+    force_restart: bool = False,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    batch = (batch_id or "").strip()[:80]
+    if not batch:
+        raise HTTPException(status_code=400, detail="Batch id is required")
+    safe_chunk = max(100, min(int(chunk_size or 1000), 2000))
+
+    total = (
+        db.query(TrainingSample.id)
+        .filter(
+            TrainingSample.import_batch == batch,
+            TrainingSample.ignored.is_(False),
+            TrainingSample.no_plate.is_(False),
+            TrainingSample.bbox.isnot(None),
+        )
+        .count()
+    )
+    if total <= 0:
+        raise HTTPException(status_code=404, detail="No annotated import samples found for this batch")
+
+    existing = _get_batch_ocr_job(db, batch)
+    if existing:
+        existing_status = str(existing.get("status") or "").strip().lower()
+        stale_seconds = int(existing.get("stale_seconds") or 0)
+        if existing_status in {"running", "stopping"} and stale_seconds < 180:
+            return {"ok": True, "job": existing, "already_running": True}
+
+    resumed_from = 0
+    initial_processed = 0
+    initial_updated = 0
+    initial_skipped = 0
+    if existing and resume and not force_restart:
+        resumed_from = max(0, int(existing.get("last_id") or 0))
+        initial_processed = max(0, int(existing.get("processed") or 0))
+        initial_updated = max(0, int(existing.get("updated") or 0))
+        initial_skipped = max(0, int(existing.get("skipped") or 0))
+        if resumed_from <= 0 and initial_processed > 0:
+            cursor_row = (
+                db.query(TrainingSample.id)
+                .filter(
+                    TrainingSample.import_batch == batch,
+                    TrainingSample.ignored.is_(False),
+                    TrainingSample.no_plate.is_(False),
+                    TrainingSample.bbox.isnot(None),
+                )
+                .order_by(TrainingSample.id.asc())
+                .offset(max(0, initial_processed - 1))
+                .first()
+            )
+            if cursor_row and cursor_row[0]:
+                resumed_from = int(cursor_row[0])
+
+    _set_batch_ocr_stop(db, batch, False)
+    now_iso = _utc_iso_now()
+    job_id = secrets.token_urlsafe(10)
+    chunk_total = max(1, (int(total) + safe_chunk - 1) // safe_chunk)
+    job = {
+        "id": job_id,
+        "batch": batch,
+        "status": "running",
+        "progress": int((initial_processed / max(1, int(total))) * 100),
+        "processed": initial_processed,
+        "updated": initial_updated,
+        "skipped": initial_skipped,
+        "total": int(total),
+        "chunk_size": safe_chunk,
+        "message": "Queued (resuming)" if resumed_from > 0 else "Queued",
+        "started_at": now_iso,
+        "updated_at": now_iso,
+        "heartbeat_at": now_iso,
+        "finished_at": "",
+        "error": "",
+        "last_id": resumed_from,
+        "chunk_index": int(initial_processed // safe_chunk),
+        "chunk_total": chunk_total,
+        "speed_sps": 0.0,
+        "eta_seconds": 0,
+        "current_sample_id": 0,
+        "resumed_from": resumed_from,
+    }
+    _write_batch_ocr_job(db, batch, job)
+    db.commit()
+
+    def _run_batch_ocr():
+        local_db = SessionLocal()
+        try:
+            processed = int(initial_processed)
+            updated = int(initial_updated)
+            skipped = int(initial_skipped)
+            last_id = int(resumed_from)
+            chunk_index = int(processed // safe_chunk)
+            started_dt = _parse_iso_datetime(now_iso) or datetime.utcnow()
+            while True:
+                if _batch_ocr_stop_requested(local_db, batch):
+                    stopped_state = {
+                        "id": job_id,
+                        "batch": batch,
+                        "status": "stopped",
+                        "progress": int((processed / max(1, total)) * 100),
+                        "processed": processed,
+                        "updated": updated,
+                        "skipped": skipped,
+                        "total": int(total),
+                        "chunk_size": safe_chunk,
+                        "message": "Stopped by admin",
+                        "started_at": now_iso,
+                        "updated_at": _utc_iso_now(),
+                        "heartbeat_at": _utc_iso_now(),
+                        "finished_at": _utc_iso_now(),
+                        "error": "",
+                        "last_id": last_id,
+                        "chunk_index": chunk_index,
+                        "chunk_total": chunk_total,
+                        "current_sample_id": 0,
+                        "resumed_from": resumed_from,
+                    }
+                    _write_batch_ocr_job(local_db, batch, stopped_state)
+                    local_db.commit()
+                    return
+                rows = (
+                    local_db.query(TrainingSample)
+                    .filter(
+                        TrainingSample.import_batch == batch,
+                        TrainingSample.ignored.is_(False),
+                        TrainingSample.no_plate.is_(False),
+                        TrainingSample.bbox.isnot(None),
+                        TrainingSample.id > last_id,
+                    )
+                    .order_by(TrainingSample.id.asc())
+                    .limit(safe_chunk)
+                    .all()
+                )
+                if not rows:
+                    break
+
+                chunk_index += 1
+                current_sample_id = 0
+                for sample in rows:
+                    if _batch_ocr_stop_requested(local_db, batch):
+                        break
+                    last_id = sample.id
+                    current_sample_id = sample.id
+                    processed += 1
+                    existing_text = (sample.plate_text or "").strip()
+                    if existing_text:
+                        skipped += 1
+                        continue
+                    try:
+                        frame = cv2.imread(str(Path(MEDIA_DIR) / str(sample.image_path or "")))
+                        if frame is None:
+                            skipped += 1
+                            continue
+                        crop = crop_from_bbox(frame, _bbox_xywh_to_xyxy(sample.bbox or {}))
+                        if crop is None:
+                            skipped += 1
+                            continue
+                        ocr = read_plate_text(crop) or {}
+                        text = str(ocr.get("plate_text") or "").strip().upper()
+                        if not text:
+                            skipped += 1
+                            continue
+                        raw = str(ocr.get("raw_text") or text).strip()
+                        sample.plate_text = text
+                        sample.unclear_plate = False
+                        sample.processed_at = datetime.utcnow()
+                        sample.notes = f"OCR_BATCH_RAW:{raw}\n{(sample.notes or '').strip()}".strip()
+                        local_db.add(sample)
+                        updated += 1
+                    except Exception:
+                        skipped += 1
+
+                local_db.commit()
+                elapsed = max(1.0, (datetime.utcnow() - started_dt).total_seconds())
+                speed_sps = round(float(processed) / float(elapsed), 3) if processed > 0 else 0.0
+                eta_seconds = int((max(0, total - processed)) / speed_sps) if speed_sps > 0 else 0
+                pct = int((processed / max(1, total)) * 100)
+                job_state = {
+                    "id": job_id,
+                    "batch": batch,
+                    "status": "running",
+                    "progress": pct,
+                    "processed": processed,
+                    "updated": updated,
+                    "skipped": skipped,
+                    "total": int(total),
+                    "chunk_size": safe_chunk,
+                    "message": f"Processed {processed}/{total}",
+                    "started_at": now_iso,
+                    "updated_at": _utc_iso_now(),
+                    "heartbeat_at": _utc_iso_now(),
+                    "finished_at": "",
+                    "error": "",
+                    "last_id": last_id,
+                    "chunk_index": chunk_index,
+                    "chunk_total": chunk_total,
+                    "speed_sps": speed_sps,
+                    "eta_seconds": eta_seconds,
+                    "current_sample_id": current_sample_id,
+                    "resumed_from": resumed_from,
+                }
+                _write_batch_ocr_job(local_db, batch, job_state)
+                local_db.commit()
+
+            done_state = {
+                "id": job_id,
+                "batch": batch,
+                "status": "complete",
+                "progress": 100,
+                "processed": processed,
+                "updated": updated,
+                "skipped": skipped,
+                "total": int(total),
+                "chunk_size": safe_chunk,
+                "message": f"Completed: {updated} updated, {skipped} skipped",
+                "started_at": now_iso,
+                "updated_at": _utc_iso_now(),
+                "heartbeat_at": _utc_iso_now(),
+                "finished_at": _utc_iso_now(),
+                "error": "",
+                "last_id": last_id,
+                "chunk_index": chunk_index,
+                "chunk_total": chunk_total,
+                "current_sample_id": 0,
+                "resumed_from": resumed_from,
+            }
+            _write_batch_ocr_job(local_db, batch, done_state)
+            local_db.commit()
+        except Exception as exc:
+            try:
+                local_db.rollback()
+            except Exception:
+                pass
+            failed_state = {
+                "id": job_id,
+                "batch": batch,
+                "status": "failed",
+                "progress": 100,
+                "processed": 0,
+                "updated": 0,
+                "skipped": 0,
+                "total": int(total),
+                "chunk_size": safe_chunk,
+                "message": "Batch OCR failed",
+                "started_at": now_iso,
+                "updated_at": _utc_iso_now(),
+                "heartbeat_at": _utc_iso_now(),
+                "finished_at": _utc_iso_now(),
+                "error": str(exc),
+                "last_id": last_id,
+                "chunk_index": chunk_index,
+                "chunk_total": chunk_total,
+                "current_sample_id": 0,
+                "resumed_from": resumed_from,
+            }
+            _write_batch_ocr_job(local_db, batch, failed_state)
+            local_db.commit()
+        finally:
+            local_db.close()
+
+    threading.Thread(target=_run_batch_ocr, daemon=True).start()
+    return {"ok": True, "job": job, "already_running": False}
+
+
+@app.get("/api/v1/training/import_batches/{batch_id}/ocr/reprocess")
+def api_v1_training_reprocess_import_batch_ocr_status(
+    batch_id: str,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    batch = (batch_id or "").strip()[:80]
+    if not batch:
+        raise HTTPException(status_code=400, detail="Batch id is required")
+    job = _get_batch_ocr_job(db, batch)
+    if not job:
+        raise HTTPException(status_code=404, detail="No OCR job found for this batch")
+    return {"ok": True, "job": job}
+
+
+@app.post("/api/v1/training/import_batches/{batch_id}/ocr/control")
+def api_v1_training_import_batch_ocr_control(
+    batch_id: str,
+    action: str = "stop",
+    chunk_size: int = 1000,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    batch = (batch_id or "").strip()[:80]
+    if not batch:
+        raise HTTPException(status_code=400, detail="Batch id is required")
+    action_norm = (action or "stop").strip().lower()
+    if action_norm not in {"stop", "resume", "restart", "clear"}:
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+    if action_norm == "stop":
+        _set_batch_ocr_stop(db, batch, True)
+        job = _get_batch_ocr_job(db, batch)
+        if job and str(job.get("status") or "").lower() == "running":
+            job["status"] = "stopping"
+            job["message"] = "Stop requested by admin"
+            job["updated_at"] = _utc_iso_now()
+            _write_batch_ocr_job(db, batch, job)
+        db.commit()
+        return {"ok": True, "action": action_norm, "job": _get_batch_ocr_job(db, batch)}
+
+    if action_norm == "clear":
+        _set_app_setting(db, _batch_ocr_job_key(batch), "")
+        _set_batch_ocr_stop(db, batch, False)
+        db.commit()
+        return {"ok": True, "action": action_norm}
+
+    if action_norm == "resume":
+        return api_v1_training_reprocess_import_batch_ocr(
+            batch_id=batch,
+            chunk_size=chunk_size,
+            resume=True,
+            force_restart=False,
+            db=db,
+            user="admin",
+        )
+
+    return api_v1_training_reprocess_import_batch_ocr(
+        batch_id=batch,
+        chunk_size=chunk_size,
+        resume=False,
+        force_restart=True,
+        db=db,
+        user="admin",
+    )
+
+
+@app.post("/api/v1/training/ocr/prefill")
+def api_v1_training_ocr_prefill(
+    batch: str = "",
+    source: str = "all",
+    limit: int = 2000,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    batch_norm = batch.strip()[:80]
+    source_norm = (source or "all").strip().lower()
+    safe_limit = max(1, min(int(limit or 2000), 5000))
+
+    _cleanup_upload_jobs()
+    job_id = _create_upload_job("ocr_prefill")
+
+    def _run():
+        local_db = SessionLocal()
+        try:
+            _update_upload_job(
+                job_id,
+                status="running",
+                progress=1,
+                message="Starting OCR prefill",
+                step="Preparing samples",
+            )
+            q = local_db.query(TrainingSample).filter(
+                TrainingSample.ignored.is_(False),
+                TrainingSample.no_plate.is_(False),
+                TrainingSample.bbox.isnot(None),
+            )
+            if batch_norm:
+                q = q.filter(TrainingSample.import_batch == batch_norm)
+            else:
+                if source_norm == "system":
+                    q = q.filter(TrainingSample.import_batch.is_(None))
+                elif source_norm == "dataset":
+                    q = q.filter(TrainingSample.import_batch.isnot(None))
+            samples = q.order_by(TrainingSample.updated_at.desc(), TrainingSample.id.desc()).limit(safe_limit).all()
+            total = len(samples)
+            scanned = 0
+            updated = 0
+            skipped = 0
+            if total == 0:
+                _update_upload_job(
+                    job_id,
+                    status="complete",
+                    progress=100,
+                    message="No annotated samples found",
+                    result={"scanned": 0, "updated": 0, "skipped": 0, "total": 0},
+                )
+                return
+
+            for sample in samples:
+                scanned += 1
+                existing_text = (sample.plate_text or "").strip()
+                if existing_text:
+                    skipped += 1
+                else:
+                    try:
+                        path = Path(MEDIA_DIR) / str(sample.image_path)
+                        frame = cv2.imread(str(path))
+                        if frame is None:
+                            skipped += 1
+                        else:
+                            crop = crop_from_bbox(frame, _bbox_xywh_to_xyxy(sample.bbox or {}))
+                            if crop is None:
+                                skipped += 1
+                            else:
+                                ocr = read_plate_text(crop) or {}
+                                text = str(ocr.get("plate_text") or "").strip().upper()
+                                if not text:
+                                    skipped += 1
+                                else:
+                                    raw = str(ocr.get("raw_text") or text).strip()
+                                    sample.plate_text = text
+                                    sample.unclear_plate = False
+                                    sample.processed_at = datetime.utcnow()
+                                    sample.notes = f"OCR_PREFILL_RAW:{raw}\n{(sample.notes or '').strip()}".strip()
+                                    local_db.add(sample)
+                                    updated += 1
+                    except Exception:
+                        skipped += 1
+
+                if scanned % 20 == 0 or scanned == total:
+                    progress = int((scanned / total) * 100)
+                    _update_upload_job(
+                        job_id,
+                        status="running",
+                        progress=progress,
+                        message=f"Processed {scanned}/{total}",
+                        step=f"Updated {updated}, skipped {skipped}",
+                        result={"scanned": scanned, "updated": updated, "skipped": skipped, "total": total},
+                    )
+            local_db.commit()
+            _update_upload_job(
+                job_id,
+                status="complete",
+                progress=100,
+                message=f"OCR prefill completed ({updated} updated)",
+                step="OCR prefill finished",
+                result={"scanned": scanned, "updated": updated, "skipped": skipped, "total": total},
+            )
+        except Exception as exc:
+            try:
+                local_db.rollback()
+            except Exception:
+                pass
+            _update_upload_job(
+                job_id,
+                status="failed",
+                progress=100,
+                message=f"OCR prefill failed: {exc}",
+                step=f"Error: {exc}",
+                error=str(exc),
+            )
+        finally:
+            local_db.close()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "job_id": job_id}
+
+
+@app.get("/api/v1/training/ocr/prefill/{job_id}")
+def api_v1_training_ocr_prefill_status(
+    job_id: str,
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    _cleanup_upload_jobs()
+    job = _get_upload_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"ok": True, "job": job}
+
+
+@app.post("/api/v1/training/ocr/learn")
+def api_v1_training_ocr_learn(
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    result = _learn_ocr_corrections_from_db(db)
+    return {
+        "ok": True,
+        "pairs": int(result.get("pairs") or 0),
+        "learned_map": result.get("learned_map") or {},
+        "replacements": int(result.get("replacements") or 0),
     }
 
 
@@ -3391,10 +6417,12 @@ def api_v1_training_annotate(
 
     if body.no_plate:
         sample.no_plate = True
+        sample.unclear_plate = False
         sample.bbox = None
         sample.plate_text = None
     else:
         sample.no_plate = False
+        sample.unclear_plate = bool(body.unclear_plate)
         if (
             body.bbox_x is not None
             and body.bbox_y is not None
@@ -3411,13 +6439,111 @@ def api_v1_training_annotate(
             }
         else:
             sample.bbox = None
-        sample.plate_text = body.plate_text.strip()[:50] if body.plate_text else None
+        if sample.unclear_plate:
+            sample.plate_text = None
+        else:
+            sample.plate_text = body.plate_text.strip()[:50] if body.plate_text else None
 
     sample.notes = body.notes.strip()[:500] if body.notes else None
+    sample.processed_at = datetime.utcnow()
     sample.ignored = False
     db.add(sample)
     db.commit()
-    return {"ok": True, "item": _api_training_sample_payload(sample)}
+    return {
+        "ok": True,
+        "item": _api_training_sample_payload(sample),
+        "debug_steps": _build_training_debug(sample),
+    }
+
+
+@app.post("/api/v1/training/samples/{sample_id:int}/reprocess")
+def api_v1_training_reprocess_sample(
+    sample_id: int,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    sample = db.get(TrainingSample, sample_id)
+    if not sample:
+        raise HTTPException(status_code=404, detail="Sample not found")
+    if sample.no_plate:
+        raise HTTPException(status_code=400, detail="Sample is marked as no-plate")
+    if not sample.bbox:
+        raise HTTPException(status_code=400, detail="Sample has no bbox")
+
+    path = Path(MEDIA_DIR) / str(sample.image_path or "")
+    frame = cv2.imread(str(path))
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Could not read sample image")
+
+    crop = crop_from_bbox(frame, _bbox_xywh_to_xyxy(sample.bbox or {}))
+    if crop is None:
+        raise HTTPException(status_code=400, detail="Could not crop sample bbox")
+
+    ocr = read_plate_text(crop) or {}
+    plate_text = str(ocr.get("plate_text") or "").strip().upper()
+    raw_text = str(ocr.get("raw_text") or plate_text).strip()
+    if plate_text:
+        sample.plate_text = plate_text[:50]
+        sample.unclear_plate = False
+    notes = (sample.notes or "").strip()
+    sample.notes = f"OCR_REPROCESS_RAW:{raw_text}\n{notes}".strip()
+    sample.processed_at = datetime.utcnow()
+    sample.ignored = False
+    db.add(sample)
+    db.commit()
+    return {
+        "ok": True,
+        "plate_text": sample.plate_text,
+        "raw_text": raw_text,
+        "item": _api_training_sample_payload(sample),
+        "debug_steps": _build_training_debug(sample),
+    }
+
+
+@app.post("/api/v1/training/samples/reprocess")
+def api_v1_training_reprocess_bulk(
+    body: ApiTrainingSampleIdsBody,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    ids = [int(x) for x in (body.sample_ids or []) if int(x) > 0]
+    if not ids:
+        return {"ok": True, "processed": 0, "updated": 0, "failed": 0}
+
+    updated = 0
+    failed = 0
+    processed = 0
+    for sid in ids:
+        sample = db.get(TrainingSample, sid)
+        if not sample or sample.no_plate or not sample.bbox:
+            failed += 1
+            continue
+        path = Path(MEDIA_DIR) / str(sample.image_path or "")
+        frame = cv2.imread(str(path))
+        if frame is None:
+            failed += 1
+            continue
+        crop = crop_from_bbox(frame, _bbox_xywh_to_xyxy(sample.bbox or {}))
+        if crop is None:
+            failed += 1
+            continue
+        ocr = read_plate_text(crop) or {}
+        plate_text = str(ocr.get("plate_text") or "").strip().upper()
+        raw_text = str(ocr.get("raw_text") or plate_text).strip()
+        if plate_text:
+            sample.plate_text = plate_text[:50]
+            sample.unclear_plate = False
+            updated += 1
+        notes = (sample.notes or "").strip()
+        sample.notes = f"OCR_REPROCESS_RAW:{raw_text}\n{notes}".strip()
+        sample.processed_at = datetime.utcnow()
+        db.add(sample)
+        processed += 1
+
+    db.commit()
+    return {"ok": True, "processed": processed, "updated": updated, "failed": failed}
 
 
 @app.post("/api/v1/training/samples/{sample_id:int}/ignore")
@@ -3583,12 +6709,57 @@ def api_v1_allowed_delete(
 @app.get("/api/v1/discovery/run")
 def api_v1_discovery_run(
     timeout: int = 3,
+    subnets: Optional[str] = None,
+    probe_ports: bool = False,
     user: str = Depends(_api_get_current_user),
 ):
     del user
     timeout = max(1, min(int(timeout), 15))
-    result = discover_onvif(timeout=timeout, resolve_rtsp=False)
-    return result
+    result = discover_onvif(timeout=timeout, resolve_rtsp=False) or {"error": None, "devices": []}
+    raw_devices = result.get("devices") or []
+    subnet_filters, invalid_subnets = _parse_discovery_subnets(subnets)
+
+    devices = []
+    for device in raw_devices:
+        xaddrs = device.get("xaddrs") or []
+        host = None
+        xaddr_ports = set()
+        for xaddr in xaddrs:
+            parsed_host, parsed_port = _xaddr_host_port(xaddr)
+            if not host and parsed_host:
+                host = parsed_host
+            if parsed_port:
+                xaddr_ports.add(int(parsed_port))
+
+        if subnet_filters and (not host or not _host_in_subnets(host, subnet_filters)):
+            continue
+
+        enriched = dict(device)
+        enriched["host"] = host
+        enriched["xaddr_ports"] = sorted(xaddr_ports)
+
+        if probe_ports and host:
+            probe_targets = {80, 443, 554}
+            probe_targets.update(xaddr_ports)
+            enriched["port_probe"] = {
+                str(port): _probe_tcp_port(host, port)
+                for port in sorted(probe_targets)
+            }
+        else:
+            enriched["port_probe"] = {}
+        devices.append(enriched)
+
+    return {
+        "error": result.get("error"),
+        "devices": devices,
+        "total_found": len(raw_devices),
+        "total_after_filter": len(devices),
+        "filters": {
+            "subnets": [str(item) for item in subnet_filters],
+            "invalid_subnets": invalid_subnets,
+            "probe_ports": bool(probe_ports),
+        },
+    }
 
 
 @app.post("/api/v1/discovery/resolve")
@@ -3599,6 +6770,206 @@ def api_v1_discovery_resolve(
     del user
     profiles = resolve_rtsp_for_xaddr(body.xaddr, body.username, body.password)
     return {"xaddr": body.xaddr, "rtsp_profiles": profiles}
+
+
+@app.get("/api/v1/clips")
+def api_v1_clips_list(
+    camera_id: Optional[int] = None,
+    kind: str = "",
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    limit = max(1, min(500, int(limit)))
+    offset = max(0, int(offset))
+    kind_norm = (kind or "").strip().lower()
+    q = (
+        db.query(ClipRecord, Camera)
+        .join(Camera, Camera.id == ClipRecord.camera_id)
+        .order_by(ClipRecord.created_at.desc(), ClipRecord.id.desc())
+    )
+    if camera_id:
+        q = q.filter(ClipRecord.camera_id == int(camera_id))
+    if kind_norm in {"manual", "detection"}:
+        q = q.filter(ClipRecord.kind == kind_norm)
+    rows = q.offset(offset).limit(limit).all()
+    items = [_clip_record_payload(row, camera_name=cam.name) for row, cam in rows]
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/v1/clips/active")
+def api_v1_clips_active(
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    active_rows = manual_clip_manager.active()
+    if not active_rows:
+        return {"items": []}
+    camera_ids = [int(item["camera_id"]) for item in active_rows]
+    camera_rows = db.query(Camera.id, Camera.name).filter(Camera.id.in_(camera_ids)).all()
+    camera_name = {int(cid): name for cid, name in camera_rows}
+    items = []
+    for row in active_rows:
+        started_at = row.get("started_at")
+        items.append(
+            {
+                "camera_id": int(row["camera_id"]),
+                "camera_name": camera_name.get(int(row["camera_id"])),
+                "file_path": row.get("file_path"),
+                "frames": int(row.get("frames") or 0),
+                "started_at": started_at.isoformat() if isinstance(started_at, datetime) else None,
+            }
+        )
+    return {"items": items}
+
+
+@app.post("/api/v1/clips/start")
+def api_v1_clips_start(
+    body: ApiClipControlBody,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    camera = db.get(Camera, int(body.camera_id))
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    if not camera.save_clip:
+        raise HTTPException(status_code=400, detail="Clip saving is disabled for this camera")
+    if not camera.enabled:
+        raise HTTPException(status_code=400, detail="Camera is disabled")
+
+    started = manual_clip_manager.start(camera)
+    if not started.get("ok"):
+        raise HTTPException(status_code=500, detail="Could not start clip recording")
+
+    if not started.get("already_running"):
+        _create_notification(
+            db,
+            title=f"Manual clip recording started on {camera.name}",
+            message=f"Recording has started for camera {camera.name}.",
+            level="info",
+            kind="clip",
+            camera_id=camera.id,
+            extra={"event": "manual_clip_start"},
+        )
+    return {
+        "ok": True,
+        "camera_id": camera.id,
+        "camera_name": camera.name,
+        "already_running": bool(started.get("already_running")),
+        "file_path": started.get("file_path"),
+    }
+
+
+@app.post("/api/v1/clips/stop")
+def api_v1_clips_stop(
+    body: ApiClipControlBody,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    camera = db.get(Camera, int(body.camera_id))
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    stopped = manual_clip_manager.stop(camera.id)
+    if not stopped:
+        raise HTTPException(status_code=400, detail="No active clip recording for this camera")
+    if not stopped.get("ok"):
+        raise HTTPException(status_code=400, detail=str(stopped.get("error") or "Clip recording did not capture frames"))
+    file_path = str(stopped.get("file_path") or "").strip()
+    if not file_path:
+        raise HTTPException(status_code=500, detail="Clip path is missing")
+
+    started_at = stopped.get("started_at")
+    ended_at = stopped.get("ended_at")
+    if not isinstance(started_at, datetime) or not isinstance(ended_at, datetime):
+        started_at = datetime.utcnow()
+        ended_at = datetime.utcnow()
+
+    detection_count = (
+        db.query(Detection)
+        .filter(Detection.camera_id == camera.id)
+        .filter(Detection.detected_at >= started_at)
+        .filter(Detection.detected_at <= ended_at)
+        .count()
+    )
+
+    row = ClipRecord(
+        camera_id=camera.id,
+        kind="manual",
+        file_path=file_path,
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_seconds=float(stopped.get("duration_seconds") or 0),
+        size_bytes=int(stopped.get("size_bytes") or 0),
+        detection_count=int(detection_count),
+    )
+    db.add(row)
+    db.commit()
+
+    _create_notification(
+        db,
+        title=f"Manual clip saved for {camera.name}",
+        message=f"Clip saved with {detection_count} detections during recording.",
+        level="success",
+        kind="clip",
+        camera_id=camera.id,
+        extra={"event": "manual_clip_stop", "clip_id": row.id, "detections": detection_count},
+    )
+
+    return {"ok": True, "item": _clip_record_payload(row, camera_name=camera.name)}
+
+
+@app.delete("/api/v1/clips/{clip_id:int}")
+def api_v1_clip_delete(
+    clip_id: int,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    row = db.get(ClipRecord, clip_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    _delete_clip_row(db, row)
+    db.commit()
+    return {"ok": True}
+
+
+def _delete_clip_row(db: Session, row: ClipRecord) -> None:
+    clip_path = _clip_abs_path(row.file_path)
+    if clip_path:
+        try:
+            clip_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    db.delete(row)
+
+
+@app.post("/api/v1/clips/bulk/delete")
+def api_v1_clips_bulk_delete(
+    body: ApiBulkIdsBody,
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    ids = [int(x) for x in body.detection_ids if int(x) > 0]
+    if not ids:
+        return {"ok": True, "deleted": 0, "failed": 0}
+
+    deleted = 0
+    failed = 0
+    rows = db.query(ClipRecord).filter(ClipRecord.id.in_(ids)).all()
+    found_ids = {int(row.id) for row in rows}
+    for row in rows:
+        _delete_clip_row(db, row)
+        deleted += 1
+    failed += max(0, len(ids) - len(found_ids))
+    db.commit()
+    return {"ok": True, "deleted": deleted, "failed": failed}
 
 
 @app.get("/api/v1/notifications")

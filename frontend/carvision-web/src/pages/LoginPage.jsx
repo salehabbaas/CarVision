@@ -38,10 +38,10 @@ export default function LoginPage() {
         <div className="login-icon"><Shield size={22} /></div>
         <h2>CarVision Admin</h2>
         <p className="muted">Secure JWT access to live cameras and CarVision training workflow.</p>
-        <label>Username</label>
-        <input value={username} onChange={(e) => setUsername(e.target.value)} required />
-        <label>Password</label>
-        <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+        <label title="Account username used to access the admin panel.">Username</label>
+        <input title="Enter your admin account username." value={username} onChange={(e) => setUsername(e.target.value)} required />
+        <label title="Account password for the admin panel login.">Password</label>
+        <input title="Enter your admin account password." type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
         {error ? <div className="alert error">{error}</div> : null}
         <button className="btn primary" disabled={loading}>{loading ? 'Signing in...' : 'Sign in'}</button>
       </motion.form>

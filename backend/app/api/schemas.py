@@ -21,6 +21,8 @@ class ApiBulkFeedbackBody(BaseModel):
 
 class ApiCameraPatchBody(BaseModel):
     name: Optional[str] = None
+    type: Optional[str] = None
+    source: Optional[str] = None
     location: Optional[str] = None
     enabled: Optional[bool] = None
     live_view: Optional[bool] = None
@@ -28,6 +30,12 @@ class ApiCameraPatchBody(BaseModel):
     detector_mode: Optional[str] = None
     scan_interval: Optional[float] = None
     cooldown_seconds: Optional[float] = None
+    save_clip: Optional[bool] = None
+    clip_seconds: Optional[int] = None
+    onvif_xaddr: Optional[str] = None
+    onvif_username: Optional[str] = None
+    onvif_password: Optional[str] = None
+    onvif_profile: Optional[str] = None
 
 
 class ApiLayoutBody(BaseModel):
@@ -67,14 +75,68 @@ class ApiTrainingAnnotateBody(BaseModel):
     bbox_w: Optional[int] = None
     bbox_h: Optional[int] = None
     no_plate: bool = False
+    unclear_plate: bool = False
     notes: Optional[str] = None
+
+
+class ApiTrainingSampleIdsBody(BaseModel):
+    sample_ids: List[int] = Field(default_factory=list)
 
 
 class ApiTrainingIgnoreBody(BaseModel):
     ignored: Optional[bool] = None
 
 
+class ApiTrainingSettingsBody(BaseModel):
+    train_model: Optional[str] = None
+    train_epochs: Optional[int] = None
+    train_imgsz: Optional[int] = None
+    train_batch: Optional[int] = None
+    train_device: Optional[str] = None
+    train_patience: Optional[int] = None
+    plate_region: Optional[str] = None
+    plate_min_length: Optional[int] = None
+    plate_max_length: Optional[int] = None
+    plate_charset: Optional[str] = None
+    plate_pattern_regex: Optional[str] = None
+    plate_shape_hint: Optional[str] = None
+    plate_reference_date: Optional[str] = None
+    allowed_stationary_enabled: Optional[bool] = None
+    allowed_stationary_motion_threshold: Optional[float] = None
+    allowed_stationary_hold_seconds: Optional[float] = None
+    train_chunk_size: Optional[int] = None
+    train_chunk_epochs: Optional[int] = None
+    train_new_only_default: Optional[bool] = None
+    train_nightly_enabled: Optional[bool] = None
+    train_nightly_hour: Optional[int] = None
+    train_nightly_minute: Optional[int] = None
+    train_schedule_tz: Optional[str] = None
+
+
+class ApiTrainingStartBody(BaseModel):
+    mode: Optional[str] = None
+    chunk_size: Optional[int] = None
+    chunk_epochs: Optional[int] = None
+    run_ocr_prefill: Optional[bool] = None
+    run_ocr_learn: Optional[bool] = None
+
+
+class ApiClipControlBody(BaseModel):
+    camera_id: int
+
+
 class ApiDiscoveryResolveBody(BaseModel):
     xaddr: str
     username: str
     password: str
+
+
+class ApiCameraTestBody(BaseModel):
+    url: str
+    host: Optional[str] = None
+    port: Optional[int] = None
+
+
+class ApiModelTestBody(BaseModel):
+    sample_ids: Optional[List[int]] = None
+    limit: int = 100

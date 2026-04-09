@@ -116,7 +116,7 @@ def discover_onvif(timeout: int = 3, resolve_rtsp: bool = False, username: str =
         services = []
         try:
             services = wsd.searchServices(
-                types=QName("http://www.onvif.org/ver10/network/wsdl", "NetworkVideoTransmitter"),
+                types=[QName("http://www.onvif.org/ver10/network/wsdl", "NetworkVideoTransmitter")],
                 timeout=timeout,
             )
         except Exception:
@@ -125,7 +125,7 @@ def discover_onvif(timeout: int = 3, resolve_rtsp: bool = False, username: str =
         if not services:
             try:
                 services = wsd.searchServices(
-                    types=QName("http://www.onvif.org/ver10/device/wsdl", "Device"),
+                    types=[QName("http://www.onvif.org/ver10/device/wsdl", "Device")],
                     timeout=timeout,
                 )
             except Exception:

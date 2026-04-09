@@ -1,17 +1,28 @@
 services:
+
+  # ── PostgreSQL database ─────────────────────────────────────────────────────
   carvision-db:
     image: postgres:16
     container_name: carvision-db
     restart: unless-stopped
+    networks:
+      - carvision-net
     environment:
-      POSTGRES_DB: carvision
-      POSTGRES_USER: carvision
-      POSTGRES_PASSWORD: carvision
+      POSTGRES_DB:       ${POSTGRES_DB:-carvision}
+      POSTGRES_USER:     ${POSTGRES_USER:-carvision}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-carvision}
     ports:
       - "5434:5432"
     volumes:
       - carvision_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-carvision} -d ${POSTGRES_DB:-carvision}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
+  # ── FastAPI backend ─────────────────────────────────────────────────────────
   carvision-backend:
     build:
       context: .
@@ -19,19 +30,38 @@ services:
     container_name: carvision-backend
     restart: unless-stopped
     depends_on:
-      - carvision-db
+      carvision-db:
+        condition: service_healthy
+    networks:
+      - carvision-net
+    # NET_ADMIN lets the container add routes at startup so it can reach
+    # VPN-connected subnets (e.g. 10.40.4.0/24) through the host machine.
+    cap_add:
+      - NET_ADMIN
     environment:
-      DATABASE_URL: postgresql+psycopg2://carvision:carvision@carvision-db:5432/carvision
-      MEDIA_DIR: /app/datasets/media
-      YOLO_PLATE_MODEL: /app/models/plate.pt
-      LEGACY_FRONTEND_DIR: /app/old/python_frontend
-      API_ADMIN_USER: ${API_ADMIN_USER:-admin}
-      API_ADMIN_PASS: ${API_ADMIN_PASS:-admin}
-      JWT_SECRET: ${JWT_SECRET:-change-this-secret}
-      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-480}
-      API_CORS_ORIGINS: ${API_CORS_ORIGINS:-http://localhost:5173,http://localhost:8081}
-      SSL_CERTFILE: ${SSL_CERTFILE:-}
-      SSL_KEYFILE: ${SSL_KEYFILE:-}
+      DATABASE_URL:          postgresql+psycopg2://${POSTGRES_USER:-carvision}:${POSTGRES_PASSWORD:-carvision}@carvision-db:5432/${POSTGRES_DB:-carvision}
+      MEDIA_DIR:             /app/datasets/media
+      YOLO_PLATE_MODEL:      /app/models/plate.pt
+      LEGACY_FRONTEND_DIR:   /app/old/python_frontend
+      API_ADMIN_USER:        ${API_ADMIN_USER:-admin}
+      API_ADMIN_PASS:        ${API_ADMIN_PASS:-admin}
+      JWT_SECRET:            ${JWT_SECRET:-change-this-secret}
+      JWT_EXPIRE_MINUTES:    ${JWT_EXPIRE_MINUTES:-480}
+      API_CORS_ORIGINS:      ${API_CORS_ORIGINS:-*}
+      PUBLIC_BASE_URL:       ${PUBLIC_BASE_URL:-}
+      FRONTEND_PUBLIC_BASE_URL: ${FRONTEND_PUBLIC_BASE_URL:-}
+      FRONTEND_PUBLIC_SCHEME:   ${FRONTEND_PUBLIC_SCHEME:-http}
+      FRONTEND_PUBLIC_PORT:     ${FRONTEND_PUBLIC_PORT:-8081}
+      SSL_CERTFILE:          ${SSL_CERTFILE:-}
+      SSL_KEYFILE:           ${SSL_KEYFILE:-}
+      # VPN subnet(s) the container should reach through the host machine.
+      # Separate multiple CIDRs with commas: 10.40.4.0/24,10.40.5.0/24
+      VPN_SUBNETS:           ${VPN_SUBNETS:-10.40.4.0/24}
+      # Low-latency RTSP/FFMPEG flags for IP cameras and DVRs.
+      # tcp  = more reliable than UDP through NAT/firewalls
+      # nobuffer/low_delay = reduce decoder queue delay
+      # stimeout=10000000  = 10-second connect timeout (raise for slow WAN cameras)
+      OPENCV_FFMPEG_CAPTURE_OPTIONS: "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0|reorder_queue_size;0|buffer_size;204800|stimeout;10000000"
     ports:
       - "8000:8000"
     volumes:
@@ -40,19 +70,54 @@ services:
       - ./old:/app/old:ro
       - ./models:/app/models
       - ./certs:/certs:ro
+      # Entrypoint helper that adds VPN routes before starting the app
+      - ./docker-vpn-routes.sh:/docker-vpn-routes.sh:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Inject VPN routes then hand off to the normal startup command.
+    # The script resolves host.docker.internal to get the Mac's IP (which has
+    # VPN access) and adds a route for every CIDR listed in VPN_SUBNETS.
+    entrypoint: ["/bin/sh", "/docker-vpn-routes.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/', timeout=3)\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
+  # ── React frontend served by nginx ─────────────────────────────────────────
   carvision-frontend:
     build:
       context: ./frontend/carvision-web
       dockerfile: Dockerfile
       args:
-        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+        # The URL baked into the React bundle that the browser uses to reach
+        # the backend. Must be reachable from the user's browser, not from
+        # inside Docker.
+        VITE_API_URL: ${VITE_API_URL:-}
+        VITE_CAPTURE_HTTPS_ORIGIN: ${VITE_CAPTURE_HTTPS_ORIGIN:-}
+        VITE_CAPTURE_HTTPS_PORT: ${VITE_CAPTURE_HTTPS_PORT:-8443}
     container_name: carvision-frontend
     restart: unless-stopped
+    networks:
+      - carvision-net
     depends_on:
-      - carvision-backend
+      carvision-backend:
+        condition: service_healthy
     ports:
       - "8081:80"
+      - "8443:443"
 
 volumes:
   carvision_db_data:
+
+networks:
+  # Explicit subnet avoids Docker choosing one that conflicts with VPN ranges.
+  # 172.28.0.0/16 is well away from 10.x.x.x and 192.168.x.x VPN ranges.
+  carvision-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1

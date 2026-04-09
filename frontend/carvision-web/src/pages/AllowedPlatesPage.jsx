@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Plus, Save, Trash2 } from 'lucide-react';
 import { request } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
+import { LoadingState, ErrorState } from '../components/PageState';
 
 export default function AllowedPlatesPage() {
   const { token } = useAuth();
@@ -10,6 +11,7 @@ export default function AllowedPlatesPage() {
   const [newLabel, setNewLabel] = useState('');
   const [toast, setToast] = useState('');
   const [error, setError] = useState('');
+  const [pageLoading, setPageLoading] = useState(true);
 
   async function load() {
     const res = await request('/api/v1/allowed', { token });
@@ -17,7 +19,9 @@ export default function AllowedPlatesPage() {
   }
 
   useEffect(() => {
-    load().catch((err) => setError(err.message || 'Failed to load allowed plates'));
+    load()
+      .catch((err) => setError(err.message || 'Failed to load allowed plates'))
+      .finally(() => setPageLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -58,14 +62,27 @@ export default function AllowedPlatesPage() {
     await load();
   }
 
+  if (pageLoading) return <LoadingState rows={3} message="Loading allowed plates…" />;
+  if (error && rows.length === 0) return <ErrorState error={{ message: error, type: 'unknown' }} onRetry={() => { setPageLoading(true); load().catch(e => setError(e.message)).finally(() => setPageLoading(false)); }} />;
+
   return (
     <div className="stack">
       {error ? <div className="alert error">{error}</div> : null}
       {toast ? <div className="alert success">{toast}</div> : null}
 
       <div className="panel glass toolbar">
-        <input placeholder="Plate" value={newPlate} onChange={(e) => setNewPlate(e.target.value)} />
-        <input placeholder="Label" value={newLabel} onChange={(e) => setNewLabel(e.target.value)} />
+        <input
+          title="Plate number to allow (for example ABC123)."
+          placeholder="Plate"
+          value={newPlate}
+          onChange={(e) => setNewPlate(e.target.value)}
+        />
+        <input
+          title="Optional label for this plate (owner, team, vehicle name)."
+          placeholder="Label"
+          value={newLabel}
+          onChange={(e) => setNewLabel(e.target.value)}
+        />
         <button className="btn primary" onClick={() => createPlate().catch((err) => setError(err.message || 'Create failed'))}><Plus size={15} /> Add</button>
       </div>
 
@@ -86,9 +103,9 @@ export default function AllowedPlatesPage() {
               {rows.map((r) => (
                 <tr key={r.id}>
                   <td className="mono">{r.id}</td>
-                  <td><input value={r.plate_text || ''} onChange={(e) => setRows((prev) => prev.map((x) => x.id === r.id ? { ...x, plate_text: e.target.value, _dirty: true } : x))} /></td>
-                  <td><input value={r.label || ''} onChange={(e) => setRows((prev) => prev.map((x) => x.id === r.id ? { ...x, label: e.target.value, _dirty: true } : x))} /></td>
-                  <td><input type="checkbox" checked={Boolean(r.active)} onChange={(e) => setRows((prev) => prev.map((x) => x.id === r.id ? { ...x, active: e.target.checked, _dirty: true } : x))} /></td>
+                  <td><input title="Edit the allowed plate text." value={r.plate_text || ''} onChange={(e) => setRows((prev) => prev.map((x) => x.id === r.id ? { ...x, plate_text: e.target.value, _dirty: true } : x))} /></td>
+                  <td><input title="Edit a descriptive label for this plate." value={r.label || ''} onChange={(e) => setRows((prev) => prev.map((x) => x.id === r.id ? { ...x, label: e.target.value, _dirty: true } : x))} /></td>
+                  <td><input title="Enable or disable this plate without deleting it." type="checkbox" checked={Boolean(r.active)} onChange={(e) => setRows((prev) => prev.map((x) => x.id === r.id ? { ...x, active: e.target.checked, _dirty: true } : x))} /></td>
                   <td>
                     <div className="row">
                       <button className="btn" disabled={!r._dirty} onClick={() => saveRow(r).catch((err) => setError(err.message || 'Save failed'))}><Save size={14} /> Save</button>

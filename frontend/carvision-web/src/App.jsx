@@ -8,11 +8,14 @@ import DetectionsPage from './pages/DetectionsPage';
 import CamerasPage from './pages/CamerasPage';
 import TrainingPage from './pages/TrainingPage';
 import NotificationsPage from './pages/NotificationsPage';
+import ClipsPage from './pages/ClipsPage';
 import UploadPage from './pages/UploadPage';
 import TrainingDataPage from './pages/TrainingDataPage';
 import DatasetImportPage from './pages/DatasetImportPage';
+import TrainedDataPage from './pages/TrainedDataPage';
 import AllowedPlatesPage from './pages/AllowedPlatesPage';
 import DiscoveryPage from './pages/DiscoveryPage';
+import CapturePage from './pages/CapturePage';
 
 function ShellPage({ children }) {
   return (
@@ -25,18 +28,21 @@ function ShellPage({ children }) {
 export default function App() {
   return (
     <Routes>
+      <Route path="/capture/:cameraId" element={<CapturePage />} />
       <Route path="/login" element={<LoginPage />} />
       <Route path="/" element={<ShellPage><DashboardPage /></ShellPage>} />
       <Route path="/live" element={<ShellPage><LivePage /></ShellPage>} />
       <Route path="/detections" element={<ShellPage><DetectionsPage /></ShellPage>} />
       <Route path="/upload" element={<ShellPage><UploadPage /></ShellPage>} />
       <Route path="/dataset-import" element={<ShellPage><DatasetImportPage /></ShellPage>} />
+      <Route path="/trained-data" element={<ShellPage><TrainedDataPage /></ShellPage>} />
       <Route path="/training-data" element={<ShellPage><TrainingDataPage /></ShellPage>} />
       <Route path="/cameras" element={<ShellPage><CamerasPage /></ShellPage>} />
       <Route path="/allowed" element={<ShellPage><AllowedPlatesPage /></ShellPage>} />
       <Route path="/discovery" element={<ShellPage><DiscoveryPage /></ShellPage>} />
       <Route path="/training" element={<ShellPage><TrainingPage /></ShellPage>} />
       <Route path="/notifications" element={<ShellPage><NotificationsPage /></ShellPage>} />
+      <Route path="/clips" element={<ShellPage><ClipsPage /></ShellPage>} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

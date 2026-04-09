@@ -16,7 +16,7 @@ class Camera(Base):
     location = Column(String(200), nullable=True)
     enabled = Column(Boolean, default=True, nullable=False)
 
-    scan_interval = Column(Float, default=1.0, nullable=False)
+    scan_interval = Column(Float, default=0.15, nullable=False)
     cooldown_seconds = Column(Float, default=10.0, nullable=False)
 
     save_snapshot = Column(Boolean, default=True, nullable=False)
@@ -89,12 +89,41 @@ class TrainingSample(Base):
     bbox = Column(JSON, nullable=True)
     notes = Column(Text, nullable=True)
     no_plate = Column(Boolean, default=False, nullable=False)
+    unclear_plate = Column(Boolean, default=False, nullable=False)
     ignored = Column(Boolean, default=False, nullable=False)
     import_batch = Column(String(80), nullable=True)
+    processed_at = Column(DateTime(timezone=True), nullable=True)
     last_trained_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class TrainingJob(Base):
+    __tablename__ = "training_jobs"
+
+    id = Column(String(64), primary_key=True)
+    kind = Column(String(30), nullable=False, default="pipeline")
+    status = Column(String(20), nullable=False, default="queued")
+    mode = Column(String(20), nullable=False, default="new_only")
+    stage = Column(String(50), nullable=False, default="queued")
+    progress = Column(Float, nullable=False, default=0.0)
+    message = Column(Text, nullable=True)
+    total_samples = Column(Integer, nullable=False, default=0)
+    trained_samples = Column(Integer, nullable=False, default=0)
+    ocr_scanned = Column(Integer, nullable=False, default=0)
+    ocr_updated = Column(Integer, nullable=False, default=0)
+    chunk_size = Column(Integer, nullable=False, default=1000)
+    chunk_index = Column(Integer, nullable=False, default=0)
+    chunk_total = Column(Integer, nullable=False, default=0)
+    run_started_at = Column(DateTime(timezone=True), nullable=True)
+    run_dir = Column(String(500), nullable=True)
+    model_path = Column(String(500), nullable=True)
+    details = Column(JSON, nullable=True)
+    error = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class AppSetting(Base):
@@ -117,4 +146,19 @@ class Notification(Base):
     camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=True)
     detection_id = Column(Integer, ForeignKey("detections.id"), nullable=True)
     extra = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ClipRecord(Base):
+    __tablename__ = "clip_records"
+
+    id = Column(Integer, primary_key=True)
+    camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False)
+    kind = Column(String(20), nullable=False, default="manual")
+    file_path = Column(String(500), nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    ended_at = Column(DateTime(timezone=True), nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    detection_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

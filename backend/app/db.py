@@ -81,13 +81,18 @@ def ensure_schema():
                     conn.execute(text("ALTER TABLE training_samples ADD COLUMN image_hash TEXT"))
                 if "no_plate" not in columns:
                     conn.execute(text("ALTER TABLE training_samples ADD COLUMN no_plate BOOLEAN DEFAULT 0"))
+                if "unclear_plate" not in columns:
+                    conn.execute(text("ALTER TABLE training_samples ADD COLUMN unclear_plate BOOLEAN DEFAULT 0"))
                 if "ignored" not in columns:
                     conn.execute(text("ALTER TABLE training_samples ADD COLUMN ignored BOOLEAN DEFAULT 0"))
                 if "import_batch" not in columns:
                     conn.execute(text("ALTER TABLE training_samples ADD COLUMN import_batch TEXT"))
+                if "processed_at" not in columns:
+                    conn.execute(text("ALTER TABLE training_samples ADD COLUMN processed_at TEXT"))
                 if "last_trained_at" not in columns:
                     conn.execute(text("ALTER TABLE training_samples ADD COLUMN last_trained_at TEXT"))
                 conn.execute(text("UPDATE training_samples SET no_plate = 0 WHERE no_plate IS NULL"))
+                conn.execute(text("UPDATE training_samples SET unclear_plate = 0 WHERE unclear_plate IS NULL"))
                 conn.execute(text("UPDATE training_samples SET ignored = 0 WHERE ignored IS NULL"))
             if "notifications" in tables:
                 columns = [row[1] for row in conn.execute(text("PRAGMA table_info(notifications)")).all()]
@@ -129,10 +134,13 @@ def ensure_schema():
             conn.execute(text("ALTER TABLE detections ADD COLUMN IF NOT EXISTS feedback_at TIMESTAMP"))
             conn.execute(text("ALTER TABLE training_samples ADD COLUMN IF NOT EXISTS image_hash VARCHAR(64)"))
             conn.execute(text("ALTER TABLE training_samples ADD COLUMN IF NOT EXISTS no_plate BOOLEAN DEFAULT FALSE"))
+            conn.execute(text("ALTER TABLE training_samples ADD COLUMN IF NOT EXISTS unclear_plate BOOLEAN DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE training_samples ADD COLUMN IF NOT EXISTS ignored BOOLEAN DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE training_samples ADD COLUMN IF NOT EXISTS import_batch VARCHAR(80)"))
+            conn.execute(text("ALTER TABLE training_samples ADD COLUMN IF NOT EXISTS processed_at TIMESTAMP"))
             conn.execute(text("ALTER TABLE training_samples ADD COLUMN IF NOT EXISTS last_trained_at TIMESTAMP"))
             conn.execute(text("UPDATE training_samples SET no_plate = FALSE WHERE no_plate IS NULL"))
+            conn.execute(text("UPDATE training_samples SET unclear_plate = FALSE WHERE unclear_plate IS NULL"))
             conn.execute(text("UPDATE training_samples SET ignored = FALSE WHERE ignored IS NULL"))
             conn.execute(text("ALTER TABLE notifications ADD COLUMN IF NOT EXISTS kind VARCHAR(50)"))
             conn.execute(text("ALTER TABLE notifications ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE"))
