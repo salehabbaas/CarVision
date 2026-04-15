@@ -18,6 +18,21 @@ TRAINING_LOCK = threading.Lock()
 UPLOAD_JOBS: Dict[str, Dict[str, object]] = {}
 UPLOAD_LOCK = threading.Lock()
 
+# Track the latest OCR prefill job ID so the frontend can recover it after a page refresh
+_LATEST_OCR_JOB_ID: Optional[str] = None
+_LATEST_OCR_LOCK = threading.Lock()
+
+
+def set_latest_ocr_job(job_id: str) -> None:
+    global _LATEST_OCR_JOB_ID
+    with _LATEST_OCR_LOCK:
+        _LATEST_OCR_JOB_ID = job_id
+
+
+def get_latest_ocr_job_id() -> Optional[str]:
+    with _LATEST_OCR_LOCK:
+        return _LATEST_OCR_JOB_ID
+
 
 def set_training_status(status: str, message: str, run_dir: Optional[str] = None, model_path: Optional[str] = None):
     with TRAINING_LOCK:
@@ -58,6 +73,7 @@ def cleanup_upload_jobs(max_age_sec: int = 3600):
 def create_upload_job(filename: str) -> str:
     job_id = secrets.token_urlsafe(10)
     now = datetime.utcnow().isoformat()
+    now_ts = time.time()
     with UPLOAD_LOCK:
         UPLOAD_JOBS[job_id] = {
             "id": job_id,
@@ -68,8 +84,9 @@ def create_upload_job(filename: str) -> str:
             "result": None,
             "error": None,
             "created_at": now,
+            "started_ts": now_ts,   # wall-clock seconds — used by frontend for ETA
             "updated_at": now,
-            "updated_ts": time.time(),
+            "updated_ts": now_ts,
         }
     return job_id
 
@@ -125,5 +142,7 @@ def get_upload_job(job_id: str) -> Optional[Dict[str, object]]:
             "result": job.get("result"),
             "error": job.get("error"),
             "created_at": job.get("created_at"),
+            "started_ts": job.get("started_ts"),
             "updated_at": job.get("updated_at"),
+            "updated_ts": job.get("updated_ts"),
         }

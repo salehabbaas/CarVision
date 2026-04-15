@@ -110,6 +110,8 @@ from services.state import (
     create_upload_job as _create_upload_job,
     get_training_status as _get_training_status,
     get_upload_job as _get_upload_job,
+    get_latest_ocr_job_id as _get_latest_ocr_job_id,
+    set_latest_ocr_job as _set_latest_ocr_job,
     set_training_status as _set_training_status,
     update_upload_job as _update_upload_job,
 )
@@ -6256,17 +6258,19 @@ def api_v1_training_import_batch_ocr_control(
 def api_v1_training_ocr_prefill(
     batch: str = "",
     source: str = "all",
-    limit: int = 2000,
+    limit: int = 0,
     db: Session = Depends(get_db),
     user: str = Depends(_api_get_current_user),
 ):
     del user
     batch_norm = batch.strip()[:80]
     source_norm = (source or "all").strip().lower()
-    safe_limit = max(1, min(int(limit or 2000), 5000))
+    # limit=0 means process ALL unfilled samples (no cap)
+    safe_limit = max(0, int(limit or 0))
 
     _cleanup_upload_jobs()
     job_id = _create_upload_job("ocr_prefill")
+    _set_latest_ocr_job(job_id)  # so the frontend can recover after page refresh
 
     def _run():
         local_db = SessionLocal()
@@ -6282,6 +6286,7 @@ def api_v1_training_ocr_prefill(
                 TrainingSample.ignored.is_(False),
                 TrainingSample.no_plate.is_(False),
                 TrainingSample.bbox.isnot(None),
+                or_(TrainingSample.plate_text.is_(None), TrainingSample.plate_text == ""),
             )
             if batch_norm:
                 q = q.filter(TrainingSample.import_batch == batch_norm)
@@ -6290,7 +6295,11 @@ def api_v1_training_ocr_prefill(
                     q = q.filter(TrainingSample.import_batch.is_(None))
                 elif source_norm == "dataset":
                     q = q.filter(TrainingSample.import_batch.isnot(None))
-            samples = q.order_by(TrainingSample.updated_at.desc(), TrainingSample.id.desc()).limit(safe_limit).all()
+            q = q.order_by(TrainingSample.id.asc())
+            if safe_limit > 0:
+                samples = q.limit(safe_limit).all()
+            else:
+                samples = q.all()
             total = len(samples)
             scanned = 0
             updated = 0
@@ -6307,42 +6316,40 @@ def api_v1_training_ocr_prefill(
 
             for sample in samples:
                 scanned += 1
-                existing_text = (sample.plate_text or "").strip()
-                if existing_text:
-                    skipped += 1
-                else:
-                    try:
-                        path = Path(MEDIA_DIR) / str(sample.image_path)
-                        frame = cv2.imread(str(path))
-                        if frame is None:
+                try:
+                    path = Path(MEDIA_DIR) / str(sample.image_path)
+                    frame = cv2.imread(str(path))
+                    if frame is None:
+                        skipped += 1
+                    else:
+                        crop = crop_from_bbox(frame, _bbox_xywh_to_xyxy(sample.bbox or {}))
+                        if crop is None:
                             skipped += 1
                         else:
-                            crop = crop_from_bbox(frame, _bbox_xywh_to_xyxy(sample.bbox or {}))
-                            if crop is None:
+                            ocr = read_plate_text(crop) or {}
+                            text = str(ocr.get("plate_text") or "").strip().upper()
+                            if not text:
                                 skipped += 1
                             else:
-                                ocr = read_plate_text(crop) or {}
-                                text = str(ocr.get("plate_text") or "").strip().upper()
-                                if not text:
-                                    skipped += 1
-                                else:
-                                    raw = str(ocr.get("raw_text") or text).strip()
-                                    sample.plate_text = text
-                                    sample.unclear_plate = False
-                                    sample.processed_at = datetime.utcnow()
-                                    sample.notes = f"OCR_PREFILL_RAW:{raw}\n{(sample.notes or '').strip()}".strip()
-                                    local_db.add(sample)
-                                    updated += 1
-                    except Exception:
-                        skipped += 1
+                                raw = str(ocr.get("raw_text") or text).strip()
+                                sample.plate_text = text
+                                sample.unclear_plate = False
+                                sample.processed_at = datetime.utcnow()
+                                sample.notes = f"OCR_PREFILL_RAW:{raw}\n{(sample.notes or '').strip()}".strip()
+                                local_db.add(sample)
+                                updated += 1
+                except Exception:
+                    skipped += 1
 
+                if scanned % 100 == 0:
+                    local_db.commit()
                 if scanned % 20 == 0 or scanned == total:
                     progress = int((scanned / total) * 100)
                     _update_upload_job(
                         job_id,
                         status="running",
                         progress=progress,
-                        message=f"Processed {scanned}/{total}",
+                        message=f"Processed {scanned}/{total} — updated {updated}",
                         step=f"Updated {updated}, skipped {skipped}",
                         result={"scanned": scanned, "updated": updated, "skipped": skipped, "total": total},
                     )
@@ -6373,6 +6380,19 @@ def api_v1_training_ocr_prefill(
 
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "job_id": job_id}
+
+
+@app.get("/api/v1/training/ocr/prefill/latest")
+def api_v1_training_ocr_prefill_latest(
+    user: str = Depends(_api_get_current_user),
+):
+    """Return the most recent OCR prefill job (survives frontend page refresh, not server restart)."""
+    del user
+    job_id = _get_latest_ocr_job_id()
+    if not job_id:
+        return {"ok": True, "job": None}
+    job = _get_upload_job(job_id)
+    return {"ok": True, "job": job}
 
 
 @app.get("/api/v1/training/ocr/prefill/{job_id}")
@@ -6814,6 +6834,16 @@ def api_v1_clips_active(
     items = []
     for row in active_rows:
         started_at = row.get("started_at")
+        duration_seconds = None
+        if isinstance(started_at, datetime):
+            duration_seconds = max(0.0, (datetime.utcnow() - started_at).total_seconds())
+        size_bytes = None
+        clip_path = _clip_abs_path(row.get("file_path"))
+        if clip_path and clip_path.exists():
+            try:
+                size_bytes = int(clip_path.stat().st_size)
+            except Exception:
+                size_bytes = None
         items.append(
             {
                 "camera_id": int(row["camera_id"]),
@@ -6821,6 +6851,8 @@ def api_v1_clips_active(
                 "file_path": row.get("file_path"),
                 "frames": int(row.get("frames") or 0),
                 "started_at": started_at.isoformat() if isinstance(started_at, datetime) else None,
+                "duration_seconds": duration_seconds,
+                "size_bytes": size_bytes,
             }
         )
     return {"items": items}

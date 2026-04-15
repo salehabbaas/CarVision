@@ -388,7 +388,7 @@ def _pick_best(results) -> Optional[Dict]:
 
     candidates = sorted(candidates, key=lambda c: c["score"], reverse=True)
     best = candidates[0]
-    if best["score"] < 20.0:
+    if best["score"] < 80.0:
         return None
     return {"best": best, "candidates": candidates[:8]}
 

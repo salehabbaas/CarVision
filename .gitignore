@@ -28,3 +28,4 @@ datasets/media/
 # Deploy tracking (machine-local, not committed)
 .build-version
 .last-deploy-commit
+note.md

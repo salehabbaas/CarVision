@@ -5,6 +5,7 @@ import { NavLink } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { useAuth } from '../context/AuthContext';
 import { request } from '../lib/api';
+import BrandLogo from './BrandLogo';
 
 const menu = [
   { to: '/', label: 'Dashboard', icon: Gauge },
@@ -121,7 +122,7 @@ export default function AppShell({ children }) {
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <aside className="sidebar glass" aria-label="Main navigation">
         <div className="brand">
-          <span className="brand-dot" />
+          <BrandLogo className="brand-logo" />
           <div className="brand-copy">
             <div className="brand-title">CarVision</div>
             <div className="brand-sub">by SpinelTech</div>

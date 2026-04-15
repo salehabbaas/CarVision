@@ -5,6 +5,12 @@ import { request, mediaPath } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
 import { LoadingState, ErrorState } from '../components/PageState';
 import { Link, useSearchParams } from 'react-router-dom';
+import Modal      from '../design-system/components/Modal';
+import FormField  from '../design-system/components/FormField';
+import Select     from '../design-system/components/Select';
+import Input      from '../design-system/components/Input';
+import Textarea   from '../design-system/components/Textarea';
+import Button     from '../design-system/components/Button';
 
 function badgeClass(status) {
   if (status === 'allowed') return 'ok';
@@ -511,216 +517,219 @@ export default function DetectionsPage() {
         </div>
       </div>
 
-      {bulkOpen && (
-        <div className="modal-backdrop" onClick={() => setBulkOpen(false)}>
-          <motion.form
-            className="modal glass"
-            onClick={(e) => e.stopPropagation()}
-            onSubmit={saveBulkFeedback}
-            initial={{ scale: 0.98, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-          >
-            <h3>Bulk Feedback</h3>
-            <p className="muted">
-              Apply to {targetIds.length} events ({selectedIds.length ? 'selected' : 'filtered'}).
-            </p>
-            <label title="Choose how selected detections should be labeled.">Mode</label>
-            <select title="Feedback mode applied to selected detections." value={bulkMode} onChange={(e) => setBulkMode(e.target.value)}>
-              <option value="correct">Correct</option>
-              <option value="corrected">Corrected</option>
-              <option value="no_plate">No Plate</option>
-            </select>
-            {bulkMode === 'corrected' && (
-              <>
-                <label title="Correct plate text when mode is set to corrected.">Expected plate</label>
-                <input
-                  value={bulkExpected}
-                  onChange={(e) => setBulkExpected(e.target.value)}
-                  placeholder="ABC123"
-                  title="Plate text to save as the corrected ground truth."
-                />
-              </>
-            )}
-            <label title="Optional comments explaining this bulk feedback action.">Notes</label>
-            <textarea
+      <Modal
+        open={bulkOpen}
+        onClose={() => setBulkOpen(false)}
+        title="Bulk Feedback"
+        subtitle={`Apply to ${targetIds.length} event(s) — ${selectedIds.length ? 'selected' : 'all filtered'}`}
+        footer={
+          <>
+            <Button variant="ghost" type="button" onClick={() => setBulkOpen(false)}>Cancel</Button>
+            <Button variant="primary" type="submit" form="bulk-feedback-form">Save Feedback</Button>
+          </>
+        }
+      >
+        <form
+          id="bulk-feedback-form"
+          onSubmit={saveBulkFeedback}
+          style={{ display: 'flex', flexDirection: 'column', gap: 14 }}
+        >
+          <FormField label="Mode" hint="How to label the selected detections">
+            <Select value={bulkMode} onChange={(e) => setBulkMode(e.target.value)}>
+              <option value="correct">Correct — OCR was right</option>
+              <option value="corrected">Corrected — provide the real plate</option>
+              <option value="no_plate">No Plate — false positive</option>
+            </Select>
+          </FormField>
+
+          {bulkMode === 'corrected' && (
+            <FormField label="Expected plate" hint="The correct plate text (ground truth)">
+              <Input
+                value={bulkExpected}
+                onChange={(e) => setBulkExpected(e.target.value)}
+                placeholder="e.g. ABC1234"
+              />
+            </FormField>
+          )}
+
+          <FormField label="Notes" hint="Optional comment for audit trail">
+            <Textarea
               value={bulkNotes}
               onChange={(e) => setBulkNotes(e.target.value)}
-              placeholder="Optional annotation note"
-              title="Stored with feedback for later review and training traceability."
+              placeholder="Why was this corrected?"
+              rows={3}
             />
-            <div className="row end">
-              <button type="button" className="btn ghost" onClick={() => setBulkOpen(false)}>
-                Cancel
-              </button>
-              <button className="btn primary" type="submit">Save</button>
-            </div>
-          </motion.form>
-        </div>
-      )}
+          </FormField>
+        </form>
+      </Modal>
 
-      {feedbackOpen && feedbackRow && (
-        <div className="modal-backdrop" onClick={() => setFeedbackOpen(false)}>
-          <motion.form
-            className="modal glass feedback-modal"
-            onClick={(e) => e.stopPropagation()}
+      <Modal
+        open={feedbackOpen && !!feedbackRow}
+        onClose={() => setFeedbackOpen(false)}
+        size="xl"
+        title={`Detection #${feedbackRow?.id} — Feedback`}
+        subtitle={feedbackRow ? `${feedbackRow.plate_text || '—'}  ·  ${feedbackRow.camera_name || '—'}` : ''}
+        footer={
+          <>
+            <div style={{ flex: 1, display: 'flex', gap: 6 }}>
+              {createdSampleId && (
+                <Link className="btn" to={`/training-data?sample_id=${createdSampleId}`}>
+                  Open Sample #{createdSampleId}
+                </Link>
+              )}
+              {feedbackRow?.feedback_sample_id && !createdSampleId && (
+                <Link className="btn ghost" to={`/training-data?sample_id=${feedbackRow.feedback_sample_id}`}>
+                  Existing Sample
+                </Link>
+              )}
+            </div>
+            <Button
+              variant="ghost"
+              type="button"
+              icon={<ChevronLeft size={14} />}
+              onClick={() => navigateFeedback(-1)}
+              disabled={!feedbackHasPrev}
+            >
+              Prev
+            </Button>
+            <Button
+              variant="ghost"
+              type="button"
+              onClick={() => navigateFeedback(1)}
+              disabled={!feedbackHasNext}
+            >
+              Next <ChevronRight size={14} />
+            </Button>
+            <Button variant="ghost" type="button" onClick={() => setFeedbackOpen(false)}>Close</Button>
+            <Button variant="primary" type="submit" form="feedback-form">Save Feedback</Button>
+          </>
+        }
+      >
+        {feedbackRow && (
+          <form
+            id="feedback-form"
             onSubmit={saveFeedback}
-            initial={{ scale: 0.98, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
+            style={{ display: 'flex', flexDirection: 'column', gap: 18 }}
           >
-            <div className="panel-head">
-              <h3>Detection #{feedbackRow.id} Feedback</h3>
-              <div className="row">
-                <span className="tiny muted">
-                  {feedbackRowIndex >= 0 ? `${feedbackRowIndex + 1} / ${items.length}` : '-'}
-                </span>
-                <span className={`tag ${feedbackClass(feedbackRow)}`}>{feedbackLabel(feedbackRow)}</span>
-              </div>
-            </div>
-            <div className="row between">
-              <div className="tiny muted">Use arrow keys or buttons to move quickly.</div>
-              <div className="row">
-                <button
-                  type="button"
-                  className="btn ghost"
-                  onClick={() => navigateFeedback(-1)}
-                  disabled={!feedbackHasPrev}
-                >
-                  <ChevronLeft size={14} /> Previous
-                </button>
-                <button
-                  type="button"
-                  className="btn ghost"
-                  onClick={() => navigateFeedback(1)}
-                  disabled={!feedbackHasNext}
-                >
-                  Next <ChevronRight size={14} />
-                </button>
-              </div>
-            </div>
-            <div className="row two">
+            {/* Snapshot + meta */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
               <div>
                 {feedbackRow.image_path ? (
                   <button type="button" className="unstyled-btn" onClick={() => openDebugPreview(feedbackRow, 0)}>
                     <img className="preview-image" src={mediaPath(feedbackRow.image_path)} alt={`det-${feedbackRow.id}`} />
                   </button>
                 ) : (
-                  <div className="muted">No snapshot</div>
+                  <div className="muted" style={{ fontSize: '0.875rem' }}>No snapshot</div>
                 )}
               </div>
-              <div className="stack">
-                <div className="tiny muted">Plate: {feedbackRow.plate_text || '-'}</div>
-                <div className="tiny muted">Camera: {feedbackRow.camera_name || '-'}</div>
-                <div className="tiny muted">Last feedback: {feedbackRow.feedback_status || 'none'}</div>
-                <label title="Choose whether the current detection was correct, corrected, or no-plate.">Mode</label>
-                <select title="Feedback mode for this detection event." value={feedbackMode} onChange={(e) => setFeedbackMode(e.target.value)}>
-                  <option value="correct">Correct</option>
-                  <option value="corrected">Corrected</option>
-                  <option value="no_plate">No Plate</option>
-                </select>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <span className="tiny muted">Detected plate</span>
+                  <strong style={{ fontFamily: 'var(--font-mono, monospace)', fontSize: '1.1rem' }}>
+                    {feedbackRow.plate_text || '—'}
+                  </strong>
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <span className={`tag ${feedbackClass(feedbackRow)}`}>{feedbackLabel(feedbackRow)}</span>
+                  <span className="tiny muted" style={{ alignSelf: 'center' }}>
+                    {feedbackRowIndex >= 0 ? `${feedbackRowIndex + 1} / ${items.length}` : ''}
+                  </span>
+                </div>
+
+                <FormField label="Mode">
+                  <Select value={feedbackMode} onChange={(e) => setFeedbackMode(e.target.value)}>
+                    <option value="correct">Correct — OCR was right</option>
+                    <option value="corrected">Corrected — provide real plate</option>
+                    <option value="no_plate">No Plate — false positive</option>
+                  </Select>
+                </FormField>
+
                 {feedbackMode === 'corrected' && (
-                  <>
-                    <label title="Enter the true plate text if OCR result is wrong.">Expected plate</label>
-                    <input
+                  <FormField label="Expected plate" hint="The correct ground-truth plate">
+                    <Input
                       value={feedbackExpected}
                       onChange={(e) => setFeedbackExpected(e.target.value)}
-                      placeholder="ABC123"
-                      title="Correct plate value saved to the training sample."
+                      placeholder="e.g. ABC1234"
                     />
-                  </>
+                  </FormField>
                 )}
-                <label title="Optional operator note for audit and model-improvement context.">Notes</label>
-                <textarea
-                  value={feedbackNotes}
-                  onChange={(e) => setFeedbackNotes(e.target.value)}
-                  placeholder="Correction note"
-                  title="Free-form note attached to this feedback action."
-                />
-                <div className="row">
-                  {createdSampleId ? (
-                    <Link className="btn" to={`/training-data?sample_id=${createdSampleId}`}>
-                      Open Training Sample #{createdSampleId}
-                    </Link>
-                  ) : null}
-                  {feedbackRow.feedback_sample_id ? (
-                    <Link className="btn ghost" to={`/training-data?sample_id=${feedbackRow.feedback_sample_id}`}>
-                      Open Existing Sample
-                    </Link>
-                  ) : null}
+
+                <FormField label="Notes">
+                  <Textarea
+                    value={feedbackNotes}
+                    onChange={(e) => setFeedbackNotes(e.target.value)}
+                    placeholder="Optional correction note"
+                    rows={3}
+                  />
+                </FormField>
+              </div>
+            </div>
+
+            {/* Debug grid */}
+            {feedbackDebugGrid?.length > 0 && (
+              <div>
+                <div className="tiny muted" style={{ marginBottom: 8 }}>Debug steps</div>
+                <div className="feedback-debug-grid">
+                  {feedbackDebugGrid.map((entry) => {
+                    const idx = feedbackDebugSteps.findIndex((s) => s.key === entry.key);
+                    return (
+                      <button
+                        type="button"
+                        key={`modal-${feedbackRow.id}-${entry.key}`}
+                        className={`feedback-debug-card ${entry.step?.path ? '' : 'is-missing'}`}
+                        onClick={() => { if (idx >= 0) openDebugPreview(feedbackRow, idx); }}
+                        disabled={idx < 0}
+                      >
+                        <div className="tiny">{entry.label}</div>
+                        {entry.step?.path ? (
+                          <img src={mediaPath(entry.step.path)} alt={`${entry.label}-${feedbackRow.id}`} />
+                        ) : (
+                          <div className="tiny muted">Not available</div>
+                        )}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
-            </div>
-            <div>
-              <div className="tiny muted">Debug steps (all together)</div>
-              <div className="feedback-debug-grid">
-                {feedbackDebugGrid.map((entry) => {
-                  const idx = feedbackDebugSteps.findIndex((s) => s.key === entry.key);
-                  return (
-                    <button
-                      type="button"
-                      key={`modal-${feedbackRow.id}-${entry.key}`}
-                      className={`feedback-debug-card ${entry.step?.path ? '' : 'is-missing'}`}
-                      onClick={() => {
-                        if (idx >= 0) openDebugPreview(feedbackRow, idx);
-                      }}
-                      disabled={idx < 0}
-                    >
-                      <div className="tiny">{entry.label}</div>
-                      {entry.step?.path ? (
-                        <img src={mediaPath(entry.step.path)} alt={`${entry.label}-${feedbackRow.id}`} />
-                      ) : (
-                        <div className="tiny muted">Not available</div>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-            <div className="row end">
-              <button type="button" className="btn ghost" onClick={() => setFeedbackOpen(false)}>
-                Close
-              </button>
-              <button className="btn primary" type="submit">Save Feedback</button>
-            </div>
-          </motion.form>
-        </div>
-      )}
+            )}
+          </form>
+        )}
+      </Modal>
 
-      {debugPreview.open && debugPreview.steps.length > 0 && (
-        <div className="modal-backdrop" onClick={() => setDebugPreview((d) => ({ ...d, open: false }))}>
-          <motion.div
-            className="modal glass feedback-modal"
-            onClick={(e) => e.stopPropagation()}
-            initial={{ scale: 0.98, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-          >
-            <div className="panel-head">
-              <h3>{debugPreview.title} Debug Viewer</h3>
-              <span className="tag ok">{debugPreview.steps[debugPreview.index]?.label || 'Step'}</span>
-            </div>
-            <img
-              className="preview-image"
-              src={mediaPath(debugPreview.steps[debugPreview.index]?.path)}
-              alt="debug-step"
-            />
-            <div className="row">
+      <Modal
+        open={debugPreview.open && debugPreview.steps.length > 0}
+        onClose={() => setDebugPreview((d) => ({ ...d, open: false }))}
+        size="lg"
+        title={`${debugPreview.title} — Debug Viewer`}
+        subtitle={debugPreview.steps[debugPreview.index]?.label || ''}
+        footer={
+          <>
+            <div style={{ display: 'flex', gap: 6, flex: 1, flexWrap: 'wrap' }}>
               {debugPreview.steps.map((step, idx) => (
-                <button
+                <Button
                   key={`dbg-${step.key}-${idx}`}
-                  className={`btn ${idx === debugPreview.index ? 'primary' : ''}`}
+                  variant={idx === debugPreview.index ? 'primary' : 'ghost'}
+                  size="sm"
                   onClick={() => setDebugPreview((d) => ({ ...d, index: idx }))}
                 >
                   {step.label}
-                </button>
+                </Button>
               ))}
             </div>
-            <div className="row end">
-              <button className="btn ghost" onClick={() => setDebugPreview((d) => ({ ...d, open: false }))}>
-                Close
-              </button>
-            </div>
-          </motion.div>
-        </div>
-      )}
+            <Button variant="ghost" onClick={() => setDebugPreview((d) => ({ ...d, open: false }))}>
+              Close
+            </Button>
+          </>
+        }
+      >
+        <img
+          className="preview-image"
+          src={mediaPath(debugPreview.steps[debugPreview.index]?.path)}
+          alt="debug-step"
+          style={{ width: '100%', borderRadius: 8 }}
+        />
+      </Modal>
     </div>
   );
 }

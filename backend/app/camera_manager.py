@@ -4,7 +4,7 @@ import threading
 import time
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 from collections import Counter, deque
@@ -18,7 +18,7 @@ from anpr import set_anpr_config
 from pipeline import PlateInferencePipeline
 from anpr import build_debug_bundle, crop_from_bbox, read_plate_text
 from db import SessionLocal
-from models import Camera, AllowedPlate, Detection, AppSetting, Notification, TrainingSample, ClipRecord
+from models import Camera, AllowedPlate, Detection, AppSetting, Notification, TrainingSample
 
 # Thread pool for background I/O tasks (snapshot saving, DB writes, clip recording).
 # These are offloaded so the detection loop can push the overlay immediately.
@@ -306,32 +306,15 @@ class CameraWorker:
     @staticmethod
     def _normalize_live_mode(mode: Optional[str]) -> str:
         normalized = str(mode or "auto").strip().lower()
-        if normalized not in {"auto", "contour", "yolo", "ocr"}:
+        if normalized not in {"auto", "contour", "yolo"}:
             return "auto"
         return normalized
-
-    @staticmethod
-    def _detect_with_ocr_only(frame) -> Optional[Dict]:
-        ocr = read_plate_text(frame)
-        if not ocr or not ocr.get("plate_text"):
-            return None
-        return {
-            "plate_text": ocr.get("plate_text"),
-            "confidence": ocr.get("confidence"),
-            "bbox": ocr.get("bbox"),
-            "raw_text": ocr.get("raw_text"),
-            "candidates": ocr.get("candidates"),
-            "detector": "ocr",
-        }
 
     def _resolve_live_detection(self, frame) -> Tuple[Optional[Dict], str]:
         mode_override = self._mode_provider()
         if self.camera.detector_mode and self.camera.detector_mode != "inherit":
             mode_override = self.camera.detector_mode
         resolved_mode = self._normalize_live_mode(mode_override)
-
-        if resolved_mode == "ocr":
-            return self._detect_with_ocr_only(frame), resolved_mode
 
         detection = None
         if self._pipeline and self._pipeline.enabled:
@@ -346,11 +329,6 @@ class CameraWorker:
                 detection = detect_plate(frame, mode_override=resolved_mode)
             except Exception:
                 logger.exception("Camera %s detector failed for mode %s", self.camera.id, resolved_mode)
-
-        if not detection:
-            ocr_detection = self._detect_with_ocr_only(frame)
-            if ocr_detection:
-                return ocr_detection, "ocr"
 
         return detection, resolved_mode
 
@@ -640,40 +618,10 @@ class CameraWorker:
                         plate_text,
                     )
 
-                    # Clip
+                    # Detection-triggered clip writes are intentionally disabled.
+                    # Clip recording is handled through explicit manual start/stop
+                    # from the Live page to avoid multiple files per incident.
                     video_path = None
-                    if stream_manager:
-                        if camera.save_clip and camera.clip_seconds > 0:
-                            ts_str   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                            filename = f"{camera.id}_{plate_text}_{ts_str}.mp4"
-                            path     = media_dir / filename
-                            fps      = 10.0
-                            frames_to_write = int(camera.clip_seconds * fps)
-                            first = (
-                                stream_manager.get_external_frame(camera.id)
-                                if camera.type == "browser"
-                                else stream_manager.get_frame(camera.id, camera.type, camera.source)
-                            )
-                            if first is not None:
-                                h, w = first.shape[:2]
-                                writer = cv2.VideoWriter(
-                                    str(path),
-                                    cv2.VideoWriter_fourcc(*"mp4v"),
-                                    fps, (w, h),
-                                )
-                                written = 0
-                                while written < frames_to_write:
-                                    f2 = (
-                                        stream_manager.get_external_frame(camera.id)
-                                        if camera.type == "browser"
-                                        else stream_manager.get_frame(camera.id, camera.type, camera.source)
-                                    )
-                                    if f2 is not None:
-                                        writer.write(f2)
-                                        written += 1
-                                    time.sleep(1 / fps)
-                                writer.release()
-                                video_path = filename if written > 0 else None
 
                     # Image hash
                     image_hash = None
@@ -707,25 +655,6 @@ class CameraWorker:
                         )
                         db.add(det_row)
                         db.flush()
-                        if video_path:
-                            clip_abs = media_dir / video_path
-                            try:
-                                clip_size = int(clip_abs.stat().st_size)
-                            except Exception:
-                                clip_size = 0
-                            clip_dur = float(max(0, int(camera.clip_seconds or 0)))
-                            clip_ended  = datetime.utcnow()
-                            clip_started = clip_ended - timedelta(seconds=clip_dur)
-                            db.add(ClipRecord(
-                                camera_id=camera.id,
-                                kind="detection",
-                                file_path=video_path,
-                                started_at=clip_started,
-                                ended_at=clip_ended,
-                                duration_seconds=clip_dur,
-                                size_bytes=clip_size,
-                                detection_count=1,
-                            ))
                         if status == "denied":
                             db.add(Notification(
                                 title=f"Denied plate {plate_text}",
@@ -856,6 +785,8 @@ class CameraManager:
             yolo_iou = db.get(AppSetting, "yolo_iou")
             yolo_max_det = db.get(AppSetting, "yolo_max_det")
             inference_device = db.get(AppSetting, "inference_device")
+            _default_model = Path(__file__).resolve().parents[3] / "models" / "plate.pt"
+            _model_path = str(_default_model) if _default_model.exists() else ""
             set_yolo_config(
                 {
                     "conf": float(yolo_conf.value) if yolo_conf and yolo_conf.value else 0.25,
@@ -863,6 +794,7 @@ class CameraManager:
                     "iou": float(yolo_iou.value) if yolo_iou and yolo_iou.value else 0.45,
                     "max_det": int(yolo_max_det.value) if yolo_max_det and yolo_max_det.value else 5,
                     "device": inference_device.value if inference_device and inference_device.value else "cpu",
+                    "model_path": _model_path,
                 }
             )
 

@@ -18,6 +18,7 @@ import os
 import threading
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+from pathlib import Path
 from typing import Optional, Dict
 
 import numpy as np
@@ -31,13 +32,23 @@ except Exception:
 
 logger = logging.getLogger("anpr.detector")
 
+def _default_model_path() -> str:
+    """Return path to plate.pt: env var override first, then project models/ dir."""
+    env = os.getenv("YOLO_PLATE_MODEL", "").strip()
+    if env:
+        return env
+    candidate = Path(__file__).resolve().parents[3] / "models" / "plate.pt"
+    return str(candidate) if candidate.exists() else ""
+
+
 # ── YOLO runtime config (updated from DB by camera_manager.sync) ──────────────
 _YOLO_CONFIG = {
-    "conf":    0.25,
-    "imgsz":   int(os.getenv("YOLO_IMGSZ", "320")),  # 320 for real-time
-    "iou":     0.45,
-    "max_det": 5,
-    "device":  os.getenv("ANPR_INFERENCE_DEVICE", "cpu"),
+    "conf":       0.25,
+    "imgsz":      int(os.getenv("YOLO_IMGSZ", "320")),  # 320 for real-time
+    "iou":        0.45,
+    "max_det":    5,
+    "device":     os.getenv("ANPR_INFERENCE_DEVICE", "cpu"),
+    "model_path": _default_model_path(),
 }
 
 # Thread pool used for parallel YOLO+contour detection in "auto" mode.
@@ -49,15 +60,17 @@ def set_yolo_config(config: Dict):
     if not isinstance(config, dict):
         return
     previous_device = str(_YOLO_CONFIG.get("device", "cpu") or "cpu").strip().lower()
+    previous_path = str(_YOLO_CONFIG.get("model_path", "") or "")
     for key in _YOLO_CONFIG.keys():
         if key in config and config[key] is not None:
             _YOLO_CONFIG[key] = config[key]
     current_device = str(_YOLO_CONFIG.get("device", "cpu") or "cpu").strip().lower()
-    if current_device != previous_device:
+    current_path = str(_YOLO_CONFIG.get("model_path", "") or "")
+    if current_device != previous_device or current_path != previous_path:
         try:
             reload_yolo_model()
         except Exception:
-            logger.debug("yolo reload skipped after device change", exc_info=True)
+            logger.debug("yolo reload skipped after config change", exc_info=True)
 
 
 def _torch_device() -> str:
@@ -86,7 +99,6 @@ class PlateDetector:
     def __init__(self):
         self._model      = None
         self._model_lock = threading.Lock()
-        self._model_path = os.getenv("YOLO_PLATE_MODEL", "")
         self._mode       = os.getenv("ANPR_DETECTOR", "auto").lower()
 
     # ── model management ──────────────────────────────────────────────────────
@@ -98,9 +110,10 @@ class PlateDetector:
                 return self._model
             if YOLO is None:
                 return None
-            if not self._model_path or not os.path.exists(self._model_path):
+            model_path = str(_YOLO_CONFIG.get("model_path", "") or "")
+            if not model_path or not os.path.exists(model_path):
                 return None
-            self._model = YOLO(self._model_path)
+            self._model = YOLO(model_path)
         return self._model
 
     def reload_model(self):
@@ -192,21 +205,6 @@ class PlateDetector:
             result["detector"] = "contour"
         return result
 
-    # ── ocr-only wrapper ──────────────────────────────────────────────────────
-    @staticmethod
-    def _detect_with_ocr(frame) -> Optional[Dict]:
-        result = read_plate_text(frame)
-        if not result or not result.get("plate_text"):
-            return None
-        return {
-            "plate_text": result.get("plate_text"),
-            "confidence": result.get("confidence"),
-            "bbox": result.get("bbox"),
-            "raw_text": result.get("raw_text"),
-            "candidates": result.get("candidates"),
-            "detector": "ocr",
-        }
-
     # ── scoring helper ────────────────────────────────────────────────────────
     @staticmethod
     def _score(det: Dict) -> float:
@@ -229,10 +227,6 @@ class PlateDetector:
         # ── yolo-only ──
         if mode == "yolo":
             return self._detect_with_yolo(frame)
-
-        # ── ocr-only ──
-        if mode == "ocr":
-            return self._detect_with_ocr(frame)
 
         # ── auto: run YOLO and contour concurrently ───────────────────────────
         # Submit both detectors to the shared thread pool.

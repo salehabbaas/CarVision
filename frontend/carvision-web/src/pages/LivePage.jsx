@@ -327,7 +327,9 @@ export default function LivePage() {
   const [events,            setEvents]    = useState([]);
   const [recordingByCamera, setRecording] = useState({});
   const [clipBusy,          setClipBusy]  = useState({});
+  const [stopAllBusy,       setStopAllBusy] = useState(false);
   const [streamRetry,       setStreamRetry] = useState({});
+  const [tickNowMs,         setTickNowMs] = useState(() => Date.now());
 
   // UI state
   const [fullscreenCam, setFullscreenCam] = useState(null);
@@ -375,6 +377,11 @@ export default function LivePage() {
     load();
     return () => { alive = false; clearTimeout(timer); };
   }, [token]);
+
+  useEffect(() => {
+    const t = setInterval(() => setTickNowMs(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
 
   useEffect(() => {
     let timer; let alive = true;
@@ -527,6 +534,44 @@ export default function LivePage() {
     finally { setClipBusy(p => ({ ...p, [camId]: false })); }
   }
 
+  async function stopAllClips() {
+    const activeIds = Object.keys(recordingByCamera).map((v) => Number(v)).filter(Number.isFinite);
+    if (!activeIds.length || stopAllBusy) return;
+    setStopAllBusy(true);
+    const busyMap = {};
+    activeIds.forEach((id) => { busyMap[id] = true; });
+    setClipBusy((p) => ({ ...p, ...busyMap }));
+    let saved = 0;
+    let failed = 0;
+    try {
+      await Promise.all(activeIds.map(async (camId) => {
+        try {
+          await request('/api/v1/clips/stop', { token, method: 'POST', body: { camera_id: camId } });
+          saved += 1;
+        } catch {
+          failed += 1;
+        }
+      }));
+      setRecording((p) => {
+        const next = { ...p };
+        activeIds.forEach((id) => { delete next[id]; });
+        return next;
+      });
+      if (saved > 0) {
+        setNotice(`Saved ${saved} clip${saved === 1 ? '' : 's'}${failed ? `, failed ${failed}` : ''}`);
+      } else if (failed > 0) {
+        setError(`Failed to stop active recordings (${failed})`);
+      }
+    } finally {
+      setStopAllBusy(false);
+      setClipBusy((p) => {
+        const next = { ...p };
+        activeIds.forEach((id) => { delete next[id]; });
+        return next;
+      });
+    }
+  }
+
   // ── Snapshot with overlay compositing ────────────────────────────────────────
   function handleSnapshot(imgEl, canvasEl, name) {
     compositeSnapshot(
@@ -578,6 +623,15 @@ export default function LivePage() {
   function fmtAge(age) {
     if (typeof age !== 'number') return null;
     return age < 60 ? `${Math.round(age)}s ago` : `${Math.round(age / 60)}m ago`;
+  }
+
+  function fmtDuration(sec) {
+    const total = Math.max(0, Math.floor(Number(sec) || 0));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   }
 
   // ── Grid geometry ─────────────────────────────────────────────────────────────
@@ -646,6 +700,20 @@ export default function LivePage() {
 
         {/* Right */}
         <div style={{ display: 'flex', gap: 6 }}>
+          {recCount > 0 && (
+            <button
+              type="button"
+              className="btn ghost"
+              style={{ height: 28, padding: '0 10px', fontSize: 11 }}
+              onClick={() => stopAllClips()}
+              disabled={stopAllBusy}
+            >
+              <Square size={11} /> {stopAllBusy ? 'Stopping…' : 'Stop all'}
+            </button>
+          )}
+          <a href="/clips" className="btn ghost" style={{ height: 28, padding: '0 10px', fontSize: 11 }}>
+            Clips <ChevronRight size={11} />
+          </a>
           <a href="/detections" className="btn ghost" style={{ height: 28, padding: '0 10px', fontSize: 11 }}>
             Detections <ChevronRight size={11} />
           </a>
@@ -671,6 +739,11 @@ export default function LivePage() {
             const tilePal   = pal(status);
             const lastEv    = camLatestEvent[cam.id];
             const isRec     = !!recordingByCamera[cam.id];
+            const recInfo   = recordingByCamera[cam.id] || null;
+            const startedMs = recInfo?.started_at ? Date.parse(recInfo.started_at) : NaN;
+            const elapsedS  = Number.isFinite(startedMs) ? Math.max(0, Math.floor((tickNowMs - startedMs) / 1000)) : null;
+            const recFrames = Number(recInfo?.frames || 0);
+            const recSizeMb = recInfo?.size_bytes != null ? (Number(recInfo.size_bytes) / (1024 * 1024)) : null;
             const src       = streamUrls[cam.id] || '';
             const isPinned  = pinnedId === cam.id;
             const isDragging = draggingId === cam.id;
@@ -729,14 +802,19 @@ export default function LivePage() {
                           {cam.location}
                         </div>
                       )}
+                      {isRec && (
+                        <div style={{ fontSize: 9, color: '#ff9aab', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          REC {elapsedS != null ? fmtDuration(elapsedS) : '--:--'} · {recFrames}f{recSizeMb != null ? ` · ${recSizeMb.toFixed(1)}MB` : ''}
+                        </div>
+                      )}
                     </div>
                   </div>
 
                   {/* Controls */}
                   <div style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
                     {cam.save_clip && (isRec
-                      ? <TileBtn title="Stop recording" danger disabled={!!clipBusy[cam.id]} onClick={() => stopClip(cam.id)}><Square size={10} /></TileBtn>
-                      : <TileBtn title="Start recording" disabled={!!clipBusy[cam.id]} onClick={() => startClip(cam.id)}><Circle size={10} /></TileBtn>
+                      ? <TileBtn title="Stop recording and save clip" danger disabled={!!clipBusy[cam.id] || stopAllBusy} onClick={() => stopClip(cam.id)}><Square size={10} /></TileBtn>
+                      : <TileBtn title="Start recording clip" disabled={!!clipBusy[cam.id] || stopAllBusy} onClick={() => startClip(cam.id)}><Circle size={10} /></TileBtn>
                     )}
                     <TileBtn title="Save snapshot (with overlay)" onClick={() => {
                       compositeSnapshot(imageRefs.current.get(cam.id), canvasRefs.current.get(cam.id), cam.name);
@@ -808,6 +886,32 @@ export default function LivePage() {
                   </div>
                 ) : (
                   <div style={{ height: 4, flexShrink: 0 }} />
+                )}
+                {isRec && (
+                  <div style={{
+                    padding: '3px 8px',
+                    flexShrink: 0,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    background: 'rgba(255,94,126,0.08)',
+                    borderTop: '1px solid rgba(255,94,126,0.28)',
+                  }}>
+                    <span style={{ fontSize: 9, fontWeight: 800, color: '#ff5e7e', letterSpacing: '0.4px', textTransform: 'uppercase' }}>
+                      Recording
+                    </span>
+                    <span style={{ fontSize: 10, fontFamily: 'monospace', color: '#ffc2cf' }}>
+                      {elapsedS != null ? fmtDuration(elapsedS) : '--:--'}
+                    </span>
+                    <span style={{ fontSize: 9, color: 'var(--muted)' }}>
+                      {recFrames} frames
+                    </span>
+                    {recInfo?.file_path && (
+                      <span style={{ fontSize: 9, color: 'var(--muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {recInfo.file_path}
+                      </span>
+                    )}
+                  </div>
                 )}
               </div>
             );
