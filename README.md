@@ -1,84 +1,80 @@
-# CarVision by SpinelTech
+# CarVision
 
-This project turns the notebook into a live CarVision platform with multi-camera support, a web admin panel, and a local database in Docker.
+CarVision is a license-plate monitoring platform with a FastAPI backend, React admin panel, multi-camera ingestion (RTSP, ONVIF, browser, webcam, MJPEG), and local media storage.
 
-## Project structure
+## Stack
+
+- Backend: FastAPI + SQLAlchemy + OpenCV
+- Frontend: React (Vite)
+- Database: PostgreSQL (Docker) or SQLite (local)
+- AI: YOLO-based plate detection (optional custom model)
+
+## Features
+
+- Multi-camera management (webcam, RTSP, HTTP MJPEG, browser stream)
+- ONVIF discovery and RTSP profile resolution
+- Live view, detections, snapshots, clips, uploads
+- Allowed-plates workflow
+- JWT-based API auth for the modern frontend
+
+## Repository Layout
 
 ```text
-backend/
-  app/
-    core/         # settings/config
-    api/          # request schemas
-    services/     # dataset + state helpers
-    main.py       # FastAPI routes (being split incrementally)
-frontend/
-  carvision-web/ # React frontend (Vite)
-datasets/
-  media/          # snapshots, uploads, training sets, exports
-old/
-  python_frontend/ # legacy Jinja templates/static
-models/
-  plate.pt
+backend/                 FastAPI app
+frontend/carvision-web/  React admin UI
+datasets/media/          Runtime media output
+models/                  Detection models
+old/python_frontend/     Legacy UI templates
 ```
 
-## Quick start (Docker)
+## Security Before Publishing Public
+
+This project includes values/files that should be treated as sensitive before public release:
+
+- Local env file `.env.carvision` (can contain real credentials; keep it untracked)
+- Weak/default credentials in config examples (`admin/admin`, placeholder JWT)
+- Camera credentials may be stored in database records at runtime
+
+Before making the repo public:
+
+1. Remove tracked secrets/config snapshots from git history if they were used with real credentials.
+2. Keep only `.env.carvision.example` in git; do not commit real `.env*` files.
+3. Rotate all credentials that may have been exposed:
+   - Admin username/password
+   - `JWT_SECRET`
+   - Database password
+   - Any RTSP/ONVIF camera credentials
+4. Review deployment files for hardcoded internal IPs, VPN ranges, or hostnames you do not want public.
+5. Run a secret scan (for example `gitleaks`) before publishing.
+
+## Quick Start (Docker)
+
+1. Copy example env:
 
 ```bash
-docker compose up --build
+cp .env.carvision.example .env.carvision
 ```
 
-Open `http://localhost:8000/admin`.
+2. Edit `.env.carvision` and set strong values at minimum:
 
-Note: Postgres is exposed on host port `5433` to avoid conflicts with local port `5432`.
+- `API_ADMIN_USER`
+- `API_ADMIN_PASS`
+- `JWT_SECRET`
+- `POSTGRES_PASSWORD`
+- `VITE_API_URL` (if accessing from another machine)
 
-## Access From Other Devices
+3. Build and run:
 
-1. Find your computer's LAN IP address.
-2. Open `http://<LAN-IP>:8000/login` on the other device.
+```bash
+docker compose -f docker-compose.carvision.yml --env-file .env.carvision up -d --build
+```
 
-Examples:
-- macOS: `ipconfig getifaddr en0`
-- Linux: `hostname -I`
-- Windows: `ipconfig` (look for IPv4 Address)
+4. Open:
 
-Make sure your firewall allows inbound connections to port `8000` and both devices are on the same network.
+- Frontend: `http://localhost:8081`
+- Backend/API: `http://localhost:8000`
 
-## Browser Camera (Phone/Laptop)
-
-Create a camera with type `browser`. The Cameras page shows a connect URL like:
-`http://<LAN-IP>:8000/capture/<camera-id>?token=...`
-
-You can also open `http://<LAN-IP>:8000/capture` (admin login required) to see offline browser cameras and pick one to connect.
-
-Note: Webcam/HTTP MJPEG cameras do not appear in the browser capture list unless you switch them to `browser` type. Use `browser` when you want to stream from the device itself (phone/laptop).
-
-## Camera configuration
-
-Add cameras in **Cameras**:
-
-- **Laptop webcam**: type `webcam`, source `0`
-- **Mobile (IP webcam app)**: type `http_mjpeg`, source like `http://<phone-ip>:8080/video`
-- **Browser camera (phone/laptop)**: type `browser`, then open `/capture/<camera-id>` from the device
-- **Dahua / NVR / DVR**: type `rtsp`, source like
-  `rtsp://user:pass@<ip>:554/cam/realmonitor?channel=1&subtype=0`
-
-Settings are applied live. The service polls for changes every 5 seconds.
-
-## Admin panel
-
-- **Allowed Plates**: manage the allow list
-- **Dashboard**: shows logs from all cameras with green (allowed) and red (denied) rows
-- **Live View**: grid view for up to 16 live cameras with zoom controls and a live detection list
-- **PTZ controls**: ONVIF cameras with XAddr + credentials show pan/tilt/zoom controls
-- **Snapshots/Clips**: enable per camera in settings
-- **ONVIF Discovery**: scan local network and resolve RTSP per device
-- **Settings**: toggle detector mode (auto/yolo) and max live cameras
-- **Upload**: run detection on uploaded images or videos
-- **Browser Camera**: open `/capture/<camera-id>` on a phone or laptop to stream into Live View
-
-Note: ONVIF discovery uses UDP multicast. If you run in Docker, use `--network host` (Linux) or run locally for best results.
-
-## Local (without Docker)
+## Local Development (No Docker)
 
 ```bash
 python3 -m venv .venv
@@ -88,18 +84,31 @@ cd backend/app
 uvicorn main:app --reload
 ```
 
-Set `DATABASE_URL` and `MEDIA_DIR` if needed.
+If needed, set `DATABASE_URL`, `MEDIA_DIR`, and auth env vars before starting.
 
-## Login
+## Camera Types
 
-Default credentials are `admin` / `admin`. Set `ADMIN_USER`, `ADMIN_PASS`, and `SESSION_SECRET` in the environment for production.
+- `webcam`: local index (example: `0`)
+- `rtsp`: full RTSP URL
+- `http_mjpeg`: MJPEG endpoint URL
+- `browser`: web capture from phone/laptop via `/capture/<camera-id>`
 
-## ONVIF PTZ
+## ONVIF Notes
 
-To enable PTZ controls on Live View, set `ONVIF XAddr`, `ONVIF Username`, and `ONVIF Password` on the camera.
+- ONVIF discovery relies on local network multicast and may be limited in containerized/network-restricted environments.
+- PTZ controls require camera `xaddr`, username, and password.
 
-## YOLO plate detector (optional, higher accuracy)
+## Production Checklist
 
-1. Place a YOLO plate detection model at `models/plate.pt` (or set `YOLO_PLATE_MODEL`).
-2. Use **Settings** in the admin panel to switch detector mode (auto/yolo).
-3. Ensure `ultralytics` and its dependencies (including `torch`) are installed.
+- Set non-default credentials and long random JWT secret
+- Restrict CORS (`API_CORS_ORIGINS`) to known origins
+- Use HTTPS behind a reverse proxy
+- Do not expose database ports publicly
+- Back up `datasets/media` and database volumes
+- Add monitoring/log retention for incident review
+
+## Additional Docs
+
+- Setup details: `SETUP.md`
+- Architecture review: `ARCHITECTURE_REVIEW.md`
+- Backend notes: `backend/README.md`

@@ -15,6 +15,7 @@ __pycache__/
 # Frontend
 frontend/carvision-web/node_modules/
 frontend/carvision-web/dist/
+frontend/carvision-web/vite.config.js.timestamp-*.mjs
 
 # Runtime data
 datasets/media/
