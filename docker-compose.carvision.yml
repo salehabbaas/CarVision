@@ -42,7 +42,6 @@ services:
       DATABASE_URL:          postgresql+psycopg2://${POSTGRES_USER:-carvision}:${POSTGRES_PASSWORD:-carvision}@carvision-db:5432/${POSTGRES_DB:-carvision}
       MEDIA_DIR:             /app/datasets/media
       YOLO_PLATE_MODEL:      /app/models/plate.pt
-      LEGACY_FRONTEND_DIR:   /app/old/python_frontend
       API_ADMIN_USER:        ${API_ADMIN_USER:-admin}
       API_ADMIN_PASS:        ${API_ADMIN_PASS:-admin}
       JWT_SECRET:            ${JWT_SECRET:-change-this-secret}
@@ -67,7 +66,6 @@ services:
     volumes:
       - ./backend/app:/app/backend/app
       - ./datasets/media:/app/datasets/media
-      - ./old:/app/old:ro
       - ./models:/app/models
       - ./certs:/certs:ro
       # Entrypoint helper that adds VPN routes before starting the app

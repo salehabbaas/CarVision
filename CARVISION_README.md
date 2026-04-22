@@ -8,7 +8,7 @@ This repo now includes a modern React frontend and JWT-secured Python API on top
   - `backend/app/api/` request models
   - `backend/app/services/` dataset/state/file helpers
 - Frontend: React + Vite + Framer Motion + Lucide icons (`frontend/carvision-web/`)
-- Legacy Python/Jinja frontend: moved to `old/python_frontend/`
+- Legacy Python/Jinja frontend: removed
 - Dataset/media storage: `datasets/media/`
 - Database: PostgreSQL
 - Containers: `docker-compose.carvision.yml`

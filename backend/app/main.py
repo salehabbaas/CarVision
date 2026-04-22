@@ -28,7 +28,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse, FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_, func, case
 from sqlalchemy.exc import IntegrityError
@@ -65,7 +64,6 @@ from core.config import (
     FRONTEND_PUBLIC_BASE_URL,
     FRONTEND_PUBLIC_PORT,
     FRONTEND_PUBLIC_SCHEME,
-    LEGACY_FRONTEND_DIR,
     MEDIA_DIR,
     PROJECT_ROOT,
     PUBLIC_BASE_URL,
@@ -262,10 +260,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory=str(LEGACY_FRONTEND_DIR / "static")), name="static")
 app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
 
-templates = Jinja2Templates(directory=str(LEGACY_FRONTEND_DIR / "templates"))
+
+def _frontend_origin_from_request(request: Request) -> str:
+    if FRONTEND_PUBLIC_BASE_URL:
+        return FRONTEND_PUBLIC_BASE_URL.rstrip("/")
+    parsed = urlparse(str(request.base_url))
+    host = parsed.hostname or request.url.hostname or "localhost"
+    scheme = FRONTEND_PUBLIC_SCHEME or parsed.scheme or "http"
+    port = (FRONTEND_PUBLIC_PORT or "").strip()
+    if not port:
+        port = "443" if scheme == "https" else "80"
+    if (scheme == "http" and port == "80") or (scheme == "https" and port == "443"):
+        return f"{scheme}://{host}"
+    return f"{scheme}://{host}:{port}"
+
+
+def _legacy_ui_target_path(path: str) -> str:
+    if path == "/admin":
+        return "/"
+    if path.startswith("/admin/"):
+        return "/" + path[len("/admin/") :]
+    return path
+
+
+def _legacy_ui_redirect(request: Request) -> RedirectResponse:
+    target = f"{_frontend_origin_from_request(request)}{_legacy_ui_target_path(request.url.path)}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    return RedirectResponse(target, status_code=307)
+
+
+class _LegacyUiRemovedTemplates:
+    @staticmethod
+    def TemplateResponse(_template_name: str, context: Dict[str, object]):
+        request = context.get("request")
+        if isinstance(request, Request):
+            return _legacy_ui_redirect(request)
+        return JSONResponse({"error": "legacy frontend removed"}, status_code=410)
+
+
+templates = _LegacyUiRemovedTemplates()
 
 stream_manager = StreamManager()
 manual_clip_manager = ManualClipManager(media_dir=MEDIA_DIR, stream_manager=stream_manager)
@@ -675,13 +711,9 @@ async def auth_middleware(request: Request, call_next):
         if _jwt_subject_from_token(bearer_token or query_token):
             return await call_next(request)
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    if path.startswith("/admin") or path in {"/capture", "/capture/"}:
-        if request.url.path.startswith("/admin/api"):
-            if not request.session.get("user"):
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-        else:
-            if not request.session.get("user"):
-                return RedirectResponse("/login", status_code=302)
+    if path.startswith("/admin/api"):
+        if not request.session.get("user"):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
     return await call_next(request)
 
 
@@ -780,8 +812,8 @@ def on_shutdown():
 
 
 @app.get("/", response_class=HTMLResponse)
-def root():
-    return RedirectResponse("/admin", status_code=302)
+def root(request: Request):
+    return _legacy_ui_redirect(request)
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -793,8 +825,8 @@ def login_page(request: Request):
 def login_submit(request: Request, username: str = Form(...), password: str = Form(...)):
     if username == ADMIN_USER and password == ADMIN_PASS:
         request.session["user"] = username
-        return RedirectResponse("/admin", status_code=302)
-    return templates.TemplateResponse("login.html", {"request": request, "error": "Invalid credentials"})
+        return _legacy_ui_redirect(request)
+    return JSONResponse({"error": "invalid credentials"}, status_code=401)
 
 
 @app.get("/logout")

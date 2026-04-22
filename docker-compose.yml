@@ -17,7 +17,6 @@ services:
       MEDIA_DIR: /app/datasets/media
       APP_ENV: docker
       YOLO_PLATE_MODEL: /app/models/plate.pt
-      LEGACY_FRONTEND_DIR: /app/old/python_frontend
       SSL_CERTFILE: ${SSL_CERTFILE:-}
       SSL_KEYFILE: ${SSL_KEYFILE:-}
     depends_on:
@@ -27,7 +26,6 @@ services:
     volumes:
       - ./backend/app:/app/backend/app
       - ./datasets/media:/app/datasets/media
-      - ./old:/app/old:ro
       - ./models:/app/models
       - ./certs:/certs:ro
 

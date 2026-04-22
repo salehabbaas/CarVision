@@ -2,9 +2,6 @@ import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-LEGACY_FRONTEND_DIR = Path(
-    os.getenv("LEGACY_FRONTEND_DIR", str(PROJECT_ROOT / "old" / "python_frontend"))
-)
 MEDIA_DIR = os.getenv("MEDIA_DIR", str(PROJECT_ROOT / "datasets" / "media"))
 
 API_JWT_SECRET = os.getenv("JWT_SECRET", "carvision-dev-secret")
