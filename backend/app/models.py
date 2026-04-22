@@ -14,6 +14,7 @@ class Camera(Base):
     type = Column(String(30), nullable=False)  # webcam, rtsp, http_mjpeg
     source = Column(String(500), nullable=False)
     location = Column(String(200), nullable=True)
+    model = Column(String(200), nullable=True)
     enabled = Column(Boolean, default=True, nullable=False)
 
     scan_interval = Column(Float, default=0.15, nullable=False)

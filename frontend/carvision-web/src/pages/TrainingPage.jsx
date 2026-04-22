@@ -12,6 +12,7 @@ import {
   Gauge,
   History,
   LoaderCircle,
+  RotateCcw,
   Play,
   RefreshCw,
   Save,
@@ -25,10 +26,11 @@ import {
 } from 'lucide-react';
 import { apiPath, request } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
+import TablePagination from '../components/admin/TablePagination';
 
 // ── constants ─────────────────────────────────────────────────────────────────
 const DEFAULTS = {
-  train_model: 'yolov8n.pt',
+  train_model: 'yolo26n.pt',
   train_epochs: 50,
   train_imgsz: 640,
   train_batch: -1,
@@ -262,6 +264,7 @@ function DatasetStats({ token }) {
   const [stats, setStats] = useState(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const [open, setOpen] = useState(false);
 
   const load = useCallback(async () => {
     setBusy(true); setErr('');
@@ -277,19 +280,26 @@ function DatasetStats({ token }) {
   if (err) return (
     <Panel>
       <SectionHead icon={Activity} title="Dataset Overview" action={
-        <button className="btn ghost" onClick={load}><RefreshCw size={13} /></button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <button className="btn ghost" onClick={() => setOpen((s) => !s)}>{open ? <ChevronUp size={13} /> : <ChevronDown size={13} />}</button>
+          <button className="btn ghost" onClick={load}><RefreshCw size={13} /></button>
+        </div>
       } />
-      <div style={{ color: 'var(--bad)', fontSize: 13 }}>{err}</div>
+      {open ? <div style={{ color: 'var(--bad)', fontSize: 13 }}>{err}</div> : null}
     </Panel>
   );
 
   if (!stats && busy) return (
     <Panel>
-      <SectionHead icon={Activity} title="Dataset Overview" />
-      <div style={{ textAlign: 'center', padding: 24, color: 'var(--muted)' }}>
-        <LoaderCircle size={20} className="spin" style={{ marginBottom: 8 }} />
-        <div className="tiny">Loading dataset statistics…</div>
-      </div>
+      <SectionHead icon={Activity} title="Dataset Overview" action={
+        <button className="btn ghost" onClick={() => setOpen((s) => !s)}>{open ? <ChevronUp size={13} /> : <ChevronDown size={13} />}</button>
+      } />
+      {open ? (
+        <div style={{ textAlign: 'center', padding: 24, color: 'var(--muted)' }}>
+          <LoaderCircle size={20} className="spin" style={{ marginBottom: 8 }} />
+          <div className="tiny">Loading dataset statistics…</div>
+        </div>
+      ) : null}
     </Panel>
   );
 
@@ -301,12 +311,19 @@ function DatasetStats({ token }) {
       <SectionHead icon={Activity} title="Dataset Overview"
         badge={t > 0 ? `${t.toLocaleString()} images` : undefined}
         action={
-          <button className="btn ghost" onClick={load} disabled={busy} title="Refresh stats">
-            <RefreshCw size={13} className={busy ? 'spin' : ''} />
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button className="btn ghost" onClick={() => setOpen((s) => !s)}>
+              {open ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+            </button>
+            <button className="btn ghost" onClick={load} disabled={busy} title="Refresh stats">
+              <RefreshCw size={13} className={busy ? 'spin' : ''} />
+            </button>
+          </div>
         }
       />
 
+      {open ? (
+      <>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(130px, 1fr))', gap: 10, marginBottom: 20 }}>
         <KpiCard label="Total Images" value={t.toLocaleString()} />
         <KpiCard label="Annotated" value={(stats.annotated || 0).toLocaleString()} accent="var(--ok)" sub={`${stats.annotation_rate || 0}%`} />
@@ -337,6 +354,8 @@ function DatasetStats({ token }) {
           </div>
         </div>
       </div>
+      </>
+      ) : null}
     </Panel>
   );
 }
@@ -347,6 +366,8 @@ function ModelTestPanel({ token, pushToast }) {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
   const [expanded, setExpanded] = useState(false);
+  const [resultsPage, setResultsPage] = useState(1);
+  const [resultsPageSize, setResultsPageSize] = useState(25);
 
   async function runTest() {
     setBusy(true); setResult(null);
@@ -357,6 +378,7 @@ function ModelTestPanel({ token, pushToast }) {
       if (!res.ok) throw new Error(res.error || 'Test failed');
       setResult(res);
       setExpanded(true);
+      setResultsPage(1);
       const s = res.summary || {};
       pushToast(`Model test complete — ${s.exact_accuracy}% exact match on ${s.total_tested} samples`);
     } catch (e) {
@@ -366,6 +388,12 @@ function ModelTestPanel({ token, pushToast }) {
 
   const summary = result?.summary || {};
   const rows = result?.results || [];
+  const resultsTotalPages = Math.max(1, Math.ceil(rows.length / resultsPageSize));
+  const pagedRows = rows.slice((resultsPage - 1) * resultsPageSize, resultsPage * resultsPageSize);
+
+  useEffect(() => {
+    setResultsPage((current) => Math.min(current, resultsTotalPages));
+  }, [resultsTotalPages]);
 
   return (
     <Panel>
@@ -414,36 +442,48 @@ function ModelTestPanel({ token, pushToast }) {
               {expanded ? 'Hide' : 'Show'} per-sample results ({rows.length})
             </button>
             {expanded && (
-              <div className="table-wrap" style={{ marginTop: 8 }}>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>ID</th><th>Expected</th><th>Predicted</th><th>Match</th>
-                      <th>Similarity</th><th>Confidence</th><th>Detector</th><th>Note</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rows.map((r) => (
-                      <tr key={r.sample_id} style={r.exact_match ? {} : { opacity: 0.8 }}>
-                        <td className="mono tiny">{r.sample_id}</td>
-                        <td className="mono">{r.expected}</td>
-                        <td className="mono">{r.predicted ?? <span className="muted">—</span>}</td>
-                        <td>
-                          {r.exact_match
-                            ? <span className="tag ok" style={{ gap: 4 }}><CheckCircle size={10} /> exact</span>
-                            : r.predicted
-                              ? <span className="tag warn">partial</span>
-                              : <span className="tag bad" style={{ gap: 4 }}><XCircle size={10} /> none</span>}
-                        </td>
-                        <td className="mono tiny">{r.similarity != null ? `${(r.similarity * 100).toFixed(0)}%` : '—'}</td>
-                        <td className="mono tiny">{r.confidence != null ? `${(r.confidence * 100).toFixed(1)}%` : '—'}</td>
-                        <td className="tiny">{r.detector ?? '—'}</td>
-                        <td className="tiny muted">{r.error ?? ''}</td>
+              <>
+                <div className="table-wrap" style={{ marginTop: 8 }}>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>ID</th><th>Expected</th><th>Predicted</th><th>Match</th>
+                        <th>Similarity</th><th>Confidence</th><th>Detector</th><th>Note</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {pagedRows.map((r) => (
+                        <tr key={r.sample_id} style={r.exact_match ? {} : { opacity: 0.8 }}>
+                          <td className="mono tiny">{r.sample_id}</td>
+                          <td className="mono">{r.expected}</td>
+                          <td className="mono">{r.predicted ?? <span className="muted">—</span>}</td>
+                          <td>
+                            {r.exact_match
+                              ? <span className="tag ok" style={{ gap: 4 }}><CheckCircle size={10} /> exact</span>
+                              : r.predicted
+                                ? <span className="tag warn">partial</span>
+                                : <span className="tag bad" style={{ gap: 4 }}><XCircle size={10} /> none</span>}
+                          </td>
+                          <td className="mono tiny">{r.similarity != null ? `${(r.similarity * 100).toFixed(0)}%` : '—'}</td>
+                          <td className="mono tiny">{r.confidence != null ? `${(r.confidence * 100).toFixed(1)}%` : '—'}</td>
+                          <td className="tiny">{r.detector ?? '—'}</td>
+                          <td className="tiny muted">{r.error ?? ''}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <TablePagination
+                  page={resultsPage}
+                  totalPages={resultsTotalPages}
+                  totalItems={rows.length}
+                  pageSize={resultsPageSize}
+                  currentCount={pagedRows.length}
+                  itemLabel="results"
+                  onPageChange={setResultsPage}
+                  onPageSizeChange={setResultsPageSize}
+                />
+              </>
             )}
           </div>
         </div>
@@ -475,6 +515,7 @@ export default function TrainingPage() {
   const [startBusy, setStartBusy] = useState(false);
   const [stopBusy, setStopBusy] = useState(false);
   const [downloadBusy, setDownloadBusy] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
 
   // Track when training started (for ETA); reset when a new job begins
   const [trainStartedTs, setTrainStartedTs] = useState(null);
@@ -501,6 +542,7 @@ export default function TrainingPage() {
   const [showHistory, setShowHistory] = useState(false);
 
   const isRunning = ['queued', 'running'].includes(String(status.status || '').toLowerCase());
+  const isStopping = String(status.stage || '').toLowerCase() === 'stopping' || String(status.status || '').toLowerCase() === 'stopping';
   const isOcrRunning = ocrJob?.status === 'running' || ocrJob?.status === 'queued';
 
   // ── Loaders ──────────────────────────────────────────────────────────────
@@ -735,6 +777,21 @@ export default function TrainingPage() {
     finally { setDownloadBusy(false); }
   }
 
+  async function resetExistingModel() {
+    if (!window.confirm('Remove the current trained model from models/plate.pt and fall back to the configured base model for the next training run?')) return;
+    setResetBusy(true);
+    try {
+      const res = await request('/api/v1/training/model/reset', { token, method: 'POST' });
+      pushToast(res?.removed ? 'Existing trained model removed.' : 'No existing trained model was found.', 'warn');
+      const st = await request('/api/v1/training/status', { token });
+      setStatus({ ...st, details: st.details || {}, progress: Number(st.progress || 0), status: st.status || 'idle', stage: st.stage || 'idle', message: st.message || 'Idle' });
+    } catch (e) {
+      pushToast(e.message || 'Failed to reset existing model', 'error');
+    } finally {
+      setResetBusy(false);
+    }
+  }
+
   async function prefillOcrTexts() {
     setOcrBusy(true);
     try {
@@ -793,6 +850,21 @@ export default function TrainingPage() {
   const logs = useMemo(() => (Array.isArray(status?.details?.logs) ? status.details.logs : []), [status?.details?.logs]);
   const progress = Math.max(0, Math.min(100, Number(status.progress || 0)));
   const ocrProgress = Math.max(0, Math.min(100, Number(ocrJob?.progress || 0)));
+  const statusCode = String(status.status || 'idle').toLowerCase();
+  const terminalStatus = ['complete', 'failed', 'stopped'].includes(statusCode);
+  const statusTimestampRaw = status.finished_at || status.updated_at || status.started_at || null;
+  const statusTimestamp = statusTimestampRaw ? new Date(statusTimestampRaw) : null;
+  const statusAgeSeconds = statusTimestamp && !Number.isNaN(statusTimestamp.getTime())
+    ? Math.max(0, Math.floor((Date.now() - statusTimestamp.getTime()) / 1000))
+    : null;
+  const recentTerminalStatus = terminalStatus && (statusAgeSeconds == null || statusAgeSeconds <= 600);
+  const showLivePipelineStatus = isRunning || isStopping || recentTerminalStatus;
+  const pipelineBadge = showLivePipelineStatus ? <StatusBadge status={status.status} /> : null;
+  const pipelineStageLabel = (isRunning || isStopping) && status.stage && status.stage !== 'idle' ? status.stage : null;
+  const pipelineMessage = showLivePipelineStatus
+    ? (status.message || (recentTerminalStatus && statusAgeSeconds != null ? `Finished ${fmtDuration(statusAgeSeconds)} ago` : 'Idle'))
+    : 'Ready to start a new pipeline run.';
+  const recentRunLabel = recentTerminalStatus && statusAgeSeconds != null ? `Finished ${fmtDuration(statusAgeSeconds)} ago` : null;
 
   return (
     <>
@@ -816,10 +888,11 @@ export default function TrainingPage() {
         {/* ── Pipeline Control ──────────────────────────────────────────── */}
         <Panel>
           <SectionHead icon={BrainCircuit} title="Training Pipeline" badge={
-            <StatusBadge status={status.status} />
+            pipelineBadge
           } action={
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span className="tiny muted">{status.stage !== 'idle' ? status.stage : ''}</span>
+              {pipelineStageLabel ? <span className="tiny muted">{pipelineStageLabel}</span> : null}
+              {recentRunLabel ? <span className="tiny muted">{recentRunLabel}</span> : null}
             </div>
           } />
 
@@ -863,19 +936,24 @@ export default function TrainingPage() {
           {/* Action buttons */}
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 20 }}>
             <button className="btn primary" onClick={startPipeline}
-              disabled={startBusy || isRunning}
+              disabled={startBusy || isRunning || isStopping}
               style={{ gap: 7, minWidth: 130 }}>
               {startBusy ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}
-              {startBusy ? 'Starting…' : isRunning ? 'Running…' : pipelineMode === 'extract_only' ? 'Run OCR Extract' : 'Start Pipeline'}
+              {startBusy ? 'Starting…' : (isRunning || isStopping) ? 'Running…' : pipelineMode === 'extract_only' ? 'Run OCR Extract' : 'Start Pipeline'}
             </button>
 
-            {isRunning && (
+            {(isRunning || isStopping) && (
               <button className="btn" onClick={stopPipeline} disabled={stopBusy}
                 style={{ gap: 7, background: 'rgba(255,94,126,.15)', border: '1px solid rgba(255,94,126,.4)', color: 'var(--bad)' }}>
                 {stopBusy ? <LoaderCircle size={15} className="spin" /> : <Square size={15} />}
                 {stopBusy ? 'Stopping…' : 'Stop'}
               </button>
             )}
+
+            <button className="btn ghost" onClick={resetExistingModel} disabled={resetBusy || isRunning || isStopping} style={{ gap: 7 }}>
+              {resetBusy ? <LoaderCircle size={14} className="spin" /> : <RotateCcw size={14} />}
+              {resetBusy ? 'Resetting…' : 'Reset Existing Model'}
+            </button>
 
             <button className="btn ghost" onClick={() => downloadModel()} disabled={downloadBusy} style={{ gap: 7, marginLeft: 'auto' }}>
               {downloadBusy ? <LoaderCircle size={14} className="spin" /> : <Download size={14} />}
@@ -884,36 +962,36 @@ export default function TrainingPage() {
           </div>
 
           {/* Progress */}
-          {(isRunning || progress > 0) && (
+          {showLivePipelineStatus && (
             <div style={{ marginBottom: 18 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6, flexWrap: 'wrap', gap: 4 }}>
-                <span className="tiny muted">{status.message}</span>
+                <span className="tiny muted">{pipelineMessage}</span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                  {isRunning && trainStartedTs && (() => {
+                  {(isRunning || isStopping) && trainStartedTs && (() => {
                     const eta = calcEta(progress, trainStartedTs);
                     return eta ? (
                       <span className="tiny" style={{ color: 'var(--warn)', fontWeight: 500 }}>⏱ {eta}</span>
                     ) : null;
                   })()}
-                  <span className="tiny mono" style={{ color: 'var(--accent)' }}>{progress}%</span>
+                  {(isRunning || isStopping || progress > 0) ? <span className="tiny mono" style={{ color: 'var(--accent)' }}>{progress}%</span> : null}
                 </div>
               </div>
-              <ProgressBar value={progress} animated={isRunning} />
+              {(isRunning || isStopping || progress > 0) ? <ProgressBar value={progress} animated={isRunning} /> : null}
             </div>
           )}
 
           {/* Runtime KPIs */}
-          {(isRunning || status.total_samples > 0) && (
+          {showLivePipelineStatus && status.total_samples > 0 && (
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))', gap: 10, marginBottom: 20 }}>
               <KpiCard label="Selected" value={status.total_samples || 0} pulse={isRunning} />
-              <KpiCard label="Trained" value={status.trained_samples || 0} accent={isRunning ? 'var(--accent)' : undefined} pulse={isRunning} />
+              <KpiCard label="Trained" value={status.trained_samples || 0} accent={(isRunning || recentTerminalStatus) ? 'var(--accent)' : undefined} pulse={isRunning} />
               <KpiCard label="Chunk" value={`${status.chunk_index || 0} / ${status.chunk_total || 0}`} />
               <KpiCard label="OCR Updated" value={status.ocr_updated || 0} />
             </div>
           )}
 
           {/* Run info */}
-          {(status.run_dir || status.last_run_dir) && (
+          {showLivePipelineStatus && (status.run_dir || status.last_run_dir) && (
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
               <div>
                 <div className="tiny muted" style={{ marginBottom: 3 }}>Run directory</div>
@@ -927,18 +1005,24 @@ export default function TrainingPage() {
           )}
 
           {/* Job log */}
-          <div>
-            <div className="tiny muted" style={{ marginBottom: 8 }}>Job log</div>
-            <div style={{
-              background: 'rgba(0,0,0,.3)', borderRadius: 10, padding: '12px 14px',
-              border: '1px solid rgba(255,255,255,.07)',
-              maxHeight: 160, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 3,
-            }}>
-              {(logs.length ? logs.slice(-15).reverse() : ['No logs yet.']).map((line, i) => (
-                <div key={`${line}-${i}`} className="tiny mono" style={{ color: 'var(--muted)', lineHeight: 1.5 }}>{line}</div>
-              ))}
+          {showLivePipelineStatus && logs.length ? (
+            <div>
+              <div className="tiny muted" style={{ marginBottom: 8 }}>Job log</div>
+              <div style={{
+                background: 'rgba(0,0,0,.3)', borderRadius: 10, padding: '12px 14px',
+                border: '1px solid rgba(255,255,255,.07)',
+                maxHeight: 160, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 3,
+              }}>
+                {logs.slice(-15).reverse().map((line, i) => (
+                  <div key={`${line}-${i}`} className="tiny mono" style={{ color: 'var(--muted)', lineHeight: 1.5 }}>{line}</div>
+                ))}
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="tiny muted">
+              {showLivePipelineStatus ? 'No log entries available for this run.' : 'No active training job. Start a new pipeline run when ready.'}
+            </div>
+          )}
         </Panel>
 
         {/* ── Standalone OCR Tools ──────────────────────────────────────── */}
@@ -1233,16 +1317,16 @@ export default function TrainingPage() {
                 </table>
               </div>
 
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12 }}>
-                <span className="tiny muted">Total: {jobsMeta.total.toLocaleString()}</span>
-                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                  <button className="btn ghost" style={{ fontSize: 12, padding: '4px 10px' }}
-                    onClick={() => setJobsPage((p) => Math.max(1, p - 1))} disabled={jobsMeta.page <= 1}>Prev</button>
-                  <span className="tiny muted">Page {jobsMeta.page} / {jobsMeta.pages}</span>
-                  <button className="btn ghost" style={{ fontSize: 12, padding: '4px 10px' }}
-                    onClick={() => setJobsPage((p) => Math.min(Number(jobsMeta.pages || 1), p + 1))} disabled={jobsMeta.page >= jobsMeta.pages}>Next</button>
-                </div>
-              </div>
+              <TablePagination
+                page={jobsMeta.page}
+                totalPages={jobsMeta.pages}
+                totalItems={jobsMeta.total}
+                pageSize={jobsMeta.limit || 20}
+                currentCount={jobs.length}
+                itemLabel="jobs"
+                pageSizeOptions={[]}
+                onPageChange={setJobsPage}
+              />
             </>
           )}
         </Panel>

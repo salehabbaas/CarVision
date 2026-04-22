@@ -11,6 +11,11 @@ import Select     from '../design-system/components/Select';
 import Input      from '../design-system/components/Input';
 import Textarea   from '../design-system/components/Textarea';
 import Button     from '../design-system/components/Button';
+import FormModal  from '../design-system/components/FormModal';
+import CollapsibleToolbar from '../components/admin/CollapsibleToolbar';
+import SortableHeader from '../components/admin/SortableHeader';
+import TablePagination from '../components/admin/TablePagination';
+import { compareTableValues, useTableSorting } from '../hooks/useTableSorting';
 
 function badgeClass(status) {
   if (status === 'allowed') return 'ok';
@@ -48,6 +53,7 @@ export default function DetectionsPage() {
   const [status, setStatus] = useState('');
   const [feedback, setFeedback] = useState('');
   const [trained, setTrained] = useState('');
+  const [cameraFilter, setCameraFilter] = useState('');
   const [selected, setSelected] = useState({});
   const [toast, setToast] = useState('');
   const [busyDebug, setBusyDebug] = useState({});
@@ -70,6 +76,8 @@ export default function DetectionsPage() {
   const [feedbackInitial, setFeedbackInitial] = useState({ mode: 'correct', expected: '', notes: '' });
   const [createdSampleId, setCreatedSampleId] = useState(null);
   const [focusedRowId, setFocusedRowId] = useState(null);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
 
   const focusDetectionId = useMemo(() => {
     const raw = searchParams.get('detection_id');
@@ -114,7 +122,29 @@ export default function DetectionsPage() {
     return () => clearTimeout(timer);
   }, [focusDetectionId, items]);
 
-  const visibleIds = useMemo(() => items.map((x) => x.id), [items]);
+  const cameraOptions = useMemo(
+    () => Array.from(new Set(items.map((row) => row.camera_name).filter(Boolean))).sort((a, b) => a.localeCompare(b)),
+    [items]
+  );
+  const filteredItems = useMemo(
+    () => items.filter((row) => !cameraFilter || row.camera_name === cameraFilter),
+    [items, cameraFilter]
+  );
+  const { sortKey, sortDirection, sortedRows, requestSort } = useTableSorting(filteredItems, {
+    initialKey: 'detected_at',
+    initialDirection: 'desc',
+    sorters: {
+      id: (a, b) => compareTableValues(a.id, b.id),
+      detected_at: (a, b) => compareTableValues(a.detected_at, b.detected_at),
+      plate_text: (a, b) => compareTableValues(a.plate_text, b.plate_text),
+      status: (a, b) => compareTableValues(a.status, b.status),
+      confidence: (a, b) => compareTableValues(a.confidence, b.confidence),
+      camera_name: (a, b) => compareTableValues(a.camera_name, b.camera_name),
+    },
+  });
+  const totalPages = Math.max(1, Math.ceil(sortedRows.length / pageSize));
+  const pagedRows = useMemo(() => sortedRows.slice((page - 1) * pageSize, page * pageSize), [sortedRows, page, pageSize]);
+  const visibleIds = useMemo(() => pagedRows.map((row) => row.id), [pagedRows]);
   const selectedIds = useMemo(
     () => Object.keys(selected).filter((id) => selected[id]).map((id) => Number(id)),
     [selected]
@@ -138,6 +168,14 @@ export default function DetectionsPage() {
     feedbackMode !== feedbackInitial.mode ||
     (feedbackExpected || '') !== (feedbackInitial.expected || '') ||
     (feedbackNotes || '') !== (feedbackInitial.notes || '');
+
+  useEffect(() => {
+    setPage(1);
+  }, [cameraFilter, status, feedback, trained, items.length]);
+
+  useEffect(() => {
+    setPage((current) => Math.min(current, totalPages));
+  }, [totalPages]);
 
   function toggleAll(v) {
     const next = { ...selected };
@@ -343,7 +381,7 @@ export default function DetectionsPage() {
       {error ? <div className="alert error">{error} <button className="btn ghost" style={{ marginLeft: 8 }} onClick={load}>Retry</button></div> : null}
       {toast ? <div className="alert success">{toast}</div> : null}
 
-      <div className="panel glass toolbar">
+      <CollapsibleToolbar title="Detection Filters" summary="Search and filter controls are collapsed by default.">
         <div className="search-wrap">
           <Search size={16} />
           <input
@@ -369,15 +407,21 @@ export default function DetectionsPage() {
           <option value="trained">Trained</option>
           <option value="not_trained">Not trained</option>
         </select>
+        <select title="Filter detections by camera name in the current result set." value={cameraFilter} onChange={(e) => setCameraFilter(e.target.value)}>
+          <option value="">All cameras</option>
+          {cameraOptions.map((camera) => (
+            <option key={camera} value={camera}>{camera}</option>
+          ))}
+        </select>
         <button className="btn" onClick={load}>Filter</button>
-      </div>
+      </CollapsibleToolbar>
 
       <div className="panel glass">
         <div className="panel-head">
           <h3>Detection Events</h3>
           <div className="row">
             <span className="tiny">
-              Selected: {selectedIds.length} • Filtered: {visibleIds.length}
+              Selected: {selectedIds.length} • Filtered: {sortedRows.length}
             </span>
             <button className="btn" onClick={() => setBulkOpen(true)} disabled={!targetIds.length}>
               <CheckCircle2 size={15} /> Bulk Feedback
@@ -397,14 +441,14 @@ export default function DetectionsPage() {
           <table>
             <thead>
               <tr>
-                <th><input title="Select or unselect all currently filtered detections." type="checkbox" onChange={(e) => toggleAll(e.target.checked)} /></th>
-                <th>ID</th>
+                <th><input title="Select or unselect all detections on the current page." type="checkbox" onChange={(e) => toggleAll(e.target.checked)} /></th>
+                <th><SortableHeader label="ID" sortKey="id" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
                 <th>Snapshot</th>
-                <th>Time</th>
-                <th>Plate</th>
-                <th>Status</th>
-                <th>Conf</th>
-                <th>Camera</th>
+                <th><SortableHeader label="Time" sortKey="detected_at" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Plate" sortKey="plate_text" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Status" sortKey="status" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Conf" sortKey="confidence" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Camera" sortKey="camera_name" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
                 <th>Debug</th>
                 <th>Feedback</th>
                 <th>Train</th>
@@ -412,7 +456,7 @@ export default function DetectionsPage() {
               </tr>
             </thead>
             <tbody>
-              {items.map((row) => (
+              {pagedRows.map((row) => (
                 <motion.tr
                   key={row.id}
                   id={`detection-row-${row.id}`}
@@ -505,29 +549,35 @@ export default function DetectionsPage() {
                   </td>
                 </motion.tr>
               ))}
-              {!items.length && (
+              {!sortedRows.length && (
                 <tr>
                   <td colSpan={12} className="empty">
-                    {loading ? 'Loading...' : 'No detections found.'}
+                    {loading ? 'Loading...' : 'No detections match the current filters.'}
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
         </div>
+        <TablePagination
+          page={page}
+          totalPages={totalPages}
+          totalItems={sortedRows.length}
+          pageSize={pageSize}
+          currentCount={pagedRows.length}
+          itemLabel="detections"
+          onPageChange={setPage}
+          onPageSizeChange={setPageSize}
+        />
       </div>
 
-      <Modal
+      <FormModal
         open={bulkOpen}
         onClose={() => setBulkOpen(false)}
         title="Bulk Feedback"
         subtitle={`Apply to ${targetIds.length} event(s) — ${selectedIds.length ? 'selected' : 'all filtered'}`}
-        footer={
-          <>
-            <Button variant="ghost" type="button" onClick={() => setBulkOpen(false)}>Cancel</Button>
-            <Button variant="primary" type="submit" form="bulk-feedback-form">Save Feedback</Button>
-          </>
-        }
+        formId="bulk-feedback-form"
+        submitLabel="Save Feedback"
       >
         <form
           id="bulk-feedback-form"
@@ -561,17 +611,20 @@ export default function DetectionsPage() {
             />
           </FormField>
         </form>
-      </Modal>
+      </FormModal>
 
-      <Modal
+      <FormModal
         open={feedbackOpen && !!feedbackRow}
         onClose={() => setFeedbackOpen(false)}
         size="xl"
         title={`Detection #${feedbackRow?.id} — Feedback`}
         subtitle={feedbackRow ? `${feedbackRow.plate_text || '—'}  ·  ${feedbackRow.camera_name || '—'}` : ''}
-        footer={
+        formId="feedback-form"
+        submitLabel="Save Feedback"
+        cancelLabel="Close"
+        footerStart={
           <>
-            <div style={{ flex: 1, display: 'flex', gap: 6 }}>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
               {createdSampleId && (
                 <Link className="btn" to={`/training-data?sample_id=${createdSampleId}`}>
                   Open Sample #{createdSampleId}
@@ -583,6 +636,10 @@ export default function DetectionsPage() {
                 </Link>
               )}
             </div>
+          </>
+        }
+        footerEnd={
+          <>
             <Button
               variant="ghost"
               type="button"
@@ -600,8 +657,6 @@ export default function DetectionsPage() {
             >
               Next <ChevronRight size={14} />
             </Button>
-            <Button variant="ghost" type="button" onClick={() => setFeedbackOpen(false)}>Close</Button>
-            <Button variant="primary" type="submit" form="feedback-form">Save Feedback</Button>
           </>
         }
       >
@@ -695,7 +750,7 @@ export default function DetectionsPage() {
             )}
           </form>
         )}
-      </Modal>
+      </FormModal>
 
       <Modal
         open={debugPreview.open && debugPreview.steps.length > 0}

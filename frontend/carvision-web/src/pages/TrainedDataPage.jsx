@@ -3,6 +3,10 @@ import { Link } from 'react-router-dom';
 import { request } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
 import { LoadingState, ErrorState } from '../components/PageState';
+import CollapsibleToolbar from '../components/admin/CollapsibleToolbar';
+import SortableHeader from '../components/admin/SortableHeader';
+import TablePagination from '../components/admin/TablePagination';
+import { compareTableValues, useTableSorting } from '../hooks/useTableSorting';
 
 function fmtDuration(seconds) {
   const val = Number(seconds || 0);
@@ -31,6 +35,10 @@ export default function TrainedDataPage() {
   const [startingBatch, setStartingBatch] = useState('');
   const [controlBatch, setControlBatch] = useState('');
   const [error, setError] = useState('');
+  const [tableSearch, setTableSearch] = useState('');
+  const [jobFilter, setJobFilter] = useState('all');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
 
   async function loadBatches(signal) {
     setLoading(true);
@@ -113,33 +121,89 @@ export default function TrainedDataPage() {
     }
   }
 
+  const filteredItems = items.filter((row) => {
+    const query = tableSearch.trim().toLowerCase();
+    const status = String(row.ocr_job?.status || 'not_started').toLowerCase();
+    const matchesSearch =
+      !query ||
+      [row.batch, row.ocr_job?.message, row.ocr_job?.error].filter(Boolean).some((value) => String(value).toLowerCase().includes(query));
+    const matchesJob = jobFilter === 'all' || status === jobFilter;
+    return matchesSearch && matchesJob;
+  });
+
+  const { sortKey, sortDirection, sortedRows, requestSort } = useTableSorting(filteredItems, {
+    initialKey: 'updated_at',
+    initialDirection: 'desc',
+    sorters: {
+      batch: (a, b) => compareTableValues(a.batch, b.batch),
+      total: (a, b) => compareTableValues(a.total, b.total),
+      annotated: (a, b) => compareTableValues(a.annotated, b.annotated),
+      negatives: (a, b) => compareTableValues(a.negatives, b.negatives),
+      pending: (a, b) => compareTableValues(a.pending, b.pending),
+      updated_at: (a, b) => compareTableValues(a.updated_at, b.updated_at),
+    },
+  });
+  const totalPages = Math.max(1, Math.ceil(sortedRows.length / pageSize));
+  const pagedRows = sortedRows.slice((page - 1) * pageSize, page * pageSize);
+
+  useEffect(() => {
+    setPage(1);
+  }, [tableSearch, jobFilter]);
+
+  useEffect(() => {
+    setPage((current) => Math.min(current, totalPages));
+  }, [totalPages]);
+
   if (loading && items.length === 0) return <LoadingState rows={4} message="Loading imported batches…" />;
   if (error && items.length === 0) return <ErrorState error={{ message: error, type: 'unknown' }} onRetry={() => { setLoading(true); loadBatches().catch(e => setError(e.message)).finally(() => setLoading(false)); }} />;
 
   return (
     <div className="stack">
       {error ? <div className="alert error">{error}</div> : null}
+      <CollapsibleToolbar title="Batch Filters" summary="Top filters are collapsed by default.">
+        <div className="row">
+          <input
+            title="Filter imported batches by batch id or OCR job text."
+            placeholder="Filter batches"
+            value={tableSearch}
+            onChange={(e) => setTableSearch(e.target.value)}
+          />
+          <select
+            title="Filter imported batches by OCR job status."
+            value={jobFilter}
+            onChange={(e) => setJobFilter(e.target.value)}
+          >
+            <option value="all">All job states</option>
+            <option value="not_started">Not started</option>
+            <option value="running">Running</option>
+            <option value="stopping">Stopping</option>
+            <option value="stopped">Stopped</option>
+            <option value="failed">Failed</option>
+            <option value="complete">Complete</option>
+          </select>
+        </div>
+      </CollapsibleToolbar>
       <div className="panel glass">
         <div className="panel-head">
           <h3>Trained Data (Imported Batches)</h3>
-          <span className="tiny muted">{items.length} batches</span>
+          <span className="tiny muted">{sortedRows.length} batches</span>
         </div>
         <div className="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>Batch</th>
-                <th>Total</th>
-                <th>Annotated</th>
-                <th>Negatives</th>
-                <th>Pending</th>
+                <th><SortableHeader label="Batch" sortKey="batch" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Total" sortKey="total" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Annotated" sortKey="annotated" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Negatives" sortKey="negatives" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Pending" sortKey="pending" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
                 <th>OCR Job</th>
-                <th>Updated</th>
+                <th><SortableHeader label="Updated" sortKey="updated_at" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
                 <th>Action</th>
               </tr>
             </thead>
             <tbody>
-              {items.map((row) => (
+              {pagedRows.map((row) => (
                 <tr key={row.batch}>
                   {(() => {
                     const ocrStatus = String(row.ocr_job?.status || '').toLowerCase();
@@ -250,14 +314,24 @@ export default function TrainedDataPage() {
                   })()}
                 </tr>
               ))}
-              {!items.length && !loading ? (
+              {!sortedRows.length && !loading ? (
                 <tr>
-                  <td colSpan={8} className="empty">No imported batches found.</td>
+                  <td colSpan={8} className="empty">No imported batches match the current filters.</td>
                 </tr>
               ) : null}
             </tbody>
           </table>
         </div>
+        <TablePagination
+          page={page}
+          totalPages={totalPages}
+          totalItems={sortedRows.length}
+          pageSize={pageSize}
+          currentCount={pagedRows.length}
+          itemLabel="batches"
+          onPageChange={setPage}
+          onPageSizeChange={setPageSize}
+        />
       </div>
     </div>
   );

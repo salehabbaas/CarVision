@@ -18,6 +18,11 @@ import Checkbox    from '../design-system/components/Checkbox';
 import Button      from '../design-system/components/Button';
 import Alert       from '../design-system/components/Alert';
 import FormSection from '../design-system/components/FormSection';
+import FormModal   from '../design-system/components/FormModal';
+import CollapsibleToolbar from '../components/admin/CollapsibleToolbar';
+import SortableHeader from '../components/admin/SortableHeader';
+import TablePagination from '../components/admin/TablePagination';
+import { compareTableValues, useTableSorting } from '../hooks/useTableSorting';
 
 // ── Defaults ────────────────────────────────────────────────────────────────
 const defaultNewCamera = {
@@ -25,6 +30,7 @@ const defaultNewCamera = {
   type:          'rtsp',
   source:        '',
   location:      '',
+  model:         '',
   enabled:       true,
   live_view:     true,
   detector_mode: 'inherit',
@@ -411,6 +417,11 @@ export default function CamerasPage() {
   const [pageLoading, setPageLoading] = useState(true);  // true until first load completes
   const [newCamera, setNewCamera]   = useState(defaultNewCamera);
   const [showAdvNew, setShowAdvNew] = useState(false);
+  const [newCameraOpen, setNewCameraOpen] = useState(false);
+  const [tableSearch, setTableSearch] = useState('');
+  const [typeFilter, setTypeFilter] = useState('all');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
   const toastTimerRef = useRef(null);
 
   function showToast(msg) {
@@ -499,6 +510,7 @@ export default function CamerasPage() {
           type:           newCamera.type,
           source:         newCamera.type === 'browser' ? (source || 'browser') : source,
           location:       newCamera.location || null,
+          model:          newCamera.model || null,
           enabled:        newCamera.enabled,
           live_view:      newCamera.live_view,
           detector_mode:  newCamera.detector_mode,
@@ -513,6 +525,7 @@ export default function CamerasPage() {
       showToast('Camera added.');
       setNewCamera(defaultNewCamera);
       setShowAdvNew(false);
+      setNewCameraOpen(false);
       await load();
     } catch (err) {
       setError(err.message || 'Create camera failed');
@@ -557,6 +570,37 @@ export default function CamerasPage() {
     newCamera.type === 'browser'   ? 'Leave blank for phone/browser capture' :
                                      'Source URL or path';
 
+  const filteredRows = rows.filter((cam) => {
+    const query = tableSearch.trim().toLowerCase();
+    const matchesSearch =
+      !query ||
+      [cam.id, cam.name, cam.location, cam.type, cam.source].some((value) => String(value ?? '').toLowerCase().includes(query));
+    const matchesType = typeFilter === 'all' || cam.type === typeFilter;
+    return matchesSearch && matchesType;
+  });
+
+  const { sortKey, sortDirection, sortedRows, requestSort } = useTableSorting(filteredRows, {
+    initialKey: 'id',
+    sorters: {
+      id: (a, b) => compareTableValues(a.id, b.id),
+      name: (a, b) => compareTableValues(a.name, b.name),
+      type: (a, b) => compareTableValues(a.type, b.type),
+      enabled: (a, b) => compareTableValues(a.enabled, b.enabled),
+      live_view: (a, b) => compareTableValues(a.live_view, b.live_view),
+      detector_mode: (a, b) => compareTableValues(a.detector_mode, b.detector_mode),
+    },
+  });
+  const totalPages = Math.max(1, Math.ceil(sortedRows.length / pageSize));
+  const pagedRows = sortedRows.slice((page - 1) * pageSize, page * pageSize);
+
+  useEffect(() => {
+    setPage(1);
+  }, [tableSearch, typeFilter]);
+
+  useEffect(() => {
+    setPage((current) => Math.min(current, totalPages));
+  }, [totalPages]);
+
   if (pageLoading) return <LoadingState rows={4} message="Loading cameras…" />;
   if (error && rows.length === 0) return <ErrorState error={{ message: error, type: 'unknown' }} onRetry={() => load().catch(() => {})} />;
 
@@ -566,185 +610,222 @@ export default function CamerasPage() {
       {toast && <Alert variant="success" onDismiss={() => setToast('')}>{toast}</Alert>}
 
       {/* ── Global live limit ─────────────────────────────────────────────── */}
-      <div className="panel glass" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap', padding: '14px 18px' }}>
+      <CollapsibleToolbar title="Live Layout" summary="Top control panels stay collapsed by default.">
+        <div className="row" style={{ justifyContent: 'space-between', width: '100%', flexWrap: 'wrap' }}>
+          <div>
+            <div className="tiny muted">Max cameras rendered simultaneously in Live DVR.</div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <Input
+              type="number" min={1} max={64}
+              value={layout}
+              onChange={(e) => setLayout(e.target.value)}
+              style={{ width: 90 }}
+            />
+            <Button variant="primary" icon={<Save size={14} />} onClick={saveLayout}>Save</Button>
+          </div>
+        </div>
+      </CollapsibleToolbar>
+
+      <div className="panel glass" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
         <div>
-          <h3 style={{ margin: '0 0 2px' }}>Global Live Limit</h3>
-          <p className="tiny muted" style={{ margin: 0 }}>Max cameras rendered simultaneously in Live DVR.</p>
+          <h3 style={{ margin: '0 0 2px' }}>Add Camera</h3>
+          <p className="tiny muted" style={{ margin: 0 }}>Create camera connections in a modal form instead of inline page chrome.</p>
         </div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <Input
-            type="number" min={1} max={64}
-            value={layout}
-            onChange={(e) => setLayout(e.target.value)}
-            style={{ width: 90 }}
-          />
-          <Button variant="primary" icon={<Save size={14} />} onClick={saveLayout}>Save</Button>
-        </div>
+        <Button
+          variant="primary"
+          icon={<Plus size={14} />}
+          onClick={() => setNewCameraOpen(true)}
+        >
+          New Camera
+        </Button>
       </div>
 
-      {/* ── Add camera ────────────────────────────────────────────────────── */}
-      <div className="panel glass" style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-        <div className="panel-head"><h3 style={{ margin: 0 }}>Add Camera</h3></div>
-
-        <FormSection title="Identity">
-          <div className="ds-grid-2">
-            <FormField label="Name" required>
-              <Input
-                placeholder="e.g. Front Gate"
-                value={newCamera.name}
-                onChange={(e) => setNewCamera((c) => ({ ...c, name: e.target.value }))}
-              />
-            </FormField>
-            <FormField label="Type">
-              <Select
-                value={newCamera.type}
-                onChange={(e) => setNewCamera((c) => ({ ...c, type: e.target.value, source: '' }))}
-              >
-                <option value="rtsp">RTSP  (IP camera / DVR / NVR)</option>
-                <option value="http_mjpeg">HTTP MJPEG  (IP camera / webcam server)</option>
-                <option value="webcam">Webcam  (local USB / built-in)</option>
-                <option value="browser">Browser  (phone / tablet)</option>
-                <option value="upload">Upload  (manual image/video)</option>
-              </Select>
-            </FormField>
-            <FormField label="Location" hint="Optional physical label">
-              <Input
-                placeholder="e.g. Main entrance"
-                value={newCamera.location}
-                onChange={(e) => setNewCamera((c) => ({ ...c, location: e.target.value }))}
-              />
-            </FormField>
-            <FormField label="Detector mode">
-              <Select
-                value={newCamera.detector_mode}
-                onChange={(e) => setNewCamera((c) => ({ ...c, detector_mode: e.target.value }))}
-              >
-                <DetectorModeOptions inheritLabel="inherit (use global setting)" />
-              </Select>
-            </FormField>
-          </div>
-        </FormSection>
-
-        <FormSection title="Connection">
-          {newCamera.type === 'rtsp' ? (
-            <IpCameraForm
-              token={token}
-              value={newCamera._ip}
-              onChange={(ip) => setNewCamera((c) => ({ ...c, _ip: ip }))}
-            />
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              <FormField label="Source URL / device index">
-                <Input
-                  placeholder={sourcePlaceholder}
-                  value={newCamera.source}
-                  onChange={(e) => setNewCamera((c) => ({ ...c, source: e.target.value }))}
-                />
-              </FormField>
-              {newCamera.type === 'http_mjpeg' && newCamera.source && (
-                <StreamTestButton
-                  url={`/stream/preview?source=${encodeURIComponent(newCamera.source)}`}
-                  token={token}
-                />
-              )}
-            </div>
-          )}
-        </FormSection>
-
-        <FormSection title="Options">
-          <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
-            <Checkbox
-              checked={newCamera.enabled}
-              onChange={(e) => setNewCamera((c) => ({ ...c, enabled: e.target.checked }))}
-              label="Enabled"
-            />
-            <Checkbox
-              checked={newCamera.live_view}
-              onChange={(e) => setNewCamera((c) => ({ ...c, live_view: e.target.checked }))}
-              label="Show in Live DVR"
-            />
-            <Checkbox
-              checked={newCamera.save_clip}
-              onChange={(e) => setNewCamera((c) => ({ ...c, save_clip: e.target.checked, clip_seconds: 0 }))}
-              label="Save clip"
-              hint="Manual start/stop from Live view"
-            />
-          </div>
-        </FormSection>
-
-        {/* ── ONVIF / PTZ optional fields ─────────────────────────────────── */}
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          icon={showAdvNew ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-          style={{ alignSelf: 'flex-start' }}
-          onClick={() => setShowAdvNew((s) => !s)}
-        >
-          ONVIF / PTZ settings (optional)
-        </Button>
-
-        {showAdvNew && (
-          <FormSection title="ONVIF / PTZ">
+      <FormModal
+        open={newCameraOpen}
+        onClose={() => setNewCameraOpen(false)}
+        title="Add Camera"
+        subtitle="Create a new camera source and connection profile"
+        size="xl"
+        submitLabel="Add Camera"
+        onSubmitClick={() => createCamera().catch((err) => setError(err.message || 'Create camera failed'))}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+          <FormSection title="Identity">
             <div className="ds-grid-2">
-              <FormField label="ONVIF xAddr" hint="Device service endpoint">
+              <FormField label="Name" required>
                 <Input
-                  placeholder="http://192.168.1.100/onvif/device_service"
-                  value={newCamera.onvif_xaddr}
-                  onChange={(e) => setNewCamera((c) => ({ ...c, onvif_xaddr: e.target.value }))}
+                  placeholder="e.g. Front Gate"
+                  value={newCamera.name}
+                  onChange={(e) => setNewCamera((c) => ({ ...c, name: e.target.value }))}
                 />
               </FormField>
-              <FormField label="ONVIF username">
+              <FormField label="Type">
+                <Select
+                  value={newCamera.type}
+                  onChange={(e) => setNewCamera((c) => ({ ...c, type: e.target.value, source: '' }))}
+                >
+                  <option value="rtsp">RTSP  (IP camera / DVR / NVR)</option>
+                  <option value="http_mjpeg">HTTP MJPEG  (IP camera / webcam server)</option>
+                  <option value="webcam">Webcam  (local USB / built-in)</option>
+                  <option value="browser">Browser  (phone / tablet)</option>
+                  <option value="upload">Upload  (manual image/video)</option>
+                </Select>
+              </FormField>
+              <FormField label="Location" hint="Optional physical label">
                 <Input
-                  placeholder="admin"
-                  value={newCamera.onvif_username}
-                  onChange={(e) => setNewCamera((c) => ({ ...c, onvif_username: e.target.value }))}
+                  placeholder="e.g. Main entrance"
+                  value={newCamera.location}
+                  onChange={(e) => setNewCamera((c) => ({ ...c, location: e.target.value }))}
                 />
               </FormField>
-              <FormField label="ONVIF password">
+              <FormField label="Model" hint="Optional camera model name">
                 <Input
-                  type="password"
-                  placeholder="••••••••"
-                  value={newCamera.onvif_password}
-                  onChange={(e) => setNewCamera((c) => ({ ...c, onvif_password: e.target.value }))}
+                  placeholder="e.g. Hikvision DS-2CD2143G2-I"
+                  value={newCamera.model}
+                  onChange={(e) => setNewCamera((c) => ({ ...c, model: e.target.value }))}
                 />
               </FormField>
-              <FormField label="ONVIF profile token" hint="From Discovery page">
-                <Input
-                  placeholder="Profile_1"
-                  value={newCamera.onvif_profile}
-                  onChange={(e) => setNewCamera((c) => ({ ...c, onvif_profile: e.target.value }))}
-                />
+              <FormField label="Detector mode">
+                <Select
+                  value={newCamera.detector_mode}
+                  onChange={(e) => setNewCamera((c) => ({ ...c, detector_mode: e.target.value }))}
+                >
+                  <DetectorModeOptions inheritLabel="inherit (use global setting)" />
+                </Select>
               </FormField>
             </div>
           </FormSection>
-        )}
 
-        <div>
+          <FormSection title="Connection">
+            {newCamera.type === 'rtsp' ? (
+              <IpCameraForm
+                token={token}
+                value={newCamera._ip}
+                onChange={(ip) => setNewCamera((c) => ({ ...c, _ip: ip }))}
+              />
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <FormField label="Source URL / device index">
+                  <Input
+                    placeholder={sourcePlaceholder}
+                    value={newCamera.source}
+                    onChange={(e) => setNewCamera((c) => ({ ...c, source: e.target.value }))}
+                  />
+                </FormField>
+                {newCamera.type === 'http_mjpeg' && newCamera.source && (
+                  <StreamTestButton
+                    url={`/stream/preview?source=${encodeURIComponent(newCamera.source)}`}
+                    token={token}
+                  />
+                )}
+              </div>
+            )}
+          </FormSection>
+
+          <FormSection title="Options">
+            <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
+              <Checkbox
+                checked={newCamera.enabled}
+                onChange={(e) => setNewCamera((c) => ({ ...c, enabled: e.target.checked }))}
+                label="Enabled"
+              />
+              <Checkbox
+                checked={newCamera.live_view}
+                onChange={(e) => setNewCamera((c) => ({ ...c, live_view: e.target.checked }))}
+                label="Show in Live DVR"
+              />
+              <Checkbox
+                checked={newCamera.save_clip}
+                onChange={(e) => setNewCamera((c) => ({ ...c, save_clip: e.target.checked, clip_seconds: 0 }))}
+                label="Save clip"
+                hint="Manual start/stop from Live view"
+              />
+            </div>
+          </FormSection>
+
           <Button
-            variant="primary"
-            icon={<Plus size={14} />}
-            onClick={() => createCamera().catch((err) => setError(err.message || 'Create camera failed'))}
+            type="button"
+            variant="ghost"
+            size="sm"
+            icon={showAdvNew ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+            style={{ alignSelf: 'flex-start' }}
+            onClick={() => setShowAdvNew((s) => !s)}
           >
-            Add Camera
+            ONVIF / PTZ settings (optional)
           </Button>
+
+          {showAdvNew && (
+            <FormSection title="ONVIF / PTZ">
+              <div className="ds-grid-2">
+                <FormField label="ONVIF xAddr" hint="Device service endpoint">
+                  <Input
+                    placeholder="http://192.168.1.100/onvif/device_service"
+                    value={newCamera.onvif_xaddr}
+                    onChange={(e) => setNewCamera((c) => ({ ...c, onvif_xaddr: e.target.value }))}
+                  />
+                </FormField>
+                <FormField label="ONVIF username">
+                  <Input
+                    placeholder="admin"
+                    value={newCamera.onvif_username}
+                    onChange={(e) => setNewCamera((c) => ({ ...c, onvif_username: e.target.value }))}
+                  />
+                </FormField>
+                <FormField label="ONVIF password">
+                  <Input
+                    type="password"
+                    placeholder="••••••••"
+                    value={newCamera.onvif_password}
+                    onChange={(e) => setNewCamera((c) => ({ ...c, onvif_password: e.target.value }))}
+                  />
+                </FormField>
+                <FormField label="ONVIF profile token" hint="From Discovery page">
+                  <Input
+                    placeholder="Profile_1"
+                    value={newCamera.onvif_profile}
+                    onChange={(e) => setNewCamera((c) => ({ ...c, onvif_profile: e.target.value }))}
+                  />
+                </FormField>
+              </div>
+            </FormSection>
+          )}
         </div>
-      </div>
+      </FormModal>
+
+      <CollapsibleToolbar title="Camera Filters" summary="Filter controls are collapsed by default.">
+        <input
+          title="Filter cameras by id, name, location, type, or source."
+          placeholder="Filter cameras"
+          value={tableSearch}
+          onChange={(e) => setTableSearch(e.target.value)}
+        />
+        <select title="Filter cameras by source type." value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
+          <option value="all">All types</option>
+          <option value="rtsp">RTSP</option>
+          <option value="http_mjpeg">HTTP MJPEG</option>
+          <option value="webcam">Webcam</option>
+          <option value="browser">Browser</option>
+          <option value="upload">Upload</option>
+        </select>
+      </CollapsibleToolbar>
 
       {/* ── Camera list ───────────────────────────────────────────────────── */}
       <div className="panel glass">
-        <div className="panel-head"><h3>Camera Control  ({rows.length})</h3></div>
+        <div className="panel-head">
+          <h3>Camera Control  ({sortedRows.length})</h3>
+        </div>
         <div className="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>ID</th>
-                <th>Name / Location</th>
-                <th>Type</th>
+                <th><SortableHeader label="ID" sortKey="id" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Name / Location" sortKey="name" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Type" sortKey="type" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
                 <th>Source</th>
-                <th>Enabled</th>
-                <th>Live</th>
-                <th>Detector</th>
+                <th><SortableHeader label="Enabled" sortKey="enabled" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Live" sortKey="live_view" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Detector" sortKey="detector_mode" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
                 <th>Status</th>
                 <th>Save Clip</th>
                 <th>Preview</th>
@@ -752,7 +833,7 @@ export default function CamerasPage() {
               </tr>
             </thead>
             <tbody>
-              {rows.map((cam) => (
+              {pagedRows.map((cam) => (
                 <CameraRow
                   key={cam.id}
                   cam={cam}
@@ -764,40 +845,31 @@ export default function CamerasPage() {
                   onDelete={() => removeCamera(cam.id)}
                 />
               ))}
-              {!rows.length && (
-                <tr><td colSpan={11} className="empty">No cameras yet. Add one above.</td></tr>
+              {!sortedRows.length && (
+                <tr><td colSpan={11} className="empty">No cameras match the current filters.</td></tr>
               )}
             </tbody>
           </table>
         </div>
+        <TablePagination
+          page={page}
+          totalPages={totalPages}
+          totalItems={sortedRows.length}
+          pageSize={pageSize}
+          currentCount={pagedRows.length}
+          itemLabel="cameras"
+          onPageChange={setPage}
+          onPageSizeChange={setPageSize}
+        />
       </div>
 
-      {/* ── Quick-reference: common RTSP URL patterns ───────────────────── */}
-      <div className="panel glass stack">
-        <div className="panel-head"><h3>Common RTSP URL Patterns</h3></div>
-        <div className="tiny muted" style={{ lineHeight: 1.8 }}>
-          <table style={{ width: '100%', fontSize: '0.82em' }}>
-            <thead><tr><th style={{textAlign:'left'}}>Brand</th><th style={{textAlign:'left'}}>Main stream URL pattern</th></tr></thead>
-            <tbody>
-              <tr><td>Hikvision / most DVRs</td><td><code>rtsp://user:pass@IP:554/Streaming/Channels/101</code></td></tr>
-              <tr><td>Hikvision sub-stream</td><td><code>rtsp://user:pass@IP:554/Streaming/Channels/102</code></td></tr>
-              <tr><td>Dahua</td><td><code>rtsp://user:pass@IP:554/cam/realmonitor?channel=1&amp;subtype=0</code></td></tr>
-              <tr><td>Reolink</td><td><code>rtsp://user:pass@IP:554//h264Preview_01_main</code></td></tr>
-              <tr><td>Axis</td><td><code>rtsp://user:pass@IP/axis-media/media.amp</code></td></tr>
-              <tr><td>Amcrest / Annke</td><td><code>rtsp://user:pass@IP:554/cam/realmonitor?channel=1&amp;subtype=0</code></td></tr>
-              <tr><td>Generic / unknown</td><td>Use ONVIF Discovery page → Resolve RTSP to get exact URL</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
     </div>
   );
 }
 
 // ── Single camera table row ──────────────────────────────────────────────────
 function CameraRow({ cam, token, saving, healthBadge, onPatch, onDelete }) {
-  const [showONVIF, setShowONVIF] = useState(false);
-  const [editing, setEditing] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
   const [draft, setDraft] = useState(() => toCameraDraft(cam));
   const secureCaptureUrl = toSecureCaptureUrl(cam.capture_url);
 
@@ -808,13 +880,12 @@ function CameraRow({ cam, token, saving, healthBadge, onPatch, onDelete }) {
   async function saveEdit() {
     const payload = buildCameraPatchPayload(draft);
     await onPatch(payload);
-    setEditing(false);
-    setShowONVIF(false);
+    setEditOpen(false);
   }
 
   function cancelEdit() {
     setDraft(toCameraDraft(cam));
-    setEditing(false);
+    setEditOpen(false);
   }
 
   return (
@@ -822,121 +893,54 @@ function CameraRow({ cam, token, saving, healthBadge, onPatch, onDelete }) {
       <tr>
         <td className="mono">{cam.id}</td>
         <td>
-          {editing ? (
-            <div className="stack" style={{ gap: 6 }}>
-              <input
-                value={draft.name}
-                onChange={(e) => setDraft((s) => ({ ...s, name: e.target.value }))}
-                placeholder="Camera name"
-              />
-              <input
-                value={draft.location}
-                onChange={(e) => setDraft((s) => ({ ...s, location: e.target.value }))}
-                placeholder="Location"
-              />
-            </div>
-          ) : (
-            <>
-              <div>{cam.name}</div>
-              {cam.location && <div className="tiny muted">{cam.location}</div>}
-            </>
-          )}
+          <>
+            <div>{cam.name}</div>
+            {cam.location && <div className="tiny muted">{cam.location}</div>}
+            {cam.model && <div className="tiny muted">{cam.model}</div>}
+          </>
         </td>
-        <td className="tiny">
-          {editing ? (
-            <select value={draft.type} onChange={(e) => setDraft((s) => ({ ...s, type: e.target.value }))}>
-              <option value="rtsp">rtsp</option>
-              <option value="http_mjpeg">http_mjpeg</option>
-              <option value="webcam">webcam</option>
-              <option value="browser">browser</option>
-              <option value="upload">upload</option>
-            </select>
-          ) : (
-            cam.type
-          )}
-        </td>
+        <td className="tiny">{cam.type}</td>
         <td className="tiny mono" style={{ maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-          title={editing ? draft.source : cam.source}>
-          {editing ? (
-            <input
-              value={draft.source}
-              onChange={(e) => setDraft((s) => ({ ...s, source: e.target.value }))}
-              placeholder={draft.type === 'browser' ? 'browser (optional)' : 'Camera source'}
-            />
-          ) : (
-            cam.source
-          )}
+          title={cam.source}>
+          {cam.source}
         </td>
         <td>
-          {editing ? (
-            <input
-              type="checkbox"
-              checked={draft.enabled}
-              onChange={(e) => setDraft((s) => ({ ...s, enabled: e.target.checked }))}
-            />
-          ) : (
-            <input
-              type="checkbox"
-              checked={cam.enabled}
-              disabled={saving}
-              title="Enable or disable this camera."
-              onChange={(e) => onPatch({ enabled: e.target.checked })}
-            />
-          )}
+          <input
+            type="checkbox"
+            checked={cam.enabled}
+            disabled={saving}
+            title="Enable or disable this camera."
+            onChange={(e) => onPatch({ enabled: e.target.checked })}
+          />
         </td>
         <td>
-          {editing ? (
-            <input
-              type="checkbox"
-              checked={draft.live_view}
-              onChange={(e) => setDraft((s) => ({ ...s, live_view: e.target.checked }))}
-            />
-          ) : (
-            <input
-              type="checkbox"
-              checked={cam.live_view}
-              disabled={saving}
-              title="Show in Live DVR grid."
-              onChange={(e) => onPatch({ live_view: e.target.checked })}
-            />
-          )}
+          <input
+            type="checkbox"
+            checked={cam.live_view}
+            disabled={saving}
+            title="Show in Live DVR grid."
+            onChange={(e) => onPatch({ live_view: e.target.checked })}
+          />
         </td>
         <td>
-          {editing ? (
-            <select
-              value={draft.detector_mode}
-              onChange={(e) => setDraft((s) => ({ ...s, detector_mode: e.target.value }))}
-            >
-              <DetectorModeOptions />
-            </select>
-          ) : (
-            <select
-              value={cam.detector_mode}
-              disabled={saving}
-              title="Per-camera detection mode."
-              onChange={(e) => onPatch({ detector_mode: e.target.value })}
-            >
-              <DetectorModeOptions />
-            </select>
-          )}
+          <select
+            value={cam.detector_mode}
+            disabled={saving}
+            title="Per-camera detection mode."
+            onChange={(e) => onPatch({ detector_mode: e.target.value })}
+          >
+            <DetectorModeOptions />
+          </select>
         </td>
         <td>{healthBadge}</td>
         <td>
-          {editing ? (
-            <input
-              type="checkbox"
-              checked={!!draft.save_clip}
-              onChange={(e) => setDraft((s) => ({ ...s, save_clip: e.target.checked }))}
-            />
-          ) : (
-            <input
-              type="checkbox"
-              checked={!!cam.save_clip}
-              disabled={saving}
-              title="Enable manual MP4 recording from Live view."
-              onChange={(e) => onPatch({ save_clip: e.target.checked, clip_seconds: 0 })}
-            />
-          )}
+          <input
+            type="checkbox"
+            checked={!!cam.save_clip}
+            disabled={saving}
+            title="Enable manual MP4 recording from Live view."
+            onChange={(e) => onPatch({ save_clip: e.target.checked, clip_seconds: 0 })}
+          />
         </td>
         <td>
           {cam.enabled ? (
@@ -954,30 +958,14 @@ function CameraRow({ cam, token, saving, healthBadge, onPatch, onDelete }) {
         </td>
         <td>
           <div className="row" style={{ gap: 4 }}>
-            {editing ? (
-              <>
-                <button
-                  className="btn primary"
-                  disabled={saving}
-                  onClick={() => saveEdit().catch(() => {})}
-                  title="Save camera updates."
-                >
-                  <Save size={13} /> Save
-                </button>
-                <button className="btn ghost" disabled={saving} onClick={cancelEdit} title="Cancel edit mode.">
-                  Cancel
-                </button>
-              </>
-            ) : (
-              <button
-                className="btn ghost"
-                disabled={saving}
-                onClick={() => { setEditing(true); setShowONVIF(true); }}
-                title="Edit camera settings."
-              >
-                Edit
-              </button>
-            )}
+            <button
+              className="btn ghost"
+              disabled={saving}
+              onClick={() => setEditOpen(true)}
+              title="Edit camera settings."
+            >
+              Edit
+            </button>
             <a
               className="btn"
               href={apiPath(`${cam.stream_url}${cam.stream_url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`)}
@@ -993,11 +981,6 @@ function CameraRow({ cam, token, saving, healthBadge, onPatch, onDelete }) {
             {cam.capture_url && secureCaptureUrl && secureCaptureUrl !== cam.capture_url
               ? <a className="btn primary" href={secureCaptureUrl} target="_blank" rel="noreferrer" title="Open secure browser-camera capture page (HTTPS)."><Play size={13} /> Secure</a>
               : null}
-            {(cam.onvif_xaddr || editing)
-              ? <button className="btn ghost" title="Toggle ONVIF settings." onClick={() => setShowONVIF((s) => !s)}>
-                  {showONVIF ? <ChevronUp size={13} /> : <ChevronDown size={13} />} ONVIF
-                </button>
-              : null}
             <button
               className="btn ghost"
               title="Delete this camera."
@@ -1009,82 +992,154 @@ function CameraRow({ cam, token, saving, healthBadge, onPatch, onDelete }) {
           </div>
         </td>
       </tr>
-      {showONVIF && (
-        <tr>
-          <td colSpan={11}>
-            <div className="stack" style={{ background: 'rgba(0,0,0,.15)', borderRadius: 6, padding: 10, gap: 6 }}>
-              <strong className="tiny">ONVIF Settings for camera {cam.id}</strong>
-              {editing ? (
-                <div className="row two">
-                  <input
-                    placeholder="ONVIF xAddr"
-                    value={draft.onvif_xaddr}
-                    onChange={(e) => setDraft((s) => ({ ...s, onvif_xaddr: e.target.value }))}
-                  />
-                  <input
-                    placeholder="ONVIF profile token"
-                    value={draft.onvif_profile}
-                    onChange={(e) => setDraft((s) => ({ ...s, onvif_profile: e.target.value }))}
-                  />
-                  <input
-                    placeholder="ONVIF username"
-                    value={draft.onvif_username}
-                    onChange={(e) => setDraft((s) => ({ ...s, onvif_username: e.target.value }))}
-                  />
-                  <input
-                    placeholder="ONVIF password (leave blank to keep existing)"
-                    type="password"
-                    value={draft.onvif_password}
-                    onChange={(e) => setDraft((s) => ({ ...s, onvif_password: e.target.value }))}
-                  />
-                </div>
-              ) : (
-                <>
-                  <div className="row two">
-                    <div>
-                      <label className="tiny muted">xAddr</label>
-                      <code className="tiny mono">{cam.onvif_xaddr || '—'}</code>
-                    </div>
-                    <div>
-                      <label className="tiny muted">Profile</label>
-                      <code className="tiny mono">{cam.onvif_profile || '—'}</code>
-                    </div>
-                  </div>
-                  <div className="tiny muted">Use Edit mode to update ONVIF credentials and profile.</div>
-                </>
-              )}
-              {editing ? (
-                <div className="row two">
-                  <input
-                    type="number"
-                    min={1}
-                    step={0.1}
-                    placeholder="Scan interval (s)"
-                    value={draft.scan_interval}
-                    onChange={(e) => setDraft((s) => ({ ...s, scan_interval: Number(e.target.value) || 1 }))}
-                  />
-                  <input
-                    type="number"
-                    min={0}
-                    step={0.1}
-                    placeholder="Cooldown (s)"
-                    value={draft.cooldown_seconds}
-                    onChange={(e) => setDraft((s) => ({ ...s, cooldown_seconds: Number(e.target.value) || 0 }))}
-                  />
-                  <input
-                    type="number"
-                    min={0}
-                    step={1}
-                    placeholder="Live order"
-                    value={draft.live_order}
-                    onChange={(e) => setDraft((s) => ({ ...s, live_order: Number(e.target.value) || 0 }))}
-                  />
-                </div>
-              ) : null}
+      <FormModal
+        open={editOpen}
+        onClose={cancelEdit}
+        title={`Edit Camera #${cam.id}`}
+        subtitle="Update camera settings in a dedicated modal"
+        size="xl"
+        submitLabel="Save Changes"
+        onSubmitClick={() => saveEdit().catch(() => {})}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+          <FormSection title="Identity">
+            <div className="ds-grid-2">
+              <FormField label="Name" required>
+                <Input
+                  placeholder="Camera name"
+                  value={draft.name}
+                  onChange={(e) => setDraft((s) => ({ ...s, name: e.target.value }))}
+                />
+              </FormField>
+              <FormField label="Type">
+                <Select value={draft.type} onChange={(e) => setDraft((s) => ({ ...s, type: e.target.value }))}>
+                  <option value="rtsp">RTSP</option>
+                  <option value="http_mjpeg">HTTP MJPEG</option>
+                  <option value="webcam">Webcam</option>
+                  <option value="browser">Browser</option>
+                  <option value="upload">Upload</option>
+                </Select>
+              </FormField>
+              <FormField label="Location">
+                <Input
+                  placeholder="Location"
+                  value={draft.location}
+                  onChange={(e) => setDraft((s) => ({ ...s, location: e.target.value }))}
+                />
+              </FormField>
+              <FormField label="Model">
+                <Input
+                  placeholder="Camera model"
+                  value={draft.model || ''}
+                  onChange={(e) => setDraft((s) => ({ ...s, model: e.target.value }))}
+                />
+              </FormField>
+              <FormField label="Detector mode">
+                <Select
+                  value={draft.detector_mode}
+                  onChange={(e) => setDraft((s) => ({ ...s, detector_mode: e.target.value }))}
+                >
+                  <DetectorModeOptions />
+                </Select>
+              </FormField>
+              <FormField label="Source">
+                <Input
+                  placeholder={draft.type === 'browser' ? 'browser (optional)' : 'Camera source'}
+                  value={draft.source}
+                  onChange={(e) => setDraft((s) => ({ ...s, source: e.target.value }))}
+                />
+              </FormField>
             </div>
-          </td>
-        </tr>
-      )}
+          </FormSection>
+
+          <FormSection title="Flags">
+            <div className="ds-grid-2">
+              <FormField label="Enabled">
+                <Checkbox
+                  checked={draft.enabled}
+                  onCheckedChange={(checked) => setDraft((s) => ({ ...s, enabled: Boolean(checked) }))}
+                  label="Camera is active"
+                />
+              </FormField>
+              <FormField label="Live view">
+                <Checkbox
+                  checked={draft.live_view}
+                  onCheckedChange={(checked) => setDraft((s) => ({ ...s, live_view: Boolean(checked) }))}
+                  label="Show in Live DVR"
+                />
+              </FormField>
+              <FormField label="Save clip">
+                <Checkbox
+                  checked={!!draft.save_clip}
+                  onCheckedChange={(checked) => setDraft((s) => ({ ...s, save_clip: Boolean(checked) }))}
+                  label="Enable manual clip recording"
+                />
+              </FormField>
+              <FormField label="Live order">
+                <Input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={draft.live_order}
+                  onChange={(e) => setDraft((s) => ({ ...s, live_order: Number(e.target.value) || 0 }))}
+                />
+              </FormField>
+              <FormField label="Scan interval (s)">
+                <Input
+                  type="number"
+                  min={0.1}
+                  step={0.1}
+                  value={draft.scan_interval}
+                  onChange={(e) => setDraft((s) => ({ ...s, scan_interval: Number(e.target.value) || 1 }))}
+                />
+              </FormField>
+              <FormField label="Cooldown (s)">
+                <Input
+                  type="number"
+                  min={0}
+                  step={0.1}
+                  value={draft.cooldown_seconds}
+                  onChange={(e) => setDraft((s) => ({ ...s, cooldown_seconds: Number(e.target.value) || 0 }))}
+                />
+              </FormField>
+            </div>
+          </FormSection>
+
+          <FormSection title="ONVIF">
+            <div className="ds-grid-2">
+              <FormField label="ONVIF xAddr">
+                <Input
+                  placeholder="http://camera/onvif/device_service"
+                  value={draft.onvif_xaddr}
+                  onChange={(e) => setDraft((s) => ({ ...s, onvif_xaddr: e.target.value }))}
+                />
+              </FormField>
+              <FormField label="ONVIF profile token">
+                <Input
+                  placeholder="Profile_1"
+                  value={draft.onvif_profile}
+                  onChange={(e) => setDraft((s) => ({ ...s, onvif_profile: e.target.value }))}
+                />
+              </FormField>
+              <FormField label="ONVIF username">
+                <Input
+                  placeholder="Username"
+                  value={draft.onvif_username}
+                  onChange={(e) => setDraft((s) => ({ ...s, onvif_username: e.target.value }))}
+                />
+              </FormField>
+              <FormField label="ONVIF password" hint="Leave blank to keep existing password">
+                <Input
+                  type="password"
+                  placeholder="••••••••"
+                  value={draft.onvif_password}
+                  onChange={(e) => setDraft((s) => ({ ...s, onvif_password: e.target.value }))}
+                />
+              </FormField>
+            </div>
+          </FormSection>
+        </div>
+      </FormModal>
     </>
   );
 }

@@ -24,6 +24,7 @@ class ApiCameraPatchBody(BaseModel):
     type: Optional[str] = None
     source: Optional[str] = None
     location: Optional[str] = None
+    model: Optional[str] = None
     enabled: Optional[bool] = None
     live_view: Optional[bool] = None
     live_order: Optional[int] = None
@@ -47,6 +48,7 @@ class ApiCameraCreateBody(BaseModel):
     type: str
     source: str
     location: Optional[str] = None
+    model: Optional[str] = None
     enabled: bool = True
     scan_interval: float = 1.0
     cooldown_seconds: float = 10.0

@@ -3,6 +3,9 @@ import { FlaskConical, Save, UploadCloud, Trash2, Ban, Boxes, RefreshCcw, Square
 import { request, apiPath, mediaPath } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
 import { Link, useSearchParams } from 'react-router-dom';
+import CollapsibleToolbar from '../components/admin/CollapsibleToolbar';
+import TablePagination from '../components/admin/TablePagination';
+import SortableHeader from '../components/admin/SortableHeader';
 
 const statusTabs = ['all', 'annotated', 'pending', 'negative', 'unclear', 'ignored'];
 const MIN_ANNOTATION_ZOOM = 1;
@@ -61,6 +64,11 @@ export default function TrainingDataPage() {
   const stageRef = useRef(null);
   const batchFilter = searchParams.get('batch') || '';
   const previousTrainingStatusRef = useRef('idle');
+
+  function requestSort(nextKey) {
+    setSortDir((currentDir) => (sortBy === nextKey ? (currentDir === 'asc' ? 'desc' : 'asc') : 'desc'));
+    setSortBy(nextKey);
+  }
 
   useEffect(() => {
     const qSampleId = Number(searchParams.get('sample_id') || 0);
@@ -632,27 +640,6 @@ export default function TrainingDataPage() {
     );
   }, [selected, form]);
 
-  const trainingLogs = useMemo(() => {
-    const logs = trainingStatus?.details?.logs;
-    return Array.isArray(logs) ? logs.slice().reverse().slice(0, 12) : [];
-  }, [trainingStatus]);
-
-  const backendState = trainingStatus?.details?.backend || {};
-  const isTrainingActive = ['queued', 'running'].includes(trainingStatus?.status || '');
-  const isStopping = (trainingStatus?.stage || '') === 'stopping' || (trainingStatus?.status || '') === 'stopping';
-  const canStartTraining = !isTrainingActive && !isStopping;
-  const canStopTraining = isTrainingActive || isStopping;
-  const canResumeTraining = ['stopped', 'queued'].includes(trainingStatus?.status || '') && !isTrainingActive;
-  const trainingProgress = Math.max(0, Math.min(100, Number(trainingStatus?.progress || 0)));
-  const trainingElapsedSeconds = backendState?.elapsed_seconds || 0;
-  const trainingMeta = [
-    trainingStatus?.stage ? `Stage: ${trainingStatus.stage}` : null,
-    trainingStatus?.chunk_total ? `Chunk ${trainingStatus.chunk_index || 0}/${trainingStatus.chunk_total}` : null,
-    trainingStatus?.total_samples ? `Samples ${trainingStatus.trained_samples || 0}/${trainingStatus.total_samples}` : null,
-    trainingStatus?.ocr_scanned ? `OCR scanned ${trainingStatus.ocr_scanned}` : null,
-    trainingStatus?.ocr_updated ? `OCR updated ${trainingStatus.ocr_updated}` : null,
-  ].filter(Boolean).join(' • ');
-
   function adjustBbox(deltaX = 0, deltaY = 0, deltaW = 0, deltaH = 0) {
     if (form.no_plate) return;
     setForm((prev) => {
@@ -675,81 +662,7 @@ export default function TrainingDataPage() {
       {error ? <div className="alert error">{error}</div> : null}
       {toast ? <div className="alert success">{toast}</div> : null}
 
-      <div className="panel glass training-hero">
-        <div className="row between">
-          <div className="stack" style={{ flex: 1 }}>
-            <div className="row">
-              <span className={`status-pill ${trainingStatus.status}`}>{trainingStatus.status}</span>
-              <span className="tag muted">{trainingStatus.stage || 'idle'}</span>
-              {trainingStatus?.id ? <span className="tag muted mono">job {trainingStatus.id}</span> : null}
-            </div>
-            <div className="muted">{trainingStatus.message}</div>
-            <div className="training-progress">
-              <div className={`training-progress-fill ${isTrainingActive ? 'running' : ''}`} style={{ width: `${trainingProgress}%` }} />
-            </div>
-            <div className="training-progress-label">
-              <span>{trainingProgress}%</span>
-              <span>{trainingMeta || 'Waiting for backend activity'}</span>
-            </div>
-          </div>
-          <div className="row">
-            <button className="btn" onClick={exportYolo}><Boxes size={15} /> Export YOLO</button>
-            <button className="btn primary" onClick={startTraining} disabled={!canStartTraining || Boolean(trainingBusy)}>
-              <FlaskConical size={15} className={trainingBusy === 'start' ? 'spin' : ''} /> {trainingBusy === 'start' ? 'Starting...' : 'Start Training'}
-            </button>
-            <button className="btn ghost" onClick={resumeTraining} disabled={!canResumeTraining || Boolean(trainingBusy)}>
-              <Play size={15} className={trainingBusy === 'resume' ? 'spin' : ''} /> {trainingBusy === 'resume' ? 'Resuming...' : 'Resume'}
-            </button>
-            <button className="btn ghost" onClick={stopTraining} disabled={!canStopTraining || Boolean(trainingBusy)}>
-              <Square size={15} className={trainingBusy === 'stop' ? 'spin' : ''} /> {trainingBusy === 'stop' || isStopping ? 'Stopping...' : 'Stop'}
-            </button>
-          </div>
-        </div>
-        <div className="training-kpis">
-          <div className="kpi-card">
-            <span className="tiny muted">Samples Trained</span>
-            <strong>{trainingStatus?.trained_samples || 0}</strong>
-          </div>
-          <div className="kpi-card">
-            <span className="tiny muted">Total Samples</span>
-            <strong>{trainingStatus?.total_samples || 0}</strong>
-          </div>
-          <div className="kpi-card">
-            <span className="tiny muted">Chunk Progress</span>
-            <strong>{trainingStatus?.chunk_index || 0}/{trainingStatus?.chunk_total || 0}</strong>
-          </div>
-          <div className="kpi-card">
-            <span className="tiny muted">Backend Activity</span>
-            <strong>{backendState?.activity || trainingStatus?.stage || 'idle'}</strong>
-          </div>
-          <div className="kpi-card">
-            <span className="tiny muted">Worker PID</span>
-            <strong>{backendState?.pid || '-'}</strong>
-          </div>
-          <div className="kpi-card">
-            <span className="tiny muted">Active For</span>
-            <strong>{trainingElapsedSeconds ? `${trainingElapsedSeconds}s` : '-'}</strong>
-          </div>
-        </div>
-        <div className="row wrap">
-          <span className="tag muted"><Activity size={12} /> Backend: {backendState?.activity || 'waiting'}</span>
-          {trainingStatus?.run_dir ? <span className="tag muted mono">run {trainingStatus.run_dir}</span> : null}
-          {trainingStatus?.model_path ? <span className="tag muted mono">model {trainingStatus.model_path}</span> : null}
-          {trainingStatus?.updated_at ? <span className="tag muted">Updated {new Date(trainingStatus.updated_at).toLocaleString()}</span> : null}
-        </div>
-        <div className="training-log">
-          <div className="tiny muted">Recent backend activity</div>
-          <div className="training-log-list">
-            {trainingLogs.length ? trainingLogs.map((line, idx) => (
-              <div key={`${line}-${idx}`} className="tiny mono">{line}</div>
-            )) : (
-              <div className="tiny muted">No backend activity logged yet.</div>
-            )}
-          </div>
-        </div>
-      </div>
-
-      <div className="panel glass toolbar between">
+      <CollapsibleToolbar title="Sample Scope Filters" summary="Top-of-page scope filters are collapsed by default.">
         <div className="row">
           {batchFilter ? (
             <>
@@ -798,9 +711,9 @@ export default function TrainingDataPage() {
             </div>
           )}
         </div>
-      </div>
+      </CollapsibleToolbar>
 
-      <div className="panel glass toolbar between">
+      <CollapsibleToolbar title="Sample Search & Actions" summary="Search, sorting, and upload actions are collapsed by default.">
         <div className="row">
           {statusTabs.map((tab) => (
             <button key={tab} className={`btn ${status === tab ? 'primary' : ''}`} onClick={() => setStatus(tab)}>
@@ -817,18 +730,6 @@ export default function TrainingDataPage() {
             style={{ minWidth: 250 }}
           />
           <button className="btn" onClick={() => loadSamples().catch((err) => setError(err.message))}>Search</button>
-          <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} title="Sort column">
-            <option value="created_at">Sort: Created</option>
-            <option value="updated_at">Sort: Updated</option>
-            <option value="plate_text">Sort: Plate Text</option>
-            <option value="processed_at">Sort: Processed</option>
-            <option value="last_trained_at">Sort: Trained</option>
-            <option value="id">Sort: ID</option>
-          </select>
-          <select value={sortDir} onChange={(e) => setSortDir(e.target.value)} title="Sort direction">
-            <option value="desc">Desc</option>
-            <option value="asc">Asc</option>
-          </select>
           <select value={pageSize} onChange={(e) => setPageSize(Number(e.target.value) || 50)} title="Rows per page">
             <option value={25}>25 / page</option>
             <option value={50}>50 / page</option>
@@ -848,7 +749,7 @@ export default function TrainingDataPage() {
             <RefreshCcw size={14} /> {bulkBusy ? 'Bulk Reprocessing...' : `Bulk Reprocess (${selectedIds.length})`}
           </button>
         </div>
-      </div>
+      </CollapsibleToolbar>
 
       <div className="split two-col">
         <div className="panel glass">
@@ -865,12 +766,12 @@ export default function TrainingDataPage() {
                       title="Select all on current page"
                     />
                   </th>
-                  <th>ID</th>
-                  <th>Plate</th>
+                  <th><SortableHeader label="ID" sortKey="id" activeKey={sortBy} direction={sortDir} onSort={requestSort} /></th>
+                  <th><SortableHeader label="Plate" sortKey="plate_text" activeKey={sortBy} direction={sortDir} onSort={requestSort} /></th>
                   <th>Status</th>
-                  <th>Processed</th>
-                  <th>Trained</th>
-                  <th>Updated</th>
+                  <th><SortableHeader label="Processed" sortKey="processed_at" activeKey={sortBy} direction={sortDir} onSort={requestSort} /></th>
+                  <th><SortableHeader label="Trained" sortKey="last_trained_at" activeKey={sortBy} direction={sortDir} onSort={requestSort} /></th>
+                  <th><SortableHeader label="Updated" sortKey="updated_at" activeKey={sortBy} direction={sortDir} onSort={requestSort} /></th>
                 </tr>
               </thead>
               <tbody>
@@ -898,23 +799,17 @@ export default function TrainingDataPage() {
               </tbody>
             </table>
           </div>
-          <div className="row between" style={{ marginTop: 8 }}>
-            <div className="tiny muted">
-              Page {pagination.page || 1} / {pagination.total_pages || 1} · Total {pagination.total_items || 0}
-            </div>
-            <div className="row">
-              <button className="btn ghost" onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={(pagination.page || 1) <= 1}>
-                Previous
-              </button>
-              <button
-                className="btn ghost"
-                onClick={() => setPage((p) => Math.min((pagination.total_pages || 1), p + 1))}
-                disabled={(pagination.page || 1) >= (pagination.total_pages || 1)}
-              >
-                Next
-              </button>
-            </div>
-          </div>
+          <TablePagination
+            page={pagination.page || 1}
+            totalPages={pagination.total_pages || 1}
+            totalItems={pagination.total_items || 0}
+            pageSize={pageSize}
+            currentCount={samples.length}
+            itemLabel="samples"
+            pageSizeOptions={[25, 50, 100]}
+            onPageChange={setPage}
+            onPageSizeChange={setPageSize}
+          />
         </div>
 
         <div className="panel glass">

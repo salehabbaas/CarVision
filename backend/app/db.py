@@ -44,6 +44,8 @@ def ensure_schema():
                     conn.execute(text("ALTER TABLE cameras ADD COLUMN onvif_password TEXT"))
                 if "onvif_profile" not in columns:
                     conn.execute(text("ALTER TABLE cameras ADD COLUMN onvif_profile TEXT"))
+                if "model" not in columns:
+                    conn.execute(text("ALTER TABLE cameras ADD COLUMN model TEXT"))
                 if "detector_mode" not in columns:
                     conn.execute(text("ALTER TABLE cameras ADD COLUMN detector_mode TEXT DEFAULT 'inherit'"))
                 if "capture_token" not in columns:
@@ -116,6 +118,7 @@ def ensure_schema():
             conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_username VARCHAR(200)"))
             conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_password VARCHAR(200)"))
             conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS onvif_profile VARCHAR(200)"))
+            conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS model VARCHAR(200)"))
             conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS detector_mode VARCHAR(20) DEFAULT 'inherit'"))
             conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS capture_token VARCHAR(200)"))
             conn.execute(text("UPDATE cameras SET live_view = TRUE WHERE live_view IS NULL"))

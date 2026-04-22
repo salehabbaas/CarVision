@@ -9,6 +9,7 @@ import Button       from '../design-system/components/Button';
 import FileDropZone from '../design-system/components/FileDropZone';
 import Alert        from '../design-system/components/Alert';
 import FormSection  from '../design-system/components/FormSection';
+import FormModal    from '../design-system/components/FormModal';
 
 export default function UploadPage() {
   const { token } = useAuth();
@@ -19,6 +20,7 @@ export default function UploadPage() {
   const [jobId, setJobId]               = useState('');
   const [job, setJob]                   = useState(null);
   const [error, setError]               = useState('');
+  const [formOpen, setFormOpen]         = useState(false);
 
   useEffect(() => {
     if (!jobId) return;
@@ -66,6 +68,7 @@ export default function UploadPage() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data?.job_id) throw new Error(data?.detail || 'Failed to start upload job');
       setJobId(data.job_id);
+      setFormOpen(false);
     } catch (err) {
       setError(err.message || 'Upload failed');
     }
@@ -78,67 +81,75 @@ export default function UploadPage() {
     <div className="stack">
       {error && <Alert variant="error" onDismiss={() => setError('')}>{error}</Alert>}
 
-      {/* ── Upload form ────────────────────────────────────────────────── */}
-      <form className="panel glass" onSubmit={startUpload} style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-        <div className="panel-head">
-          <h3 style={{ margin: 0 }}><UploadCloud size={15} style={{ verticalAlign: 'middle', marginRight: 6 }} />Upload & Test Detection</h3>
-          <span className="muted tiny">Run detection on a single image or video clip</span>
+      <div className="panel glass" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
+        <div>
+          <h3 style={{ margin: '0 0 4px' }}>Upload & Test Detection</h3>
+          <span className="muted tiny">Run detection on a single image or video clip.</span>
         </div>
+        <Button type="button" variant="primary" icon={<UploadCloud size={14} />} onClick={() => setFormOpen(true)}>
+          New Upload Test
+        </Button>
+      </div>
 
-        <FormSection title="File">
-          <FileDropZone
-            accept="image/*,video/*"
-            value={file}
-            onChange={setFile}
-            icon={<UploadCloud size={22} />}
-            label="Drop an image or video here, or click to browse"
-            hint="Supported: JPEG, PNG, MP4, AVI, MOV…"
-          />
-        </FormSection>
+      <FormModal
+        open={formOpen}
+        onClose={() => setFormOpen(false)}
+        title="Upload & Test Detection"
+        subtitle="Run detection on a single image or video clip"
+        formId="upload-test-form"
+        submitLabel="Start Detection"
+        submitDisabled={!file}
+      >
+        <form id="upload-test-form" onSubmit={startUpload} style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+          <FormSection title="File">
+            <FileDropZone
+              accept="image/*,video/*"
+              value={file}
+              onChange={setFile}
+              icon={<UploadCloud size={22} />}
+              label="Drop an image or video here, or click to browse"
+              hint="Supported: JPEG, PNG, MP4, AVI, MOV…"
+            />
+          </FormSection>
 
-        <FormSection title="Options">
-          <div className="ds-grid-2">
-            <FormField
-              label="Sample interval (sec)"
-              hint="How often frames are extracted from video"
-            >
-              <Input
-                type="number"
-                step="0.1"
-                min="0.1"
-                value={sampleSeconds}
-                onChange={(e) => setSampleSeconds(e.target.value)}
-              />
-            </FormField>
+          <FormSection title="Options">
+            <div className="ds-grid-2">
+              <FormField
+                label="Sample interval (sec)"
+                hint="How often frames are extracted from video"
+              >
+                <Input
+                  type="number"
+                  step="0.1"
+                  min="0.1"
+                  value={sampleSeconds}
+                  onChange={(e) => setSampleSeconds(e.target.value)}
+                />
+              </FormField>
 
-            <FormField
-              label="Max frames"
-              hint="Cap on total frames processed"
-            >
-              <Input
-                type="number"
-                min="1"
-                max="2000"
-                value={maxFrames}
-                onChange={(e) => setMaxFrames(e.target.value)}
-              />
-            </FormField>
-          </div>
+              <FormField
+                label="Max frames"
+                hint="Cap on total frames processed"
+              >
+                <Input
+                  type="number"
+                  min="1"
+                  max="2000"
+                  value={maxFrames}
+                  onChange={(e) => setMaxFrames(e.target.value)}
+                />
+              </FormField>
+            </div>
 
-          <Checkbox
-            checked={showDebug}
-            onChange={(e) => setShowDebug(e.target.checked)}
-            label="Include debug steps"
-            hint="Attaches intermediate detection images for troubleshooting"
-          />
-        </FormSection>
-
-        <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-          <Button type="submit" variant="primary" icon={<Play size={14} />} disabled={!file}>
-            Start Detection
-          </Button>
-        </div>
-      </form>
+            <Checkbox
+              checked={showDebug}
+              onChange={(e) => setShowDebug(e.target.checked)}
+              label="Include debug steps"
+              hint="Attaches intermediate detection images for troubleshooting"
+            />
+          </FormSection>
+        </form>
+      </FormModal>
 
       {/* ── Job progress ───────────────────────────────────────────────── */}
       <div className="panel glass">

@@ -70,6 +70,9 @@ def apply_camera_patch(cam: Camera, patch: Dict[str, Any]) -> None:
     if "location" in patch and patch.get("location") is not None:
         loc = str(patch.get("location") or "").strip()[:200]
         cam.location = loc if loc else None
+    if "model" in patch and patch.get("model") is not None:
+        model = str(patch.get("model") or "").strip()[:200]
+        cam.model = model if model else None
     if "enabled" in patch and patch.get("enabled") is not None:
         cam.enabled = bool(patch.get("enabled"))
     if "live_view" in patch and patch.get("live_view") is not None:

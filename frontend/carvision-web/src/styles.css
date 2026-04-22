@@ -1,4 +1,41 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Space+Grotesk:wght@400;500;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 :root {
+  --background: 216 45% 6%;
+  --foreground: 210 100% 97%;
+  --card: 219 33% 12%;
+  --card-foreground: 210 100% 97%;
+  --popover: 219 36% 10%;
+  --popover-foreground: 210 100% 97%;
+  --primary: 195 96% 57%;
+  --primary-foreground: 216 45% 8%;
+  --secondary: 208 32% 18%;
+  --secondary-foreground: 210 100% 97%;
+  --muted: 215 27% 18%;
+  --muted-foreground: 213 24% 72%;
+  --accent: 170 84% 53%;
+  --accent-foreground: 216 45% 8%;
+  --destructive: 344 100% 68%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 214 28% 22%;
+  --input: 214 28% 20%;
+  --ring: 195 96% 57%;
+  --success: 162 83% 48%;
+  --warning: 41 100% 64%;
+  --info: 195 96% 57%;
+  --chart-1: 195 96% 57%;
+  --chart-2: 162 83% 48%;
+  --chart-3: 344 100% 68%;
+  --chart-4: 41 100% 64%;
+  --chart-5: 264 87% 73%;
+  --radius-sm: 0.625rem;
+  --radius-md: 1rem;
+  --radius-lg: 1.5rem;
+  --radius-xl: 2rem;
   --bg-0: #070d16;
   --bg-1: #0d1827;
   --glass: rgba(18, 27, 42, 0.65);
@@ -9,6 +46,58 @@
   --bad: #ff5e7e;
   --warn: #ffbf47;
   --accent: #35a2ff;
+}
+
+:root[data-theme='light'] {
+  --background: 210 33% 98%;
+  --foreground: 220 32% 10%;
+  --card: 0 0% 100%;
+  --card-foreground: 220 32% 10%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 220 32% 10%;
+  --primary: 215 72% 20%;
+  --primary-foreground: 210 33% 98%;
+  --secondary: 210 25% 94%;
+  --secondary-foreground: 220 32% 10%;
+  --muted: 210 20% 92%;
+  --muted-foreground: 220 16% 40%;
+  --accent: 195 92% 42%;
+  --accent-foreground: 210 33% 98%;
+  --destructive: 0 72% 48%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 214 22% 84%;
+  --input: 214 24% 90%;
+  --ring: 215 72% 20%;
+  --success: 152 59% 34%;
+  --warning: 32 95% 45%;
+  --info: 195 92% 42%;
+  --chart-1: 215 72% 20%;
+  --chart-2: 195 92% 42%;
+  --chart-3: 152 59% 34%;
+  --chart-4: 32 95% 45%;
+  --chart-5: 266 56% 48%;
+  --bg-0: #f7f9fc;
+  --bg-1: #edf2f8;
+  --glass: rgba(255, 255, 255, 0.82);
+  --glass-border: rgba(15, 23, 42, 0.08);
+  --text: #101826;
+  --ok: #0f9f65;
+  --bad: #d63b5c;
+  --warn: #c97800;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    background:
+      radial-gradient(1200px 900px at -10% -20%, #184a7d55, transparent),
+      radial-gradient(900px 700px at 120% -10%, #1f755e40, transparent),
+      linear-gradient(140deg, var(--bg-0), var(--bg-1));
+  }
 }
 
 * {
@@ -38,6 +127,16 @@ a {
   border: 1px solid var(--glass-border);
   backdrop-filter: blur(16px);
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.25);
+}
+
+.brand-logo-theme {
+  display: block;
+  filter: brightness(0);
+}
+
+:root[data-theme='dark'] .brand-logo-theme,
+.dark .brand-logo-theme {
+  filter: brightness(0) invert(1);
 }
 
 .app-shell {

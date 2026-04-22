@@ -277,6 +277,7 @@ TRAIN_PIPELINE_THREAD: Optional[threading.Thread] = None
 TRAIN_PIPELINE_STOP = threading.Event()
 TRAIN_PIPELINE_PROC_LOCK = threading.Lock()
 TRAIN_PIPELINE_PROC: Optional[subprocess.Popen] = None
+TRAIN_PIPELINE_STALL_TIMEOUT_SECONDS = int(os.getenv("TRAIN_PIPELINE_STALL_TIMEOUT_SECONDS", "1800") or "1800")
 TRAIN_SCHEDULER_LOCK = threading.Lock()
 TRAIN_SCHEDULER_THREAD: Optional[threading.Thread] = None
 TRAIN_SCHEDULER_STOP = threading.Event()
@@ -412,6 +413,12 @@ def _touch_training_job(
         _set_training_status(job.status or "running", job.message, run_dir=job.run_dir, model_path=job.model_path)
     if error is not None:
         job.error = str(error)[:2000]
+    if (job.status or "") in {"complete", "failed", "stopped"}:
+        # Clear ephemeral runtime-only activity details when a run is no longer active.
+        details = dict(job.details or {})
+        if "backend" in details:
+            details.pop("backend", None)
+            job.details = details
     job.updated_at = datetime.utcnow()
     if (job.status or "") in {"complete", "failed", "stopped"} and not job.finished_at:
         job.finished_at = datetime.utcnow()
@@ -708,7 +715,7 @@ def on_startup():
             "contour_approx_eps": "0.018",
             "contour_pad_ratio": "0.15",
             "contour_pad_min": "18",
-            "train_model": "yolov8n.pt",
+            "train_model": "yolo26n.pt",
             "train_epochs": "50",
             "train_imgsz": "640",
             "train_batch": "-1",
@@ -748,6 +755,9 @@ def on_startup():
         for key, value in defaults.items():
             if not db.get(AppSetting, key):
                 db.add(AppSetting(key=key, value=value))
+        train_model_setting = db.get(AppSetting, "train_model")
+        if train_model_setting and str(train_model_setting.value or "").strip() == "yolov8n.pt":
+            train_model_setting.value = "yolo26n.pt"
         # Migrate cameras that still have the old 1.0s scan_interval default
         # to the faster 0.15s value so detection works at real-time speed.
         db.query(Camera).filter(Camera.scan_interval >= 1.0).update(
@@ -2756,7 +2766,7 @@ def _refresh_anpr_config(db: Session) -> None:
 
 def _training_settings_payload(db: Session) -> Dict[str, str]:
     return {
-        "train_model": _get_app_setting(db, "train_model", "yolov8n.pt"),
+        "train_model": _get_app_setting(db, "train_model", "yolo26n.pt"),
         "train_epochs": _get_app_setting(db, "train_epochs", "50"),
         "train_imgsz": _get_app_setting(db, "train_imgsz", "640"),
         "train_batch": _get_app_setting(db, "train_batch", "-1"),
@@ -2783,7 +2793,7 @@ def _training_settings_payload(db: Session) -> Dict[str, str]:
 
 
 def _sanitize_training_settings(payload: Dict[str, object]) -> Dict[str, str]:
-    train_model = str(payload.get("train_model") or "yolov8n.pt").strip() or "yolov8n.pt"
+    train_model = str(payload.get("train_model") or "yolo26n.pt").strip() or "yolo26n.pt"
     train_device = str(payload.get("train_device") or "auto").strip() or "auto"
     plate_region = str(payload.get("plate_region") or "generic").strip()[:80] or "generic"
     plate_charset = str(payload.get("plate_charset") or "alnum").strip().lower()
@@ -2932,7 +2942,7 @@ def _resolve_train_device(requested: str) -> str:
 def _resolve_train_model_source(model_spec: str) -> str:
     spec = str(model_spec or "").strip()
     if not spec:
-        return "yolov8n.pt"
+        return "yolo26n.pt"
     if spec.startswith(("http://", "https://")):
         return spec
     if Path(spec).exists() or spec.endswith(".pt"):
@@ -3131,12 +3141,16 @@ def _train_chunk_with_yolo(
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
         text=True,
         start_new_session=True,
     )
     _set_training_proc(proc)
     started_at = time.time()
+    stall_timeout = max(300, int(TRAIN_PIPELINE_STALL_TIMEOUT_SECONDS or 1800))
+    result_csv = Path(run_root) / str(run_name) / "results.csv"
+    last_progress_at = started_at
+    last_results_mtime = None
     last_beat = 0.0
     try:
         while proc.poll() is None:
@@ -3148,13 +3162,37 @@ def _train_chunk_with_yolo(
                     _stop_training_proc(force=True)
                 raise InterruptedError("Training stop requested by admin")
             now = time.time()
+            if result_csv.exists():
+                try:
+                    mtime = result_csv.stat().st_mtime
+                    if last_results_mtime is None or mtime > float(last_results_mtime):
+                        last_results_mtime = mtime
+                        last_progress_at = now
+                except Exception:
+                    pass
+            if now - last_progress_at >= stall_timeout:
+                _stop_training_proc(force=False)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _stop_training_proc(force=True)
+                raise RuntimeError(
+                    f"Training stalled for {int(now - last_progress_at)}s with no progress updates (chunk watchdog timeout)."
+                )
             if heartbeat and (now - last_beat >= 2.0):
                 heartbeat(proc.pid, int(now - started_at))
                 last_beat = now
             time.sleep(0.25)
-        stderr = (proc.stderr.read() or "").strip() if proc.stderr else ""
         if proc.returncode != 0:
-            summary = _compact_training_error_text(stderr, fallback=f"Training process failed with exit code {proc.returncode}")
+            summary = f"Training process failed with exit code {proc.returncode}"
+            try:
+                if result_path.exists():
+                    payload = json.loads(result_path.read_text(encoding="utf-8"))
+                    err = str(payload.get("error") or "").strip()
+                    if err:
+                        summary = _compact_training_error_text(err, fallback=summary)
+            except Exception:
+                pass
             raise RuntimeError(summary)
         payload = json.loads(result_path.read_text(encoding="utf-8"))
         save_dir = Path(str(payload.get("save_dir") or ""))
@@ -3237,7 +3275,7 @@ def _run_training_pipeline_job(job_id: str) -> None:
         run_root = Path(MEDIA_DIR) / "training_runs"
         run_root.mkdir(parents=True, exist_ok=True)
         job.run_dir = str(run_root)
-        model_name = settings.get("train_model") or "yolov8n.pt"
+        model_name = settings.get("train_model") or "yolo26n.pt"
         try:
             from ultralytics import YOLO  # noqa: F401
         except Exception:
@@ -3679,7 +3717,7 @@ def training_center(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/admin/training/settings")
 def training_settings_update(
-    train_model: str = Form("yolov8n.pt"),
+    train_model: str = Form("yolo26n.pt"),
     train_epochs: int = Form(50),
     train_imgsz: int = Form(640),
     train_batch: int = Form(-1),
@@ -4355,6 +4393,7 @@ def api_v1_cameras(
                 "type": cam.type,
                 "source": cam.source,
                 "location": cam.location,
+                "model": cam.model,
                 "enabled": bool(cam.enabled),
                 "live_view": bool(cam.live_view),
                 "live_order": cam.live_order,
@@ -4399,6 +4438,7 @@ def api_v1_camera_create(
         type=cam_type,
         source=source,
         location=(body.location or "").strip()[:200] if body.location else None,
+        model=(body.model or "").strip()[:200] if body.model else None,
         enabled=bool(body.enabled),
         scan_interval=max(0.1, float(body.scan_interval)),
         cooldown_seconds=max(0.0, float(body.cooldown_seconds)),
@@ -5342,6 +5382,37 @@ def api_v1_training_model_download(
         media_type="application/octet-stream",
         filename=f"carvision_plate_{filename_suffix}.pt",
     )
+
+
+@app.post("/api/v1/training/model/reset")
+def api_v1_training_model_reset(
+    db: Session = Depends(get_db),
+    user: str = Depends(_api_get_current_user),
+):
+    del user
+    active = _active_training_job(db)
+    if active:
+        raise HTTPException(status_code=409, detail="Cannot reset model while training is active")
+
+    model_path = PROJECT_ROOT / "models" / "plate.pt"
+    existed = model_path.exists()
+    if existed:
+        try:
+            model_path.unlink()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to remove existing model: {exc}") from exc
+
+    try:
+        camera_manager.sync()
+    except Exception:
+        logger.warning("camera_manager sync failed after model reset", exc_info=True)
+
+    return {
+        "ok": True,
+        "removed": bool(existed),
+        "path": str(model_path),
+        "message": "Existing trained model removed. Future training will use the configured base model.",
+    }
 
 
 @app.get("/api/v1/training/settings")

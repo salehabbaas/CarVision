@@ -3,6 +3,10 @@ import { RefreshCw, Square, Trash2, ExternalLink } from 'lucide-react';
 import { request, mediaPath } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
 import { LoadingState, ErrorState } from '../components/PageState';
+import CollapsibleToolbar from '../components/admin/CollapsibleToolbar';
+import SortableHeader from '../components/admin/SortableHeader';
+import TablePagination from '../components/admin/TablePagination';
+import { compareTableValues, useTableSorting } from '../hooks/useTableSorting';
 
 export default function ClipsPage() {
   const { token } = useAuth();
@@ -16,9 +20,48 @@ export default function ClipsPage() {
   const [pageLoading, setPageLoading] = useState(true);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
+  const [tableSearch, setTableSearch] = useState('');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
 
   const queryCameraId = useMemo(() => (cameraId === 'all' ? null : Number(cameraId)), [cameraId]);
   const queryKind = useMemo(() => (kind === 'all' ? '' : kind), [kind]);
+
+  const filteredClips = clips.filter((clip) => {
+    const query = tableSearch.trim().toLowerCase();
+    if (!query) return true;
+    return [
+      clip.id,
+      clip.camera_name,
+      clip.camera_id,
+      clip.kind,
+      clip.file_path,
+    ].some((value) => String(value ?? '').toLowerCase().includes(query));
+  });
+
+  const { sortKey, sortDirection, sortedRows, requestSort } = useTableSorting(filteredClips, {
+    initialKey: 'started_at',
+    initialDirection: 'desc',
+    sorters: {
+      id: (a, b) => compareTableValues(a.id, b.id),
+      camera_name: (a, b) => compareTableValues(a.camera_name || a.camera_id, b.camera_name || b.camera_id),
+      kind: (a, b) => compareTableValues(a.kind, b.kind),
+      started_at: (a, b) => compareTableValues(a.started_at, b.started_at),
+      duration_seconds: (a, b) => compareTableValues(a.duration_seconds, b.duration_seconds),
+      detection_count: (a, b) => compareTableValues(a.detection_count, b.detection_count),
+      size_bytes: (a, b) => compareTableValues(a.size_bytes, b.size_bytes),
+    },
+  });
+  const totalPages = Math.max(1, Math.ceil(sortedRows.length / pageSize));
+  const pagedRows = sortedRows.slice((page - 1) * pageSize, page * pageSize);
+
+  useEffect(() => {
+    setPage(1);
+  }, [tableSearch, cameraId, kind]);
+
+  useEffect(() => {
+    setPage((current) => Math.min(current, totalPages));
+  }, [totalPages]);
 
   async function load() {
     setBusy(true);
@@ -87,7 +130,7 @@ export default function ClipsPage() {
   }
 
   function toggleSelectAllShown() {
-    const ids = clips.map((clip) => clip.id);
+    const ids = pagedRows.map((clip) => clip.id);
     const allSelected = ids.length > 0 && ids.every((id) => selectedIds.includes(id));
     if (allSelected) {
       setSelectedIds((prev) => prev.filter((id) => !ids.includes(id)));
@@ -131,8 +174,14 @@ export default function ClipsPage() {
       {error ? <div className="alert error">{error}</div> : null}
       {toast ? <div className="alert success">{toast}</div> : null}
 
-      <div className="panel glass toolbar between">
+      <CollapsibleToolbar title="Clip Filters" summary="Filter and bulk clip actions are collapsed by default.">
         <div className="row">
+          <input
+            title="Filter clips by camera, ID, kind, or file path."
+            placeholder="Filter clips"
+            value={tableSearch}
+            onChange={(e) => setTableSearch(e.target.value)}
+          />
           <select title="Filter clips by camera." value={cameraId} onChange={(e) => setCameraId(e.target.value)}>
             <option value="all">All cameras</option>
             {cameras.map((cam) => (
@@ -153,7 +202,7 @@ export default function ClipsPage() {
             <RefreshCw size={14} /> Refresh
           </button>
         </div>
-      </div>
+      </CollapsibleToolbar>
 
       <div className="panel glass">
         <div className="panel-head">
@@ -183,7 +232,7 @@ export default function ClipsPage() {
       <div className="panel glass">
         <div className="panel-head">
           <h3>Saved Clips</h3>
-          <span className="tiny muted">{clips.length} shown</span>
+          <span className="tiny muted">{sortedRows.length} shown</span>
         </div>
         <div className="table-wrap">
           <table>
@@ -192,24 +241,24 @@ export default function ClipsPage() {
                 <th>
                   <input
                     type="checkbox"
-                    checked={clips.length > 0 && clips.every((clip) => selectedIds.includes(clip.id))}
+                    checked={pagedRows.length > 0 && pagedRows.every((clip) => selectedIds.includes(clip.id))}
                     onChange={toggleSelectAllShown}
                     title="Select all shown clips"
                   />
                 </th>
-                <th>ID</th>
-                <th>Camera</th>
-                <th>Type</th>
+                <th><SortableHeader label="ID" sortKey="id" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Camera" sortKey="camera_name" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Type" sortKey="kind" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
                 <th>Preview</th>
-                <th>Started</th>
-                <th>Duration</th>
-                <th>Detections</th>
-                <th>Size</th>
+                <th><SortableHeader label="Started" sortKey="started_at" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Duration" sortKey="duration_seconds" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Detections" sortKey="detection_count" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
+                <th><SortableHeader label="Size" sortKey="size_bytes" activeKey={sortKey} direction={sortDirection} onSort={requestSort} /></th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {clips.map((clip) => (
+              {pagedRows.map((clip) => (
                 <tr key={clip.id}>
                   <td>
                     <input
@@ -241,10 +290,20 @@ export default function ClipsPage() {
                   </td>
                 </tr>
               ))}
-              {!clips.length ? <tr><td colSpan={10} className="empty">No clips found.</td></tr> : null}
+              {!sortedRows.length ? <tr><td colSpan={10} className="empty">No clips match the current filters.</td></tr> : null}
             </tbody>
           </table>
         </div>
+        <TablePagination
+          page={page}
+          totalPages={totalPages}
+          totalItems={sortedRows.length}
+          pageSize={pageSize}
+          currentCount={pagedRows.length}
+          itemLabel="clips"
+          onPageChange={setPage}
+          onPageSizeChange={setPageSize}
+        />
       </div>
     </div>
   );
