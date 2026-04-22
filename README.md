@@ -231,7 +231,7 @@ CarVision/
 ### Option 1 — Docker Compose *(Recommended)*
 
 ```bash
-git clone https://github.com/salehabbas/CarVision.git
+git clone https://github.com/salehabbaas/CarVision.git
 cd CarVision
 
 # Copy and edit environment file
@@ -354,7 +354,7 @@ See [deploy/k8s/README.md](./deploy/k8s/README.md) for the full guide.
 <tr>
 <td width="65%" valign="top">
 
-**Saleh Abbas** is a software engineer passionate about computer vision, AI systems, and building practical tools that solve real-world problems. CarVision was born from the challenge of bringing enterprise-grade automated gate control to any facility — without the enterprise price tag.
+**Saleh Abbaas** is a software engineer passionate about computer vision, AI systems, and building practical tools that solve real-world problems. CarVision was born from the challenge of bringing enterprise-grade automated gate control to any facility — without the enterprise price tag.
 
 This project was built using modern **AI-agentic workflows**, pairing engineering judgment with:
 - **[Claude Cowork](https://claude.ai)** (Anthropic) — for architectural refactoring, security hardening, and deep code review
@@ -367,7 +367,7 @@ The combination demonstrates how AI agents can elevate what a single engineer sh
 
 📧 [salehabbas123@gmail.com](mailto:salehabbas123@gmail.com)
 
-🐙 [github.com/salehabbas](https://github.com/salehabbaas)
+🐙 [github.com/salehabbaas](https://github.com/salehabbaas)
 
 💼 [LinkedIn](https://linkedin.com/in/salehabbaas)
 
@@ -379,7 +379,7 @@ The combination demonstrates how AI agents can elevate what a single engineer sh
 
 <div align="center">
 
-Built with ❤️ by **[Saleh Abbas](https://github.com/salehabbas)**
+Built with ❤️ by **[Saleh Abbaas](https://github.com/salehabbaas)**
 
 *Powered by AI agents — [Claude Cowork](https://claude.ai) · [Codex](https://openai.com/codex)*
 

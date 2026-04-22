@@ -78,7 +78,7 @@ backend/
 
 ```python
 def create_app() -> FastAPI:
-    application = FastAPI(title="CarVision by Saleh Abbas")
+    application = FastAPI(title="CarVision by Saleh Abbaas")
 
     # Inject shared state into routers
     cameras._init(stream_manager, manual_clip_manager)

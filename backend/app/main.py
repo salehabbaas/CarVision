@@ -431,7 +431,7 @@ def _resume_pipeline_if_needed() -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def create_app() -> FastAPI:
-    application = FastAPI(title="CarVision by Saleh Abbas")
+    application = FastAPI(title="CarVision by Saleh Abbaas")
 
     application.add_middleware(
         CORSMiddleware,
