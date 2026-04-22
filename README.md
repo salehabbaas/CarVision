@@ -367,9 +367,9 @@ The combination demonstrates how AI agents can elevate what a single engineer sh
 
 📧 [salehabbas123@gmail.com](mailto:salehabbas123@gmail.com)
 
-🐙 [github.com/salehabbas](https://github.com/salehabbas)
+🐙 [github.com/salehabbas](https://github.com/salehabbaas)
 
-💼 [LinkedIn](https://linkedin.com/in/salehabbas)
+💼 [LinkedIn](https://linkedin.com/in/salehabbaas)
 
 </td>
 </tr>
