@@ -1,17 +1,25 @@
-# Frontend Layout
+# Frontend
 
-React app path: `frontend`
+React + Vite application for CarVision.
 
-Recommended source structure in `src/`:
+## Path
 
-- `pages/` route-level screens
-- `components/` reusable UI shell and guards
-- `context/` auth/session context
-- `lib/api.js` API client wrapper
+`frontend/`
 
-Build:
+## Common Commands
 
 ```bash
-cd frontend
+cd /Users/salehabbas/Developer/CarVision/frontend
+npm install
+npm run dev
 npm run build
 ```
+
+## Source Layout
+
+- `src/pages/` route-level screens
+- `src/components/` shared UI components
+- `src/design-system/` design system primitives
+- `src/context/` app/session context
+- `src/hooks/` custom hooks
+- `src/lib/` API + shared utilities
