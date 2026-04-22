@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carvision-frontend
+  namespace: carvision
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: carvision-frontend
+  template:
+    metadata:
+      labels:
+        app: carvision-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: ghcr.io/salehabbaas/carvision-frontend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

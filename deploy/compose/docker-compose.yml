@@ -11,7 +11,9 @@ services:
       - db_data:/var/lib/postgresql/data
 
   app:
-    build: .
+    build:
+      context: ../..
+      dockerfile: deploy/docker/backend.Dockerfile
     environment:
       DATABASE_URL: postgresql+psycopg2://carvision:carvision@db:5432/carvision
       MEDIA_DIR: /app/datasets/media
@@ -24,10 +26,10 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./backend/app:/app/backend/app
-      - ./datasets/media:/app/datasets/media
-      - ./models:/app/models
-      - ./certs:/certs:ro
+      - ../../backend/app:/app/backend/app
+      - ../../datasets/media:/app/datasets/media
+      - ../../models:/app/models
+      - ../../certs:/certs:ro
 
 volumes:
   db_data:

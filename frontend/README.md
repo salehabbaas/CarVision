@@ -1,6 +1,6 @@
 # Frontend Layout
 
-React app path: `frontend/carvision-web`
+React app path: `frontend`
 
 Recommended source structure in `src/`:
 
@@ -12,6 +12,6 @@ Recommended source structure in `src/`:
 Build:
 
 ```bash
-cd frontend/carvision-web
+cd frontend
 npm run build
 ```

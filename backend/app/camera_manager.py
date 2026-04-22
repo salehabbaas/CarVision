@@ -40,13 +40,18 @@ class CameraWorker:
             lambda: {"enabled": True, "motion_threshold": 7.0, "hold_seconds": 0.0}
         )
         self._pipeline = PlateInferencePipeline()
-        self._known_cache = []
-        self._known_cache_ts = 0.0
-        self._policy_cache = {"min_len": 5, "max_len": 8}
-        self._policy_cache_ts = 0.0
+        # Thread-safety: all shared mutable state guarded by a single lock.
+        # _known_cache and _policy_cache are read by the detection thread and
+        # refreshed from DB callbacks — concurrent iteration would cause RuntimeError.
+        self._cache_lock = threading.Lock()
+        self._known_cache: list = []
+        self._known_cache_ts: float = 0.0
+        self._policy_cache: dict = {"min_len": 5, "max_len": 8}
+        self._policy_cache_ts: float = 0.0
         self._allowed_stationary_hold: Optional[Dict] = None
         # Frame-motion guard: stores a tiny thumbnail of the last scanned frame
         # to skip re-detection when the stream is frozen or the scene is static.
+        self._thumb_lock = threading.Lock()
         self._last_scan_thumb: Optional[np.ndarray] = None
 
     def start(self):
@@ -96,6 +101,7 @@ class CameraWorker:
         return cap
 
     def _is_allowed(self, plate_text: str) -> bool:
+        """Thread-safe check: is this plate on the allowed list?"""
         with SessionLocal() as db:
             allowed = (
                 db.query(AllowedPlate)
@@ -107,8 +113,10 @@ class CameraWorker:
 
     def _known_plate_candidates(self):
         now = time.time()
-        if self._known_cache and now - self._known_cache_ts < 20:
-            return self._known_cache
+        # Fast path: return snapshot under lock without hitting DB
+        with self._cache_lock:
+            if self._known_cache and now - self._known_cache_ts < 20:
+                return list(self._known_cache)
         with SessionLocal() as db:
             allowed = (
                 db.query(AllowedPlate.plate_text)
@@ -129,22 +137,30 @@ class CameraWorker:
                 max_len = int(max_len_setting.value) if max_len_setting and max_len_setting.value else 8
                 if min_len > max_len:
                     min_len, max_len = max_len, min_len
-                self._policy_cache = {"min_len": max(1, min_len), "max_len": max(1, max_len)}
-                self._policy_cache_ts = now
+                new_policy = {"min_len": max(1, min_len), "max_len": max(1, max_len)}
             except Exception:
-                self._policy_cache = {"min_len": 5, "max_len": 8}
-                self._policy_cache_ts = now
+                new_policy = {"min_len": 5, "max_len": 8}
+
         pool = {str(v[0]).strip().upper() for v in allowed + training if v and v[0]}
-        min_len = int(self._policy_cache.get("min_len", 5))
-        max_len = int(self._policy_cache.get("max_len", 8))
-        self._known_cache = [p for p in pool if min_len <= len(p) <= max_len]
-        self._known_cache_ts = now
-        return self._known_cache
+        min_len = int(new_policy.get("min_len", 5))
+        max_len = int(new_policy.get("max_len", 8))
+        new_cache = [p for p in pool if min_len <= len(p) <= max_len]
+
+        # Atomic swap: write both cache and policy under lock so readers
+        # never see a mismatched cache/policy pair.
+        with self._cache_lock:
+            self._policy_cache = new_policy
+            self._policy_cache_ts = now
+            self._known_cache = new_cache
+            self._known_cache_ts = now
+        return new_cache
 
     def _match_known_plate(self, plate_text: str) -> str:
         normalized = (plate_text or "").strip().upper()
-        min_len = int(self._policy_cache.get("min_len", 5))
-        max_len = int(self._policy_cache.get("max_len", 8))
+        # Read policy snapshot under lock to avoid torn reads from the writer thread
+        with self._cache_lock:
+            min_len = int(self._policy_cache.get("min_len", 5))
+            max_len = int(self._policy_cache.get("max_len", 8))
         if len(normalized) < min_len:
             return normalized
         if len(normalized) > max_len:
@@ -528,12 +544,17 @@ class CameraWorker:
                     cv2.resize(frame, (16, 9), interpolation=cv2.INTER_AREA),
                     cv2.COLOR_BGR2GRAY,
                 )
-                if self._last_scan_thumb is not None:
-                    motion = float(np.mean(cv2.absdiff(thumb, self._last_scan_thumb)))
+                # Guard thumb reads/writes: the main thread may read _last_scan_thumb
+                # for stream previews while the detection thread writes it here.
+                with self._thumb_lock:
+                    last_thumb = self._last_scan_thumb
+                if last_thumb is not None:
+                    motion = float(np.mean(cv2.absdiff(thumb, last_thumb)))
                     if motion < 1.5:
                         time.sleep(0.02)
                         continue
-                self._last_scan_thumb = thumb
+                with self._thumb_lock:
+                    self._last_scan_thumb = thumb
             except Exception:
                 pass  # if thumbnail fails, proceed with detection anyway
 

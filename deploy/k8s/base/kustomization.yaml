@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - pvc-media.yaml
+  - api-deployment.yaml
+  - api-service.yaml
+  - frontend-deployment.yaml
+  - frontend-service.yaml
+  - ingest-worker-deployment.yaml
+  - detection-worker-deployment.yaml
+  - training-worker-deployment.yaml
+  - hpa-api.yaml
+  - hpa-detection.yaml
+  - ingress.yaml

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: carvision-frontend
+  namespace: carvision
+spec:
+  selector:
+    app: carvision-frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: ClusterIP

@@ -17,7 +17,6 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend /app/backend
-COPY old /app/old
 RUN mkdir -p /app/datasets/media
 RUN chmod +x /app/backend/app/start.sh
 

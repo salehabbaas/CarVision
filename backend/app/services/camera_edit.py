@@ -2,6 +2,7 @@ from typing import Any, Dict
 
 from fastapi import HTTPException
 
+from core.crypto import decrypt_field, encrypt_field
 from models import Camera
 
 VALID_CAMERA_TYPES = {"webcam", "rtsp", "http_mjpeg", "browser", "upload"}
@@ -98,7 +99,7 @@ def apply_camera_patch(cam: Camera, patch: Dict[str, Any]) -> None:
         cam.onvif_username = val if val else None
     if "onvif_password" in patch and patch.get("onvif_password") is not None:
         val = str(patch.get("onvif_password") or "").strip()[:200]
-        cam.onvif_password = val if val else None
+        cam.onvif_password = encrypt_field(val) if val else None
     if "onvif_profile" in patch and patch.get("onvif_profile") is not None:
         val = str(patch.get("onvif_profile") or "").strip()[:200]
         cam.onvif_profile = val if val else None

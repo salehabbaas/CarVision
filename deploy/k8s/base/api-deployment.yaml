@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carvision-api
+  namespace: carvision
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: carvision-api
+  template:
+    metadata:
+      labels:
+        app: carvision-api
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/salehabbaas/carvision-backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: carvision-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: carvision-secrets
+                  key: database_url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: carvision-secrets
+                  key: jwt_secret
+            - name: API_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: carvision-secrets
+                  key: api_admin_user
+            - name: API_ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: carvision-secrets
+                  key: api_admin_pass
+            - name: MEDIA_DIR
+              value: /data/media
+          volumeMounts:
+            - name: media
+              mountPath: /data/media
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1500m"
+              memory: "2Gi"
+      volumes:
+        - name: media
+          persistentVolumeClaim:
+            claimName: carvision-media-pvc

@@ -7,11 +7,11 @@ This repo now includes a modern React frontend and JWT-secured Python API on top
   - `backend/app/core/` config
   - `backend/app/api/` request models
   - `backend/app/services/` dataset/state/file helpers
-- Frontend: React + Vite + Framer Motion + Lucide icons (`frontend/carvision-web/`)
+- Frontend: React + Vite + Framer Motion + Lucide icons (`frontend/`)
 - Legacy Python/Jinja frontend: removed
 - Dataset/media storage: `datasets/media/`
 - Database: PostgreSQL
-- Containers: `docker-compose.carvision.yml`
+- Containers: `deploy/compose/docker-compose.carvision.yml`
 
 ## React features now included
 - Dashboard summary + training status
@@ -79,7 +79,7 @@ Additional endpoints:
 1. Copy env file:
    - `cp .env.carvision.example .env`
 2. Build and run:
-   - `docker compose -f docker-compose.carvision.yml up --build`
+   - `docker compose -f deploy/compose/docker-compose.carvision.yml up --build`
 3. Open:
    - Frontend: `http://localhost:8081`
    - Backend API: `http://localhost:8000`
@@ -89,7 +89,7 @@ Additional endpoints:
   - `pip install -r requirements.txt`
   - `cd backend/app && uvicorn main:app --reload --host 0.0.0.0 --port 8000`
 - Frontend:
-  - `cd frontend/carvision-web && npm install && npm run dev`
+  - `cd frontend && npm install && npm run dev`
   - Open `http://localhost:5173`
 
 ## Notes

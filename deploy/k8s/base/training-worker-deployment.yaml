@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carvision-training-worker
+  namespace: carvision
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: carvision-training-worker
+  template:
+    metadata:
+      labels:
+        app: carvision-training-worker
+    spec:
+      containers:
+        - name: training-worker
+          image: ghcr.io/salehabbaas/carvision-backend:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/app/backend/app/workers/training_worker.py"]
+          envFrom:
+            - configMapRef:
+                name: carvision-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: carvision-secrets
+                  key: database_url
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "4000m"
+              memory: "8Gi"

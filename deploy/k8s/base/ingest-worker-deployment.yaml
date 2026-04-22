@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carvision-ingest-worker
+  namespace: carvision
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: carvision-ingest-worker
+  template:
+    metadata:
+      labels:
+        app: carvision-ingest-worker
+    spec:
+      containers:
+        - name: ingest-worker
+          image: ghcr.io/salehabbaas/carvision-backend:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/app/backend/app/workers/ingest_worker.py"]
+          envFrom:
+            - configMapRef:
+                name: carvision-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: carvision-secrets
+                  key: database_url
+          resources:
+            requests:
+              cpu: "150m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"

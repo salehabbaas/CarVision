@@ -7,7 +7,7 @@
 cd CarVision
 
 # 2. Start everything with Docker Compose
-docker compose -f docker-compose.carvision.yml --env-file .env.carvision up -d --build
+docker compose -f deploy/compose/docker-compose.carvision.yml --env-file .env.carvision up -d --build
 
 # 3. Open the web UI
 #    http://localhost:8081      ← frontend
@@ -47,7 +47,7 @@ Edit `.env.carvision` before deploying.  Key variables:
    ```
 3. Rebuild the frontend (which bakes the API URL in at build time):
    ```bash
-   docker compose -f docker-compose.carvision.yml --env-file .env.carvision up -d --build carvision-frontend
+   docker compose -f deploy/compose/docker-compose.carvision.yml --env-file .env.carvision up -d --build carvision-frontend
    ```
 4. Open `http://192.168.1.50:8081` from any device on the network.
    For secure phone camera access, use `https://192.168.1.50:8443`.
@@ -326,10 +326,10 @@ Before exposing CarVision to the internet:
 
 ```bash
 # Start everything
-docker compose -f docker-compose.carvision.yml --env-file .env.carvision up -d --build
+docker compose -f deploy/compose/docker-compose.carvision.yml --env-file .env.carvision up -d --build
 
 # Stop
-docker compose -f docker-compose.carvision.yml down
+docker compose -f deploy/compose/docker-compose.carvision.yml down
 
 # View live backend logs
 docker logs carvision-backend -f
@@ -338,10 +338,10 @@ docker logs carvision-backend -f
 docker logs carvision-frontend -f
 
 # Restart only the backend (after editing Python files)
-docker compose -f docker-compose.carvision.yml restart carvision-backend
+docker compose -f deploy/compose/docker-compose.carvision.yml restart carvision-backend
 
 # Rebuild just the frontend (after editing .env VITE_API_URL)
-docker compose -f docker-compose.carvision.yml up -d --build carvision-frontend
+docker compose -f deploy/compose/docker-compose.carvision.yml up -d --build carvision-frontend
 
 # Open a database shell
 docker exec -it carvision-db psql -U carvision -d carvision

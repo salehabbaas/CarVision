@@ -4,15 +4,17 @@
 
 # 🚗 CarVision
 
-### *Intelligent License Plate Recognition, Built for the Real World*
+### *Intelligent License Plate Recognition & Automated Gate Access*
 
-**See every plate. Log every vehicle. Secure every entry.**
+**See every plate. Verify every vehicle. Open every gate automatically.**
 
-CarVision is a full-stack Automatic Number Plate Recognition (ANPR) system that connects to your cameras, detects vehicles in real time, reads license plates with AI, and gives you a live dashboard to monitor, search, and act on every detection.
+CarVision is a full-stack Automatic Number Plate Recognition (ANPR) system that connects to your cameras, reads license plates in real time with AI, checks them against an allowed-vehicles list, and — **coming soon** — automatically opens a gate or barrier when an authorized vehicle is detected.
+
+> 🚧 **Gate Control (coming soon):** Hardware relay / GPIO output to trigger physical gates, barriers, and boom arms will be added in the next release. The allowlist and detection engine are already fully in place.
 
 <br/>
 
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.136-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-18.3-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev)
 [![YOLOv8](https://img.shields.io/badge/YOLOv8-Detection-7c3aed?style=flat-square&logo=python&logoColor=white)](https://ultralytics.com)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docker.com)
@@ -25,9 +27,11 @@ CarVision is a full-stack Automatic Number Plate Recognition (ANPR) system that 
 
 ## 🌟 What is CarVision?
 
-Imagine plugging in any IP camera — from a Hikvision DVR to a simple USB webcam — and instantly having a system that **watches the feed, spots every car that drives by, reads its license plate, and logs it to a searchable database**. That's CarVision.
+Imagine plugging in any IP camera — from a Hikvision DVR to a simple USB webcam — and instantly having a system that **watches the feed, spots every car that drives by, reads its license plate, cross-checks it against your allowed-vehicles list, and opens a gate automatically**. That's CarVision.
 
-It's built for **security teams**, **parking operators**, **gated communities**, and **smart facilities** that need reliable, real-time vehicle monitoring without the cost of enterprise systems.
+The core purpose is **smart gate access control**: you define which plates are allowed to enter, and CarVision handles the rest — live detection, identity verification, logging, and (coming soon) sending the open signal directly to a physical gate or barrier.
+
+It's built for **gated communities**, **private parking**, **warehouses**, **security checkpoints**, and **smart facilities** that need automated vehicle access control without the cost of enterprise systems.
 
 You connect your cameras, optionally train a custom model on your local plate styles, and get a live multi-camera dashboard with detection history, alerts, and access control — all in one self-hosted package.
 
@@ -82,8 +86,8 @@ Every detected plate is logged with its timestamp, camera source, confidence sco
 ### 🎓 Custom Model Training — In-App
 Upload your own annotated images, draw bounding boxes, label plates, and kick off a training run — entirely within the web UI. Your model, tuned to your location.
 
-### 🔒 Access Control & Alerts
-Maintain an allowed-plates whitelist. Get instant notifications when an unrecognized vehicle is detected. All routes are secured with JWT authentication.
+### 🔒 Access Control & Gate Trigger
+Maintain an allowed-plates whitelist. When an authorized plate is detected, CarVision logs the entry and — **coming soon** — fires a relay/GPIO signal to open a physical gate or barrier. Unrecognized vehicles trigger instant notifications. All routes are secured with JWT authentication.
 
 ### 📷 Broad Camera Support
 | Protocol | Examples |
@@ -134,7 +138,7 @@ cp .env.example .env
 
 ### 3. Launch with Docker
 ```bash
-docker-compose -f docker-compose.carvision.yml up -d
+docker compose -f deploy/compose/docker-compose.carvision.yml up -d
 ```
 
 ### 4. Open the dashboard
@@ -175,7 +179,7 @@ CarVision/
 │           └── tracker.py           # Cross-frame tracking
 │
 ├── ⚛️  frontend/
-│   └── carvision-web/
+│   └── web/
 │       └── src/
 │           ├── pages/               # Route-level screens
 │           ├── components/          # Reusable UI components
@@ -184,11 +188,23 @@ CarVision/
 │           ├── design-system/       # UI component library
 │           └── lib/api.ts           # Typed API client
 │
-├── 🐳 Dockerfile
-├── 🐳 docker-compose.carvision.yml
+├── 🛠️  tools/
+│   ├── viewer.py                    # Standalone OpenCV diagnostics utility
+│   └── README.md                    # Tool usage docs
+│
+├── 🐳 deploy/docker/backend.Dockerfile
+├── 🐳 deploy/compose/docker-compose.carvision.yml
 ├── 📦 requirements.txt
 └── 📖 SETUP.md
 ```
+
+---
+
+## 👨‍💻 About the Creator
+
+**CarVision** was designed and built by **Saleh Abbas** ([@salehabbas](https://github.com/salehabbas) · salehabbas123@gmail.com).
+
+The project started from a real need: reliable, affordable, self-hosted vehicle access control that doesn't require expensive proprietary hardware. The goal is a system you can deploy on a Raspberry Pi or a cloud VM, point at any camera, and have working gate automation in under an hour.
 
 ---
 
@@ -217,10 +233,22 @@ uvicorn main:app --reload --port 8000
 
 ### Frontend
 ```bash
-cd frontend/carvision-web
+cd frontend
 npm install
 npm run dev
 # Runs at http://localhost:5173
+```
+
+## 🧰 Utilities
+
+### Standalone Camera Diagnostic Viewer
+Runs independently of the web server for direct camera debugging.
+
+```bash
+cd /Users/salehabbas/Developer/CarVision
+python tools/viewer.py
+python tools/viewer.py --camera 1
+python tools/viewer.py --source rtsp://user:pass@192.168.1.100/stream
 ```
 
 ---
@@ -238,10 +266,12 @@ npm run dev
 
 <div align="center">
 
-Built with ❤️ using **FastAPI · React · YOLOv8 · EasyOCR**
+Built with ❤️ by **[Saleh Abbas](https://github.com/salehabbas)**
+
+using **FastAPI · React · YOLOv8 · EasyOCR**
 
 and accelerated by **OpenAI Codex** and **Claude Cowork**
 
-*CarVision — Because every vehicle tells a story.*
+*CarVision — See every plate. Open every gate.*
 
 </div>

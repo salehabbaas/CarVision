@@ -1,6 +1,8 @@
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
+from core.crypto import decrypt_field
+
 
 def _get_wsdl_dir():
     try:
@@ -26,7 +28,8 @@ def _create_ptz(camera):
 
     wsdl_dir = _get_wsdl_dir()
     try:
-        cam = ONVIFCamera(host, port, camera.onvif_username or "", camera.onvif_password or "", wsdl_dir=wsdl_dir)
+        raw_password = decrypt_field(camera.onvif_password) or ""
+        cam = ONVIFCamera(host, port, camera.onvif_username or "", raw_password, wsdl_dir=wsdl_dir)
         media = cam.create_media_service()
         profiles = media.GetProfiles()
         if not profiles:

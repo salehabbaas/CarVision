@@ -7,9 +7,9 @@ runs YOLO + OCR detection inline, and displays results with no web/HTTP overhead
 
 Usage:
     cd /path/to/CarVision
-    python viewer.py              # show all enabled cameras
-    python viewer.py --camera 1   # show a specific camera by ID
-    python viewer.py --source rtsp://user:pass@192.168.1.100/stream  # ad-hoc source
+    python tools/viewer.py                    # show all enabled cameras
+    python tools/viewer.py --camera 1         # show a specific camera by ID
+    python tools/viewer.py --source rtsp://user:pass@192.168.1.100/stream  # ad-hoc source
 
 Press  Q  or  ESC  to quit.
 """
@@ -22,7 +22,7 @@ import threading
 from pathlib import Path
 
 # ── Make backend modules importable ──────────────────────────────────────────
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend" / "app"))
 os.chdir(ROOT / "backend" / "app")  # so relative DB path resolves correctly
 

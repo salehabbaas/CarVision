@@ -2,15 +2,18 @@
 # CarVision Deploy Script
 #
 # Usage:
-#   ./deploy.sh          # soft restart (keep volumes)
-#   ./deploy.sh --soft   # same as default
+#   ./deploy/scripts/deploy.sh          # soft restart (keep volumes)
+#   ./deploy/scripts/deploy.sh --soft   # same as default
 
 set -euo pipefail
 
-COMPOSE_FILE="docker-compose.carvision.yml"
-ENV_FILE=".env.carvision"
-VERSION_FILE=".build-version"
-LAST_DEPLOY_FILE=".last-deploy-commit"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+COMPOSE_FILE="${ROOT_DIR}/deploy/compose/docker-compose.carvision.yml"
+ENV_FILE="${ROOT_DIR}/.env.carvision"
+VERSION_FILE="${ROOT_DIR}/.build-version"
+LAST_DEPLOY_FILE="${ROOT_DIR}/.last-deploy-commit"
 
 # ── Parse flags ───────────────────────────────────────────────────────────────
 MODE="soft"
@@ -39,7 +42,7 @@ echo "🔨 Building and starting services..."
 BUILD_LABEL="$BUILD_LABEL" docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build
 
 # ── Save current commit for next run ─────────────────────────────────────────
-git rev-parse HEAD > "$LAST_DEPLOY_FILE" 2>/dev/null || true
+(cd "$ROOT_DIR" && git rev-parse HEAD > "$LAST_DEPLOY_FILE") 2>/dev/null || true
 
 echo ""
 echo "✅ Build ${BUILD_LABEL} deployed [${MODE}]!"

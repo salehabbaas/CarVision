@@ -25,8 +25,8 @@ services:
   # ── FastAPI backend ─────────────────────────────────────────────────────────
   carvision-backend:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: deploy/docker/backend.Dockerfile
     container_name: carvision-backend
     restart: unless-stopped
     depends_on:
@@ -64,12 +64,12 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./backend/app:/app/backend/app
-      - ./datasets/media:/app/datasets/media
-      - ./models:/app/models
-      - ./certs:/certs:ro
+      - ../../backend/app:/app/backend/app
+      - ../../datasets/media:/app/datasets/media
+      - ../../models:/app/models
+      - ../../certs:/certs:ro
       # Entrypoint helper that adds VPN routes before starting the app
-      - ./docker-vpn-routes.sh:/docker-vpn-routes.sh:ro
+      - ../../deploy/scripts/docker-vpn-routes.sh:/docker-vpn-routes.sh:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # Inject VPN routes then hand off to the normal startup command.
@@ -86,7 +86,7 @@ services:
   # ── React frontend served by nginx ─────────────────────────────────────────
   carvision-frontend:
     build:
-      context: ./frontend/carvision-web
+      context: ../../frontend
       dockerfile: Dockerfile
       args:
         # The URL baked into the React bundle that the browser uses to reach
