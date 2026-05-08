@@ -10,6 +10,7 @@ Responsible for:
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import secrets
@@ -29,6 +30,7 @@ import cv2
 import numpy as np
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -218,7 +220,7 @@ def _get_browser_camera_by_token(camera_id: int, token: Optional[str], db: Sessi
     camera = db.get(Camera, camera_id)
     if not camera or camera.type != "browser":
         raise HTTPException(status_code=404, detail="Camera not found")
-    if not token or token != camera.capture_token:
+    if not token or not hmac.compare_digest(token, camera.capture_token or ""):
         raise HTTPException(status_code=403, detail="Invalid capture token")
     return camera
 
@@ -270,42 +272,44 @@ def _run_upload_job(
 
         if is_video:
             cap = cv2.VideoCapture(str(file_path))
-            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            step_frames = max(1, int(fps * float(sample_seconds)))
-            frames_to_process = min(max_frames, max(1, total_frames // step_frames))
-            processed = 0
-            frame_idx = 0
+            try:
+                fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                step_frames = max(1, int(fps * float(sample_seconds)))
+                frames_to_process = min(max_frames, max(1, total_frames // step_frames))
+                processed = 0
+                frame_idx = 0
 
-            while cap.isOpened() and processed < max_frames:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                detection = detect_plate(frame)
-                if detection and detection.get("plate_text"):
-                    plate_text = detection["plate_text"]
-                    from models import AllowedPlate
-                    norm = "".join(ch for ch in plate_text if ch.isalnum()).upper()
-                    allowed_row = local_db.query(AllowedPlate).filter(
-                        AllowedPlate.plate_text == norm, AllowedPlate.active.is_(True)
-                    ).first()
-                    status = "allowed" if allowed_row else "denied"
-                    results.append({
-                        "frame": frame_idx,
-                        "plate_text": plate_text,
-                        "confidence": detection.get("confidence"),
-                        "status": status,
-                        "detector": detection.get("detector"),
-                    })
-                processed += 1
-                frame_idx += step_frames
-                pct = int((processed / max(1, frames_to_process)) * 90)
-                if processed % 5 == 0:
-                    _update_upload_job(job_id, status="running", progress=pct,
-                                       message=f"Analysed {processed} frames, found {len(results)} plates",
-                                       step=f"Frame {frame_idx}/{total_frames}")
-            cap.release()
+                while cap.isOpened() and processed < max_frames:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    detection = detect_plate(frame)
+                    if detection and detection.get("plate_text"):
+                        plate_text = detection["plate_text"]
+                        from models import AllowedPlate
+                        norm = "".join(ch for ch in plate_text if ch.isalnum()).upper()
+                        allowed_row = local_db.query(AllowedPlate).filter(
+                            AllowedPlate.plate_text == norm, AllowedPlate.active.is_(True)
+                        ).first()
+                        status = "allowed" if allowed_row else "denied"
+                        results.append({
+                            "frame": frame_idx,
+                            "plate_text": plate_text,
+                            "confidence": detection.get("confidence"),
+                            "status": status,
+                            "detector": detection.get("detector"),
+                        })
+                    processed += 1
+                    frame_idx += step_frames
+                    pct = int((processed / max(1, frames_to_process)) * 90)
+                    if processed % 5 == 0:
+                        _update_upload_job(job_id, status="running", progress=pct,
+                                           message=f"Analysed {processed} frames, found {len(results)} plates",
+                                           step=f"Frame {frame_idx}/{total_frames}")
+            finally:
+                cap.release()
         else:
             frame = cv2.imread(str(file_path))
             if frame is not None:
@@ -430,9 +434,30 @@ def _resume_pipeline_if_needed() -> None:
 # FastAPI application factory
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Inject security headers on every response."""
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none';",
+        )
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        return response
+
+
 def create_app() -> FastAPI:
     application = FastAPI(title="CarVision by Saleh Abbaas")
 
+    application.add_middleware(_SecurityHeadersMiddleware)
     application.add_middleware(
         CORSMiddleware,
         allow_origins=API_CORS_ORIGINS if API_CORS_ORIGINS else ["*"],
@@ -605,11 +630,15 @@ def _seed_default_settings() -> None:
         setting = db.get(AppSetting, "train_model")
         if setting and str(setting.value or "").strip() == "yolov8n.pt":
             setting.value = "yolo26n.pt"
-        # Speed-up legacy cameras with slow scan_interval
-        from models import Camera as CameraModel
-        db.query(CameraModel).filter(CameraModel.scan_interval >= 1.0).update(
-            {CameraModel.scan_interval: 0.15}, synchronize_session=False
-        )
+        # One-time migration: speed-up legacy cameras with slow scan_interval.
+        # Guarded by a marker so it only runs once and never clobbers intentional
+        # operator overrides on subsequent restarts.
+        if not db.get(AppSetting, "migration_scan_interval_v1_done"):
+            from models import Camera as CameraModel
+            db.query(CameraModel).filter(CameraModel.scan_interval >= 1.0).update(
+                {CameraModel.scan_interval: 0.15}, synchronize_session=False
+            )
+            db.add(AppSetting(key="migration_scan_interval_v1_done", value="1"))
         db.commit()
         _refresh_anpr_config(db)
 

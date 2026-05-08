@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 
 import cv2
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from api.schemas import ApiBulkFeedbackBody, ApiBulkIdsBody
@@ -230,26 +231,85 @@ def list_detections(
 ):
     limit = max(1, min(1000, int(limit)))
     offset = max(0, int(offset))
-    rows = (
+
+    q_norm = (q or "").strip().lower()
+    status_norm = (status or "").strip().lower()
+    feedback_norm = (feedback or "").strip().lower()
+    trained_norm = (trained or "").strip().lower()
+
+    needs_sample_join = bool(feedback_norm or trained_norm)
+
+    qry = (
         db.query(Detection, Camera)
         .join(Camera, Detection.camera_id == Camera.id)
+    )
+
+    if needs_sample_join:
+        qry = qry.outerjoin(TrainingSample, Detection.feedback_sample_id == TrainingSample.id)
+
+    if camera_id:
+        qry = qry.filter(Detection.camera_id == camera_id)
+
+    if status_norm:
+        qry = qry.filter(Detection.status == status_norm)
+
+    if q_norm:
+        qry = qry.filter(
+            or_(
+                Detection.plate_text.ilike(f"%{q_norm}%"),
+                Camera.name.ilike(f"%{q_norm}%"),
+                Camera.location.ilike(f"%{q_norm}%"),
+                Detection.feedback_note.ilike(f"%{q_norm}%"),
+            )
+        )
+
+    if feedback_norm == "annotated":
+        qry = qry.filter(
+            TrainingSample.id.isnot(None),
+            TrainingSample.bbox.isnot(None),
+            TrainingSample.no_plate.is_(False),
+            TrainingSample.ignored.is_(False),
+        )
+    elif feedback_norm == "ignored":
+        qry = qry.filter(
+            TrainingSample.id.isnot(None),
+            TrainingSample.ignored.is_(True),
+        )
+    elif feedback_norm == "pending":
+        qry = qry.filter(
+            or_(
+                Detection.feedback_sample_id.is_(None),
+                and_(
+                    TrainingSample.bbox.is_(None),
+                    TrainingSample.no_plate.is_(False),
+                    TrainingSample.ignored.is_(False),
+                ),
+            )
+        )
+
+    if trained_norm == "trained":
+        qry = qry.filter(TrainingSample.last_trained_at.isnot(None))
+    elif trained_norm == "not_trained":
+        qry = qry.filter(
+            or_(
+                Detection.feedback_sample_id.is_(None),
+                TrainingSample.last_trained_at.is_(None),
+            )
+        )
+
+    rows = (
+        qry
         .order_by(Detection.detected_at.desc(), Detection.id.desc())
-        .limit(limit + offset)
+        .offset(offset)
+        .limit(limit)
         .all()
     )
-    if offset:
-        rows = rows[offset:]
 
     sample_ids = [det.feedback_sample_id for det, _ in rows if det.feedback_sample_id]
     sample_map: Dict[int, TrainingSample] = {}
     if sample_ids:
         samples = db.query(TrainingSample).filter(TrainingSample.id.in_(sample_ids)).all()
         sample_map = {s.id: s for s in samples}
-
-    q_norm = (q or "").strip().lower()
-    status_norm = (status or "").strip().lower()
-    feedback_norm = (feedback or "").strip().lower()
-    trained_norm = (trained or "").strip().lower()
 
     out = []
     changed = False
@@ -261,22 +321,6 @@ def list_detections(
         annotated = bool(sample and sample.bbox and not sample.no_plate and not sample.ignored)
         ignored = bool(sample.ignored) if sample else False
         trained_flag = bool(sample and sample.last_trained_at)
-        feedback_state = "ignored" if ignored else ("annotated" if annotated else "pending")
-
-        if camera_id and cam.id != camera_id:
-            continue
-        if q_norm:
-            hay = f"{det.plate_text or ''} {cam.name or ''} {cam.location or ''} {det.feedback_note or ''}".lower()
-            if q_norm not in hay:
-                continue
-        if status_norm and det.status != status_norm:
-            continue
-        if feedback_norm and feedback_state != feedback_norm:
-            continue
-        if trained_norm == "trained" and not trained_flag:
-            continue
-        if trained_norm == "not_trained" and trained_flag:
-            continue
 
         out.append({
             "id": det.id,

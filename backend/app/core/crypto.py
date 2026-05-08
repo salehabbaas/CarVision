@@ -2,8 +2,14 @@
 core/crypto.py — lightweight symmetric encryption for sensitive fields.
 
 ONVIF passwords are stored encrypted in the database using Fernet (AES-128-CBC
-+ HMAC-SHA256).  The encryption key is derived from JWT_SECRET so no extra
-secret needs to be configured; just set a strong JWT_SECRET in .env.
++ HMAC-SHA256).
+
+Set FIELD_ENCRYPTION_KEY in .env to a 32-byte base64url-encoded key.
+Generate one with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+IMPORTANT: FIELD_ENCRYPTION_KEY is independent of JWT_SECRET. Rotating JWT_SECRET
+(e.g. after a breach) does NOT break stored encrypted passwords. If you rotate
+FIELD_ENCRYPTION_KEY you must re-encrypt all ONVIF passwords in the database.
 
 Usage:
     from core.crypto import encrypt_field, decrypt_field
@@ -32,7 +38,7 @@ def _get_fernet():
     if _fernet is not None:
         return _fernet
     try:
-        from cryptography.fernet import Fernet
+        from cryptography.fernet import Fernet, InvalidToken  # noqa: F401
     except ImportError:
         logger.warning(
             "cryptography package not installed — ONVIF passwords stored as plaintext. "
@@ -40,11 +46,23 @@ def _get_fernet():
         )
         return None
 
-    secret = os.getenv("JWT_SECRET", "carvision-dev-secret")
-    # Derive a 32-byte key from the JWT secret using SHA-256, then base64url-encode
-    # it to produce a valid Fernet key.
-    key_bytes = hashlib.sha256(secret.encode()).digest()
-    fernet_key = base64.urlsafe_b64encode(key_bytes)
+    field_key = os.getenv("FIELD_ENCRYPTION_KEY", "").strip()
+    if field_key:
+        # Use the dedicated encryption key if provided.
+        fernet_key = field_key.encode()
+    else:
+        # Fall back to deriving from JWT_SECRET for backwards-compatibility,
+        # but warn loudly so operators know to set FIELD_ENCRYPTION_KEY.
+        jwt_secret = os.getenv("JWT_SECRET", "carvision-dev-secret")
+        logger.warning(
+            "FIELD_ENCRYPTION_KEY is not set — deriving encryption key from JWT_SECRET. "
+            "Set FIELD_ENCRYPTION_KEY to an independent key so rotating JWT_SECRET does not "
+            "break stored ONVIF passwords. "
+            "Generate one: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+        )
+        key_bytes = hashlib.sha256(jwt_secret.encode()).digest()
+        fernet_key = base64.urlsafe_b64encode(key_bytes)
+
     _fernet = Fernet(fernet_key)
     return _fernet
 

@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import sys
 import threading
 import time
 import os
@@ -48,6 +49,8 @@ class CameraWorker:
         self._known_cache_ts: float = 0.0
         self._policy_cache: dict = {"min_len": 5, "max_len": 8}
         self._policy_cache_ts: float = 0.0
+        self._allowed_cache: set = set()
+        self._allowed_cache_ts: float = 0.0
         self._allowed_stationary_hold: Optional[Dict] = None
         # Frame-motion guard: stores a tiny thumbnail of the last scanned frame
         # to skip re-detection when the stream is frozen or the scene is static.
@@ -101,15 +104,24 @@ class CameraWorker:
         return cap
 
     def _is_allowed(self, plate_text: str) -> bool:
-        """Thread-safe check: is this plate on the allowed list?"""
+        """Thread-safe check: is this plate on the allowed list?
+
+        Caches the full allowed-plate set for 20 seconds to avoid a DB round-
+        trip on every detection event.
+        """
+        now = time.time()
+        with self._cache_lock:
+            if self._allowed_cache and now - self._allowed_cache_ts < 20:
+                return plate_text.upper() in self._allowed_cache
+
         with SessionLocal() as db:
-            allowed = (
-                db.query(AllowedPlate)
-                .filter(AllowedPlate.active.is_(True))
-                .all()
-            )
-            allowed_set = {a.plate_text.upper() for a in allowed}
-        return plate_text.upper() in allowed_set
+            rows = db.query(AllowedPlate.plate_text).filter(AllowedPlate.active.is_(True)).all()
+        fresh: set = {str(r[0]).strip().upper() for r in rows if r and r[0]}
+
+        with self._cache_lock:
+            self._allowed_cache = fresh
+            self._allowed_cache_ts = now
+        return plate_text.upper() in fresh
 
     def _known_plate_candidates(self):
         now = time.time()
@@ -505,7 +517,7 @@ class CameraWorker:
                             webcam_idx = int(self.camera.source)
                         except Exception:
                             webcam_idx = 0
-                        if not Path(f"/dev/video{webcam_idx}").exists():
+                        if sys.platform == "linux" and not Path(f"/dev/video{webcam_idx}").exists():
                             time.sleep(15.0)
                             continue
                     time.sleep(capture_retry_delay)
@@ -611,6 +623,8 @@ class CameraWorker:
             _stream_manager = self._stream_manager
             _cap_ref        = cap if not self._stream_manager else None
 
+            _stop_event_ref = self._stop_event
+
             def _background_io(
                 frame=_frame_copy,
                 detection=_detection_copy,
@@ -621,7 +635,12 @@ class CameraWorker:
                 status=status,
                 allowed=allowed,
                 cap=_cap_ref,
+                stop_event=_stop_event_ref,
             ):
+                # Bail out if the worker was stopped before this task ran to
+                # prevent duplicate detections when a camera is reconfigured.
+                if stop_event.is_set():
+                    return
                 try:
                     # Snapshot
                     image_path = None

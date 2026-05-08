@@ -30,11 +30,9 @@ API_CORS_ORIGINS = [o.strip() for o in os.getenv("API_CORS_ORIGINS", "*").split(
 
 # ── Security warnings on startup ─────────────────────────────────────────────
 def _warn_insecure_defaults() -> None:
-    """Emit loud warnings (and refuse to start in strict mode) when default
-    credentials or secrets are in use.  Set CARVISION_STRICT_SECRETS=1 to
-    make these fatal so CI / production deploys can't accidentally ship with
-    defaults."""
-    strict = os.getenv("CARVISION_STRICT_SECRETS", "0").strip().lower() in {"1", "true", "yes"}
+    """Refuse to start when default credentials or secrets are in use unless
+    CARVISION_STRICT_SECRETS=0 is explicitly set (dev/test override only)."""
+    strict = os.getenv("CARVISION_STRICT_SECRETS", "1").strip().lower() not in {"0", "false", "no"}
     issues = []
 
     if API_JWT_SECRET == _DEFAULT_JWT_SECRET:

@@ -19,6 +19,8 @@ from services.state import (
 
 router = APIRouter(prefix="/api/v1/upload", tags=["upload"])
 
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB
+
 # Populated by main.py app factory
 _run_upload_job_fn = None
 
@@ -43,7 +45,22 @@ async def upload_start(
     filename = f"uploads/{int(time.time())}_{file.filename}"
     file_path = Path(MEDIA_DIR) / filename
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    content = await file.read()
+
+    # Stream into memory with a hard size cap to prevent DoS / disk exhaustion.
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)  # 1 MB at a time
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024*1024)} MB upload limit.",
+            )
+        chunks.append(chunk)
+    content = b"".join(chunks)
     file_path.write_bytes(content)
 
     job_id = _create_upload_job(file.filename or file_path.name)

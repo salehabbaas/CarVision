@@ -7,6 +7,7 @@ import re
 import secrets
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -34,6 +35,23 @@ router = APIRouter(prefix="/api/v1", tags=["cameras"])
 # Populated by main.py app factory after instantiation
 _stream_manager = None
 _manual_clip_manager = None
+
+
+def _assert_host_not_internal(host: str) -> None:
+    """Reject RFC-1918, loopback, link-local, and other non-routable addresses
+    to prevent SSRF via the test_connection endpoint."""
+    try:
+        resolved = socket.getaddrinfo(host, None)[0][4][0]
+        addr = ipaddress.ip_address(resolved)
+    except (socket.gaierror, ValueError):
+        raise HTTPException(status_code=400, detail=f"Cannot resolve host: {host}")
+
+    if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_unspecified:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Host '{host}' resolves to a non-routable address ({resolved}). "
+                   "Only publicly routable hosts are permitted.",
+        )
 
 
 def _init(stream_manager, manual_clip_manager) -> None:
@@ -237,7 +255,7 @@ def stream_health(db: Session = Depends(get_db), _user: str = Depends(get_curren
                 idx = int(cam.source)
             except Exception:
                 idx = 0
-            if not Path(f"/dev/video{idx}").exists():
+            if sys.platform == "linux" and not Path(f"/dev/video{idx}").exists():
                 online = False
                 reason = f"webcam /dev/video{idx} not found"
         elif cam.type == "browser" and not _stream_manager.is_external_online(cam.id):
@@ -261,6 +279,8 @@ def test_connection(body: ApiCameraTestBody, _user: str = Depends(get_current_us
     port = body.port or parsed.port or 554
     if not host:
         raise HTTPException(status_code=400, detail="Cannot determine host from URL")
+
+    _assert_host_not_internal(host)
 
     steps: list = []
 

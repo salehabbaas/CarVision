@@ -344,17 +344,23 @@ def _stop_training_proc(force: bool = False) -> bool:
     if not proc or proc.poll() is not None:
         return False
     try:
+        # Use proc.kill()/terminate() as the primary stop path. Fall back to
+        # killpg only when the process was started with start_new_session=True
+        # so proc.pid equals the process group ID.
         if force:
-            _os.killpg(proc.pid, signal.SIGKILL)
+            proc.kill()
         else:
-            _os.killpg(proc.pid, signal.SIGTERM)
+            proc.terminate()
         return True
     except Exception:
-        try:
-            proc.kill() if force else proc.terminate()
-            return True
-        except Exception:
-            return False
+        pass
+    # Secondary: try the process group (only valid when start_new_session=True).
+    try:
+        pgid = _os.getpgid(proc.pid)
+        _os.killpg(pgid, signal.SIGKILL if force else signal.SIGTERM)
+        return True
+    except Exception:
+        return False
 
 
 def _start_training_pipeline_thread(job_id: str) -> bool:
