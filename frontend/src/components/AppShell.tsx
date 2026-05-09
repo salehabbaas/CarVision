@@ -13,6 +13,7 @@ import {
   Moon,
   Network,
   Radar,
+  Settings2,
   ShieldCheck,
   Sun,
   Upload,
@@ -39,6 +40,7 @@ const menu = [
   { to: "/allowed", label: "Allowed Plates", icon: ListChecks },
   { to: "/discovery", label: "Discovery", icon: Network },
   { to: "/training", label: "Training", icon: BrainCircuit },
+  { to: "/settings", label: "Settings", icon: Settings2 },
 ];
 
 function HorizontalNav({ onNavigate }: { onNavigate?: () => void }) {

@@ -14,13 +14,6 @@ API_JWT_SECRET = os.getenv("JWT_SECRET", _DEFAULT_JWT_SECRET)
 API_JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 API_JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))
 
-# ── Admin credentials ────────────────────────────────────────────────────────
-API_ADMIN_USER = os.getenv("API_ADMIN_USER", os.getenv("ADMIN_USER", "admin"))
-API_ADMIN_PASS = os.getenv("API_ADMIN_PASS", os.getenv("ADMIN_PASS", "admin"))
-
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASS = os.getenv("ADMIN_PASS", "admin")
-
 # ── Public URLs ───────────────────────────────────────────────────────────────
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
 FRONTEND_PUBLIC_BASE_URL = os.getenv("FRONTEND_PUBLIC_BASE_URL", "").strip()
@@ -30,7 +23,7 @@ API_CORS_ORIGINS = [o.strip() for o in os.getenv("API_CORS_ORIGINS", "*").split(
 
 # ── Security warnings on startup ─────────────────────────────────────────────
 def _warn_insecure_defaults() -> None:
-    """Refuse to start when default credentials or secrets are in use unless
+    """Refuse to start when default JWT secrets are in use unless
     CARVISION_STRICT_SECRETS=0 is explicitly set (dev/test override only)."""
     strict = os.getenv("CARVISION_STRICT_SECRETS", "1").strip().lower() not in {"0", "false", "no"}
     issues = []
@@ -39,17 +32,6 @@ def _warn_insecure_defaults() -> None:
         issues.append(
             "JWT_SECRET is using the insecure default 'carvision-dev-secret'. "
             "Set JWT_SECRET to a long random string in your .env file."
-        )
-
-    if ADMIN_PASS in {"admin", "password", "123456", ""}:
-        issues.append(
-            f"ADMIN_PASS is set to a weak default ('{ADMIN_PASS}'). "
-            "Set a strong ADMIN_PASS in your .env file."
-        )
-
-    if ADMIN_USER == "admin":
-        issues.append(
-            "ADMIN_USER is still 'admin'. Consider changing it to a unique username."
         )
 
     for issue in issues:

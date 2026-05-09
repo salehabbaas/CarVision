@@ -388,6 +388,8 @@ def _create_training_job(
     run_ocr_prefill: bool,
     run_ocr_learn: bool,
     trigger: str,
+    export_profile: Optional[str] = None,
+    auto_deploy: bool = False,
 ) -> TrainingJob:
     job = TrainingJob(
         id=secrets.token_urlsafe(14),
@@ -410,6 +412,8 @@ def _create_training_job(
             "chunk_epochs": chunk_epochs,
             "run_ocr_prefill": bool(run_ocr_prefill),
             "run_ocr_learn": bool(run_ocr_learn),
+            "export_profile": export_profile or "",
+            "auto_deploy": bool(auto_deploy),
         },
         error=None,
     )
@@ -430,6 +434,8 @@ def _start_training_pipeline_from_request(
     run_ocr_prefill: Optional[bool] = None,
     run_ocr_learn: Optional[bool] = None,
     trigger: str = "manual",
+    export_profile: Optional[str] = None,
+    auto_deploy: bool = False,
 ) -> Dict:
     from routers.deps import create_notification
     running = _active_training_job(db)
@@ -450,6 +456,7 @@ def _start_training_pipeline_from_request(
         db, mode=mode_resolved, chunk_size=chunk_size_resolved,
         chunk_epochs=chunk_epochs_resolved, run_ocr_prefill=ocr_prefill_resolved,
         run_ocr_learn=ocr_learn_resolved, trigger=trigger,
+        export_profile=export_profile, auto_deploy=auto_deploy,
     )
     _start_training_pipeline_thread(job.id)
     try:
@@ -829,7 +836,40 @@ def start_training(
         run_ocr_prefill=(body.run_ocr_prefill if body else None),
         run_ocr_learn=(body.run_ocr_learn if body else None),
         trigger="api",
+        export_profile=(body.export_profile if body else None),
+        auto_deploy=bool(body.auto_deploy if body else False),
     )
+
+
+@router.post("/export")
+def export_trained_model(
+    body: Dict = None,
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+):
+    """Export the current plate model to a different format (onnx, engine, coreml)."""
+    from fastapi import Body
+    from services.model_export import export_model, register_model_version, profile_to_format
+
+    body = body or {}
+    model_path = str(body.get("model_path") or (PROJECT_ROOT / "models" / "plate.pt"))
+    profile = str(body.get("profile") or body.get("export_profile") or "cpu").strip().lower()
+    fmt = str(body.get("format") or profile_to_format(profile)).strip().lower()
+
+    exported_path, err = export_model(model_path, fmt)
+    if err:
+        return {"ok": False, "error": err}
+
+    mv = register_model_version(
+        db, path=exported_path, fmt=fmt, profile=profile, metrics={},
+    )
+    return {
+        "ok": True,
+        "exported_path": exported_path,
+        "format": fmt,
+        "profile": profile,
+        "model_version_id": mv.id,
+    }
 
 
 @router.post("/stop")

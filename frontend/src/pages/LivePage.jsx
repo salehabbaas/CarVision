@@ -336,6 +336,7 @@ export default function LivePage() {
   const [eventFilter,   setEventFilter]   = useState('all');
   const [draggingId,    setDraggingId]    = useState(null);
   const [dragOverId,    setDragOverId]    = useState(null);
+  const [wsConnected,   setWsConnected]   = useState(false);
   const [error,  setError]  = useState('');
   const [notice, setNotice] = useState('');
 
@@ -349,25 +350,35 @@ export default function LivePage() {
   const streamNonce   = useRef(Date.now());
   const dragSrcRef    = useRef(null);
 
+  // ── Overlay sync — stable: reads everything from refs ─────────────────────
+  // No state in deps → this function is created once and never changes.
+  // This prevents effects from restarting due to function identity changes.
+  const syncOverlay = useCallback((camId) => {
+    const img     = imageRefs.current.get(camId);
+    const canvas  = canvasRefs.current.get(camId);
+    const det     = overlaysRef.current[String(camId)] || null;
+    const p       = pal(det?.status || camStatusRef.current[camId]);
+    const camName = camNamesRef.current[camId] || '';
+    drawOverlay(canvas, img, det, p?.fg, camName);
+  }, []); // Intentionally empty deps — reads from refs
+
   // ── Data polling ─────────────────────────────────────────────────────────────
+
+  // Camera list + active clips — always polled (camera metadata not in WS)
   useEffect(() => {
     let timer; let alive = true;
     const load = async () => {
       try {
-        const [camRes, healthRes, clipsRes] = await Promise.all([
+        const [camRes, clipsRes] = await Promise.all([
           request('/api/v1/cameras',    { token }),
-          request('/api/v1/live/stream_health', { token }),
           request('/api/v1/clips/active', { token }),
         ]);
         if (!alive) return;
-        // Only update state when content actually changed to prevent
-        // cascading re-renders that disrupt the MJPEG stream connections
         setCameras(prev => {
           const next = (camRes.items || []).filter(c => c.enabled && c.live_view);
           const same = prev.length === next.length && prev.every((c, i) => c.id === next[i]?.id);
           return same ? prev : next;
         });
-        setHealth(healthRes.items || {});
         const map = {};
         (clipsRes.items || []).forEach(i => { map[i.camera_id] = i; });
         setRecording(map);
@@ -383,7 +394,61 @@ export default function LivePage() {
     return () => clearInterval(t);
   }, []);
 
+  // ── WebSocket — primary live data source ──────────────────────────────────
   useEffect(() => {
+    if (!token) return;
+    let ws; let alive = true;
+
+    function connect() {
+      try {
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const rawBase = apiPath('/api/v1/live/ws');
+        let wsUrl;
+        try {
+          const u = new URL(rawBase, window.location.href);
+          u.protocol = proto;
+          u.searchParams.set('token', token);
+          wsUrl = u.toString();
+        } catch {
+          wsUrl = `${proto}//${window.location.host}/api/v1/live/ws?token=${encodeURIComponent(token)}`;
+        }
+        ws = new WebSocket(wsUrl);
+      } catch {
+        if (alive) setWsConnected(false);
+        return;
+      }
+
+      ws.onopen = () => { if (alive) setWsConnected(true); };
+      ws.onclose = () => { if (alive) setWsConnected(false); };
+      ws.onerror = () => { if (alive) setWsConnected(false); };
+      ws.onmessage = (e) => {
+        if (!alive) return;
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type !== 'live_update') return;
+          if (msg.overlays) {
+            overlaysRef.current = msg.overlays;
+            visibleRef.current.forEach(cam => syncOverlay(cam.id));
+          }
+          if (msg.events) setEvents(msg.events);
+          if (msg.health) setHealth(msg.health);
+        } catch {}
+      };
+    }
+
+    connect();
+    return () => {
+      alive = false;
+      if (ws) ws.close();
+      setWsConnected(false);
+    };
+  }, [token, syncOverlay]);
+
+  // ── REST fallbacks — only active when WebSocket is disconnected ───────────
+
+  // Events fallback
+  useEffect(() => {
+    if (wsConnected) return;
     let timer; let alive = true;
     const load = async () => {
       try {
@@ -395,7 +460,23 @@ export default function LivePage() {
     };
     load();
     return () => { alive = false; clearTimeout(timer); };
-  }, [token]);
+  }, [token, wsConnected]);
+
+  // Health + overlays fallback
+  useEffect(() => {
+    if (wsConnected) return;
+    let timer; let alive = true;
+    const load = async () => {
+      try {
+        const healthRes = await request('/api/v1/live/stream_health', { token });
+        if (!alive) return;
+        setHealth(healthRes.items || {});
+      } catch {}
+      timer = setTimeout(load, 4000);
+    };
+    load();
+    return () => { alive = false; clearTimeout(timer); };
+  }, [token, wsConnected]);
 
   // ── Derived data ──────────────────────────────────────────────────────────────
   const layout = LAYOUTS.find(l => l.id === gridMax) || LAYOUTS[1];
@@ -452,21 +533,9 @@ export default function LivePage() {
     return evs.slice(0, 30);
   }, [events, liveCamIds, eventFilter]);
 
-  // ── Overlay sync — stable: reads everything from refs ─────────────────────────
-  // No state in deps → this function is created once and never changes.
-  // This prevents the overlay polling effect from restarting every 2.5 s
-  // (which was causing streams to flicker/go black).
-  const syncOverlay = useCallback((camId) => {
-    const img     = imageRefs.current.get(camId);
-    const canvas  = canvasRefs.current.get(camId);
-    const det     = overlaysRef.current[String(camId)] || null;
-    const p       = pal(det?.status || camStatusRef.current[camId]);
-    const camName = camNamesRef.current[camId] || '';
-    drawOverlay(canvas, img, det, p?.fg, camName);
-  }, []); // ← intentionally empty deps — reads from refs
-
-  // Overlay polling — restarts only when token changes
+  // Overlay polling — REST fallback only when WebSocket is not connected
   useEffect(() => {
+    if (wsConnected) return;
     const ctrl = new AbortController();
     (async () => {
       while (!ctrl.signal.aborted) {
@@ -488,7 +557,7 @@ export default function LivePage() {
       }
     })();
     return () => ctrl.abort();
-  }, [token, syncOverlay]); // syncOverlay is stable → effect only restarts on auth change
+  }, [token, syncOverlay, wsConnected]);
 
   // Redraw overlays when visible set or status changes
   useEffect(() => { visible.forEach(cam => syncOverlay(cam.id)); }, [visible, camStatus, syncOverlay]);
@@ -676,6 +745,14 @@ export default function LivePage() {
               {cameras.filter(c => { const h = health[c.id]; return h && typeof h.age === 'number' && h.age <= 5; }).length}
             </span>
             /{cameras.length} live
+          </span>
+          <span title={wsConnected ? 'WebSocket connected' : 'Polling (WebSocket disconnected)'} style={{
+            fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4,
+            background: wsConnected ? 'rgba(28,217,164,0.15)' : 'rgba(255,191,71,0.12)',
+            color: wsConnected ? '#1cd9a4' : '#ffbf47',
+            border: `1px solid ${wsConnected ? 'rgba(28,217,164,0.3)' : 'rgba(255,191,71,0.3)'}`,
+          }}>
+            {wsConnected ? '⚡ WS' : '↻ Polling'}
           </span>
           {recCount > 0 && (
             <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>

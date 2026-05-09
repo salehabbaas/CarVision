@@ -8,6 +8,18 @@ class ApiLoginBody(BaseModel):
     password: str
 
 
+class ApiBootstrapBody(BaseModel):
+    username: str
+    password: str
+
+
+class ApiAdminResetBody(BaseModel):
+    master_password: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    remove_admin: bool = False
+
+
 class ApiBulkIdsBody(BaseModel):
     detection_ids: List[int] = Field(default_factory=list)
 
@@ -121,6 +133,9 @@ class ApiTrainingStartBody(BaseModel):
     chunk_epochs: Optional[int] = None
     run_ocr_prefill: Optional[bool] = None
     run_ocr_learn: Optional[bool] = None
+    # Post-training export and activation
+    export_profile: Optional[str] = None   # "cpu" → onnx, "nvidia" → engine, "mac" → coreml
+    auto_deploy: Optional[bool] = None     # activate model only if metrics improve
 
 
 class ApiClipControlBody(BaseModel):

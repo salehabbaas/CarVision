@@ -163,3 +163,33 @@ class ClipRecord(Base):
     size_bytes = Column(Integer, nullable=True)
     detection_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class RuntimeSettings(Base):
+    __tablename__ = "runtime_settings"
+
+    id = Column(Integer, primary_key=True)
+    runtime_profile = Column(String(20), nullable=False, default="cpu")  # cpu, nvidia, mac
+    inference_device = Column(String(20), nullable=False, default="cpu")
+    training_device = Column(String(20), nullable=False, default="cpu")
+    model_backend = Column(String(20), nullable=False, default="pytorch")  # pytorch, onnx, tensorrt, openvino
+    target_detection_fps = Column(Float, nullable=False, default=2.0)
+    batch_inference = Column(Boolean, nullable=False, default=False)
+    max_live_cameras = Column(Integer, nullable=False, default=8)
+    jpeg_quality = Column(Integer, nullable=False, default=82)
+    plate_region = Column(String(50), nullable=False, default="generic")
+    ocr_engine = Column(String(30), nullable=False, default="easyocr")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ModelVersion(Base):
+    __tablename__ = "model_versions"
+
+    id = Column(Integer, primary_key=True)
+    path = Column(String(500), nullable=False)
+    format = Column(String(30), nullable=False, default="pytorch")  # pytorch, onnx, tensorrt, openvino, coreml
+    profile = Column(String(20), nullable=False, default="cpu")  # cpu, nvidia, mac
+    metrics = Column(JSON, nullable=True)
+    active = Column(Boolean, nullable=False, default=False)
+    rollback_source_id = Column(Integer, ForeignKey("model_versions.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

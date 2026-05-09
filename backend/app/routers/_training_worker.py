@@ -33,6 +33,13 @@ from services.dataset import (
     bbox_xywh_to_xyxy as _bbox_xywh_to_xyxy,
     build_yolo_dataset_for_sample_ids as _build_yolo_dataset_for_sample_ids,
 )
+from services.model_export import (
+    export_model as _export_model,
+    profile_to_format as _profile_to_format,
+    register_model_version as _register_model_version,
+    activate_model_version as _activate_model_version,
+    should_activate as _should_activate,
+)
 from services.state import set_training_status as _set_training_status
 
 logger = logging.getLogger("carvision.training_worker")
@@ -41,6 +48,67 @@ logger = logging.getLogger("carvision.training_worker")
 TRAIN_PIPELINE_STALL_TIMEOUT_SECONDS = int(
     __import__("os").getenv("TRAIN_PIPELINE_STALL_TIMEOUT_SECONDS", "1800") or "1800"
 )
+
+
+def _register_and_maybe_activate(db: Session, job: "TrainingJob") -> None:
+    """Register ModelVersion, optionally export, optionally auto-activate."""
+    model_path = job.model_path
+    if not model_path:
+        return
+
+    details = dict(job.details or {})
+    export_profile = str(details.get("export_profile") or "").strip().lower()
+    auto_deploy = bool(details.get("auto_deploy", False))
+    metrics: dict = dict(details.get("training_metrics") or {})
+
+    try:
+        # 1. Register as pytorch / cpu model version
+        mv = _register_model_version(
+            db, path=model_path, fmt="pytorch", profile=export_profile or "cpu", metrics=metrics,
+        )
+
+        # 2. Optional export
+        if export_profile and export_profile != "cpu":
+            fmt = _profile_to_format(export_profile)
+            _touch_job = _touch_job_fn()  # imported lazily to avoid circular dep
+            _touch_job(db, job, message=f"Exporting model to {fmt} ({export_profile} profile)")
+            exported_path, export_err = _export_model(model_path, fmt)
+            if exported_path:
+                from services.model_export import register_model_version
+                _register_model_version(
+                    db, path=exported_path, fmt=fmt, profile=export_profile,
+                    metrics=metrics, rollback_source_id=mv.id,
+                )
+                details["exported_path"] = exported_path
+                details["export_format"] = fmt
+            elif export_err:
+                details["export_error"] = export_err
+            job.details = details
+            db.add(job)
+            db.commit()
+
+        # 3. Auto-activate if metrics improved
+        if auto_deploy:
+            from models import ModelVersion
+            active = db.query(ModelVersion).filter(ModelVersion.active.is_(True)).first()
+            current_metrics = dict(active.metrics or {}) if active else None
+            if _should_activate(metrics, current_metrics):
+                _activate_model_version(db, mv.id)
+                details["auto_activated"] = True
+            else:
+                details["auto_activated"] = False
+                details["auto_activate_reason"] = "metrics did not improve"
+            job.details = details
+            db.add(job)
+            db.commit()
+
+    except Exception as exc:
+        logger.warning("_register_and_maybe_activate failed: %s", exc)
+
+
+def _touch_job_fn():
+    from routers.training import _touch_training_job
+    return _touch_training_job
 
 
 # ── Tiny helpers ──────────────────────────────────────────────────────────────
@@ -561,6 +629,9 @@ def run_training_pipeline_job(
             job.details = details
             local_db.add(job)
             local_db.commit()
+
+        # ── Model registry + optional export + auto-activation ───────────────
+        _register_and_maybe_activate(local_db, job)
 
         # ── Finalise ──────────────────────────────────────────────────────────
         try:

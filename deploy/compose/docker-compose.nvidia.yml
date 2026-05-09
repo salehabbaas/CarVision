@@ -1,0 +1,31 @@
+# NVIDIA GPU profile override — requires nvidia-container-toolkit on the host.
+#
+# Prerequisites:
+#   1. Install nvidia-container-toolkit:
+#      https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#   2. Verify: docker run --rm --gpus all nvidia/cuda:12.0-base-ubuntu22.04 nvidia-smi
+#
+# Usage:
+#   docker compose \
+#     -f deploy/compose/docker-compose.carvision.yml \
+#     -f deploy/compose/docker-compose.nvidia.yml \
+#     --env-file .env.carvision up -d --build
+
+services:
+  carvision-backend:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      ANPR_INFERENCE_DEVICE: cuda
+      ANPR_DETECTOR: auto
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Enable CUDA AMP for training (auto-detected by yolo_train_worker)
+      TRAIN_DEVICE_OVERRIDE: "0"
+      # Larger YOLO image size — GPU can handle 640 comfortably
+      YOLO_IMGSZ: "640"

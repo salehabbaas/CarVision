@@ -23,7 +23,7 @@ from typing import Optional, Dict
 
 import numpy as np
 
-from anpr import detect_plate as contour_detect, read_plate_text
+from anpr import detect_plate as contour_detect
 
 try:
     from ultralytics import YOLO
@@ -183,18 +183,9 @@ class PlateDetector:
         x1 = max(0, x1 - pad); y1 = max(0, y1 - pad)
         x2 = min(w, x2 + pad);  y2 = min(h, y2 + pad)
 
-        crop = frame[y1:y2, x1:x2]
-        ocr  = read_plate_text(crop)
-        if not ocr:
-            return None
-
         return {
-            "plate_text": ocr["plate_text"],
-            "confidence": ocr.get("confidence"),
             "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "detector_conf": conf},
-            "raw_text":   ocr.get("raw_text"),
-            "candidates": ocr.get("candidates"),
-            "detector":   "yolo",
+            "detector": "yolo",
         }
 
     # ── contour wrapper (adds detector tag) ───────────────────────────────────

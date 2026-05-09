@@ -43,6 +43,7 @@ from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
 from anpr import crop_from_bbox, read_plate_text, set_anpr_config
+from routers.deps import is_token_valid_for_current_admin
 from camera_manager import CameraManager
 from core.config import (
     API_CORS_ORIGINS,
@@ -88,7 +89,9 @@ from routers import (
     dashboard,
     detections,
     discovery,
+    live,
     notifications,
+    settings,
     training,
     training_samples,
     upload,
@@ -286,21 +289,34 @@ def _run_upload_job(
                     if not ret:
                         break
                     detection = detect_plate(frame)
-                    if detection and detection.get("plate_text"):
-                        plate_text = detection["plate_text"]
-                        from models import AllowedPlate
-                        norm = "".join(ch for ch in plate_text if ch.isalnum()).upper()
-                        allowed_row = local_db.query(AllowedPlate).filter(
-                            AllowedPlate.plate_text == norm, AllowedPlate.active.is_(True)
-                        ).first()
-                        status = "allowed" if allowed_row else "denied"
-                        results.append({
-                            "frame": frame_idx,
-                            "plate_text": plate_text,
-                            "confidence": detection.get("confidence"),
-                            "status": status,
-                            "detector": detection.get("detector"),
-                        })
+                    if detection:
+                        plate_text = detection.get("plate_text")
+                        confidence = detection.get("confidence")
+                        if not plate_text:
+                            bbox = detection.get("bbox")
+                            if bbox:
+                                x1 = int(bbox.get("x1", 0)); y1 = int(bbox.get("y1", 0))
+                                x2 = int(bbox.get("x2", 0)); y2 = int(bbox.get("y2", 0))
+                                crop = frame[y1:y2, x1:x2]
+                                if crop.size:
+                                    ocr = read_plate_text(crop)
+                                    if ocr:
+                                        plate_text = ocr.get("plate_text")
+                                        confidence = ocr.get("confidence")
+                        if plate_text:
+                            from models import AllowedPlate
+                            norm = "".join(ch for ch in plate_text if ch.isalnum()).upper()
+                            allowed_row = local_db.query(AllowedPlate).filter(
+                                AllowedPlate.plate_text == norm, AllowedPlate.active.is_(True)
+                            ).first()
+                            status = "allowed" if allowed_row else "denied"
+                            results.append({
+                                "frame": frame_idx,
+                                "plate_text": plate_text,
+                                "confidence": confidence,
+                                "status": status,
+                                "detector": detection.get("detector"),
+                            })
                     processed += 1
                     frame_idx += step_frames
                     pct = int((processed / max(1, frames_to_process)) * 90)
@@ -314,17 +330,30 @@ def _run_upload_job(
             frame = cv2.imread(str(file_path))
             if frame is not None:
                 detection = detect_plate(frame)
-                if detection and detection.get("plate_text"):
-                    plate_text = detection["plate_text"]
-                    from models import AllowedPlate
-                    norm = "".join(ch for ch in plate_text if ch.isalnum()).upper()
-                    allowed_row = local_db.query(AllowedPlate).filter(
-                        AllowedPlate.plate_text == norm, AllowedPlate.active.is_(True)
-                    ).first()
-                    status = "allowed" if allowed_row else "denied"
-                    results.append({"frame": 0, "plate_text": plate_text,
-                                    "confidence": detection.get("confidence"), "status": status,
-                                    "detector": detection.get("detector")})
+                if detection:
+                    plate_text = detection.get("plate_text")
+                    confidence = detection.get("confidence")
+                    if not plate_text:
+                        bbox = detection.get("bbox")
+                        if bbox:
+                            x1 = int(bbox.get("x1", 0)); y1 = int(bbox.get("y1", 0))
+                            x2 = int(bbox.get("x2", 0)); y2 = int(bbox.get("y2", 0))
+                            crop = frame[y1:y2, x1:x2]
+                            if crop.size:
+                                ocr = read_plate_text(crop)
+                                if ocr:
+                                    plate_text = ocr.get("plate_text")
+                                    confidence = ocr.get("confidence")
+                    if plate_text:
+                        from models import AllowedPlate
+                        norm = "".join(ch for ch in plate_text if ch.isalnum()).upper()
+                        allowed_row = local_db.query(AllowedPlate).filter(
+                            AllowedPlate.plate_text == norm, AllowedPlate.active.is_(True)
+                        ).first()
+                        status = "allowed" if allowed_row else "denied"
+                        results.append({"frame": 0, "plate_text": plate_text,
+                                        "confidence": confidence, "status": status,
+                                        "detector": detection.get("detector")})
 
         _update_upload_job(job_id, status="complete", progress=100,
                            message=f"Analysis complete — {len(results)} plate(s) found",
@@ -473,6 +502,7 @@ def create_app() -> FastAPI:
     cameras._init(stream_manager, manual_clip_manager)
     clips._init(manual_clip_manager)
     detections._init(detect_plate, read_plate_text, _copy_training_image, _load_image_size)
+    live._init(stream_manager)
     training._init(camera_manager, read_plate_text, crop_from_bbox, set_anpr_config)
     upload._init(_run_upload_job)
 
@@ -484,6 +514,8 @@ def create_app() -> FastAPI:
         detections.router,
         allowed.router,
         notifications.router,
+        live.router,
+        settings.router,
         training.router,
         training_samples.router,
         upload.router,
@@ -513,7 +545,14 @@ def create_app() -> FastAPI:
 
     # ── MJPEG camera stream ───────────────────────────────────────────────────
     @application.get("/stream/{camera_id}")
-    def stream_camera(camera_id: int, overlay: int = 1, db: Session = Depends(get_db)):
+    def stream_camera(
+        camera_id: int,
+        overlay: int = 1,
+        token: Optional[str] = None,
+        db: Session = Depends(get_db),
+    ):
+        if not is_token_valid_for_current_admin(token, db):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
         camera = db.get(Camera, camera_id)
         if not camera or not camera.enabled:
             return JSONResponse({"error": "camera not found"}, status_code=404)

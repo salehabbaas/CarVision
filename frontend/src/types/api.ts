@@ -32,3 +32,26 @@ export interface NotificationListResponse {
   items: NotificationItem[];
   unread: number;
 }
+
+export interface HardwareInfo {
+  cpu: boolean;
+  cuda: boolean;
+  mps: boolean;
+  gpu_names: string[];
+  pytorch_available: boolean;
+  usable_backends: string[];
+}
+
+export interface RuntimeSettings {
+  runtime_profile: string;
+  inference_device: string;
+  training_device: string;
+  model_backend: string;
+  target_detection_fps: number;
+  batch_inference: boolean;
+  max_live_cameras: number;
+  jpeg_quality: number;
+  plate_region: string;
+  ocr_engine: string;
+  updated_at: string | null;
+}

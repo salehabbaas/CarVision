@@ -18,6 +18,7 @@ const TrainingDataPage = lazy(() => import("./pages/TrainingDataPage"));
 const AllowedPlatesPage = lazy(() => import("./pages/AllowedPlatesPage"));
 const DiscoveryPage = lazy(() => import("./pages/DiscoveryPage"));
 const CapturePage = lazy(() => import("./pages/CapturePage"));
+const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 
 function RouteLoader() {
   return <LoadingState rows={3} message="Loading workspace..." />;
@@ -54,6 +55,7 @@ export default function App() {
         <Route path="/discovery" element={<ShellPage><DiscoveryPage /></ShellPage>} />
         <Route path="/training" element={<ShellPage><TrainingPage /></ShellPage>} />
         <Route path="/notifications" element={<ShellPage><NotificationsPage /></ShellPage>} />
+        <Route path="/settings" element={<ShellPage><SettingsPage /></ShellPage>} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </Suspense>

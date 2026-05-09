@@ -1,0 +1,15 @@
+# CPU profile override — safe for any host with no GPU.
+#
+# Usage:
+#   docker compose \
+#     -f deploy/compose/docker-compose.carvision.yml \
+#     -f deploy/compose/docker-compose.cpu.yml \
+#     --env-file .env.carvision up -d --build
+
+services:
+  carvision-backend:
+    environment:
+      ANPR_INFERENCE_DEVICE: cpu
+      ANPR_DETECTOR: auto
+      # Training also runs on CPU; set batch=-1 so Ultralytics auto-sizes
+      TRAIN_DEVICE_OVERRIDE: cpu

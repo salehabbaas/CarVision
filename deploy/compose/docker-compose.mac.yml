@@ -1,0 +1,33 @@
+# Mac (Apple Silicon) profile override.
+#
+# IMPORTANT — MPS is NOT available inside Docker on Mac.
+# Docker Desktop runs a Linux VM; the Linux kernel cannot access the Mac GPU
+# through the hypervisor. This profile therefore uses CPU inside the container.
+#
+# For native MPS inference (faster on M-series Macs), run the backend directly
+# on the host (outside Docker):
+#
+#   cd backend/app
+#   ANPR_INFERENCE_DEVICE=mps \
+#     uvicorn main:app --reload --port 8000
+#
+# The database and frontend can still run in Docker; point VITE_API_URL at
+# http://localhost:8000 in your .env.carvision file.
+#
+# Usage (Docker CPU fallback):
+#   docker compose \
+#     -f deploy/compose/docker-compose.carvision.yml \
+#     -f deploy/compose/docker-compose.mac.yml \
+#     --env-file .env.carvision up -d --build
+
+services:
+  carvision-backend:
+    environment:
+      ANPR_INFERENCE_DEVICE: cpu
+      ANPR_DETECTOR: auto
+      TRAIN_DEVICE_OVERRIDE: cpu
+      # Reduce image size to keep CPU inference fast on limited container resources
+      YOLO_IMGSZ: "320"
+    # Remove any GPU capability claims that would break Docker Desktop on Mac
+    deploy:
+      resources: {}

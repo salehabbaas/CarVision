@@ -5,6 +5,7 @@ Every router imports from here instead of duplicating auth logic.
 """
 from __future__ import annotations
 
+import hmac
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -15,12 +16,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from core.config import (
-    API_ADMIN_PASS,
-    API_ADMIN_USER,
     API_JWT_ALGORITHM,
     API_JWT_EXPIRE_MINUTES,
     API_JWT_SECRET,
 )
+from core.auth_store import get_admin_username, verify_admin_credentials
 from db import get_db
 from models import AllowedPlate, AppSetting, ClipRecord, Detection, Notification, TrainingSample
 
@@ -54,17 +54,31 @@ def decode_token_subject(token: Optional[str]) -> Optional[str]:
 
 def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_BEARER),
+    db: Session = Depends(get_db),
 ) -> str:
     if not credentials or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Missing bearer token")
     subject = decode_token_subject(credentials.credentials)
     if not subject:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+    active_admin = get_admin_username(db)
+    if not active_admin or not hmac.compare_digest(subject, active_admin):
+        raise HTTPException(status_code=401, detail="Session is no longer valid")
     return subject
 
 
-def verify_credentials(username: str, password: str) -> bool:
-    return username == API_ADMIN_USER and password == API_ADMIN_PASS
+def verify_credentials(db: Session, username: str, password: str) -> bool:
+    return verify_admin_credentials(db, username, password)
+
+
+def is_token_valid_for_current_admin(token: Optional[str], db: Session) -> bool:
+    subject = decode_token_subject(token)
+    if not subject:
+        return False
+    active_admin = get_admin_username(db)
+    if not active_admin:
+        return False
+    return hmac.compare_digest(subject, active_admin)
 
 
 # ── App settings helpers ──────────────────────────────────────────────────────
