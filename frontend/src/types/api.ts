@@ -55,3 +55,13 @@ export interface RuntimeSettings {
   ocr_engine: string;
   updated_at: string | null;
 }
+
+export type ImportPhase = "idle" | "uploading" | "validating" | "importing" | "done" | "error";
+
+export interface ImportStatus {
+  phase: ImportPhase;
+  percent: number;
+  message?: string;
+  error?: string | null;
+  job_id?: string | null;
+}

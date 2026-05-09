@@ -89,6 +89,7 @@ from routers import (
     dashboard,
     detections,
     discovery,
+    exports,
     live,
     notifications,
     settings,
@@ -521,6 +522,7 @@ def create_app() -> FastAPI:
         upload.router,
         clips.router,
         discovery.router,
+        exports.router,
     ]:
         application.include_router(r)
 

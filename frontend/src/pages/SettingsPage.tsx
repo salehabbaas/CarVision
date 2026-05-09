@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Cpu, HardDrive, Save, Settings2, Zap } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Archive, Cpu, HardDrive, Save, Settings2, Zap } from "lucide-react";
 
 import { ErrorState, LoadingState } from "@/components/PageState";
 import PageHeader from "@/components/admin/PageHeader";
@@ -8,8 +8,8 @@ import { useAuth } from "@/context/AuthContext";
 import Button from "@/design-system/components/Button";
 import FormField from "@/design-system/components/FormField";
 import Select from "@/design-system/components/Select";
-import { request } from "@/lib/api";
-import type { HardwareInfo, RuntimeSettings } from "@/types/api";
+import { apiPath, request } from "@/lib/api";
+import type { HardwareInfo, ImportStatus, RuntimeSettings } from "@/types/api";
 
 interface Option { value: string; label: string }
 
@@ -104,6 +104,184 @@ function HardwarePanel({ hw }: { hw: HardwareInfo }) {
             </span>
           ))}
         </div>
+      </div>
+    </SurfaceCard>
+  );
+}
+
+function BackupPanel({ token }: { token?: string }) {
+  const [exportLoading, setExportLoading] = useState(false);
+  const [includeDetections, setIncludeDetections] = useState(false);
+  const [importStatus, setImportStatus] = useState<ImportStatus>({ phase: "idle", percent: 0 });
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  function stopPolling() {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }
+
+  async function handleExport() {
+    setExportLoading(true);
+    try {
+      const url = apiPath(
+        `/api/v1/exports/download?include_detection_images=${includeDetections}`
+      );
+      const res = await fetch(url, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) throw new Error(`Export failed: ${res.status}`);
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const disposition = res.headers.get("content-disposition") ?? "";
+      const match = disposition.match(/filename="?([^"]+)"?/);
+      a.download = match?.[1] ?? "carvision-backup.zip";
+      a.href = objectUrl;
+      a.click();
+      URL.revokeObjectURL(objectUrl);
+    } catch (err) {
+      setImportStatus({
+        phase: "error",
+        percent: 0,
+        error: err instanceof Error ? err.message : "Export failed",
+      });
+    } finally {
+      setExportLoading(false);
+    }
+  }
+
+  async function handleImport() {
+    if (!importFile) return;
+    stopPolling();
+    setImportStatus({ phase: "uploading", percent: 5, message: "Uploading…" });
+
+    const form = new FormData();
+    form.append("file", importFile);
+
+    try {
+      const res = await fetch(apiPath("/api/v1/exports/import"), {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: form,
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(body.detail ?? "Import request failed");
+      }
+
+      pollRef.current = setInterval(async () => {
+        try {
+          const status = await request<ImportStatus>("/api/v1/exports/import/status", { token });
+          setImportStatus(status);
+          if (status.phase === "done" || status.phase === "error") {
+            stopPolling();
+          }
+        } catch {
+          // ignore transient poll failures
+        }
+      }, 1500);
+    } catch (err) {
+      setImportStatus({
+        phase: "error",
+        percent: 0,
+        error: err instanceof Error ? err.message : "Import failed",
+      });
+    }
+  }
+
+  const activeImport = ["uploading", "validating", "importing"].includes(importStatus.phase);
+  const isDone = importStatus.phase === "done";
+  const isError = importStatus.phase === "error";
+
+  return (
+    <SurfaceCard>
+      <div className="flex items-center gap-3 mb-5">
+        <div className="rounded-xl border border-primary/20 bg-primary/10 p-2.5 text-primary">
+          <Archive className="size-4" />
+        </div>
+        <div>
+          <p className="text-sm font-semibold text-foreground">Backup &amp; Restore</p>
+          <p className="text-xs text-muted-foreground">
+            Export all data, annotations, settings and trained model as a ZIP. Restore on any CarVision instance.
+          </p>
+        </div>
+      </div>
+
+      {/* Export */}
+      <div className="space-y-3">
+        <p className="text-xs font-medium text-foreground">Export</p>
+        <div className="flex items-center gap-2">
+          <input
+            id="include_detections"
+            type="checkbox"
+            checked={includeDetections}
+            onChange={(e) => setIncludeDetections(e.target.checked)}
+            className="size-4 rounded border-border accent-primary"
+          />
+          <label htmlFor="include_detections" className="text-sm text-foreground cursor-pointer">
+            Include detection snapshot images{" "}
+            <span className="text-muted-foreground">(increases export size)</span>
+          </label>
+        </div>
+        <Button
+          type="button"
+          disabled={exportLoading}
+          onClick={() => void handleExport()}
+        >
+          <Archive className="size-4" />
+          {exportLoading ? "Preparing…" : "Download backup ZIP"}
+        </Button>
+      </div>
+
+      <hr className="border-border/40 my-5" />
+
+      {/* Import */}
+      <div className="space-y-3">
+        <p className="text-xs font-medium text-foreground">Restore</p>
+        <p className="text-xs text-amber-600 dark:text-amber-400">
+          Restoring will replace all data except user credentials. This cannot be undone.
+        </p>
+        <input
+          type="file"
+          accept=".zip"
+          disabled={activeImport}
+          onChange={(e) => setImportFile(e.target.files?.[0] ?? null)}
+          className="block w-full text-sm text-muted-foreground file:mr-3 file:rounded-lg file:border file:border-border file:bg-muted file:px-3 file:py-1.5 file:text-xs file:font-medium file:text-foreground hover:file:bg-muted/80 disabled:opacity-50"
+        />
+        <Button
+          type="button"
+          disabled={!importFile || activeImport}
+          onClick={() => void handleImport()}
+        >
+          {activeImport ? "Restoring…" : "Restore from ZIP"}
+        </Button>
+
+        {importStatus.phase !== "idle" && (
+          <div className="space-y-2 mt-2">
+            <div className="h-1.5 w-full rounded-full bg-border/40 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-primary transition-all duration-500"
+                style={{ width: `${importStatus.percent}%` }}
+              />
+            </div>
+            {(importStatus.message || importStatus.error) && (
+              <p
+                className={`text-xs ${
+                  isError
+                    ? "text-destructive"
+                    : isDone
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : "text-muted-foreground"
+                }`}
+              >
+                {isError ? importStatus.error : importStatus.message}
+              </p>
+            )}
+          </div>
+        )}
       </div>
     </SurfaceCard>
   );
@@ -322,6 +500,8 @@ export default function SettingsPage() {
           </div>
         </form>
       )}
+
+      <BackupPanel token={token ?? undefined} />
     </div>
   );
 }
