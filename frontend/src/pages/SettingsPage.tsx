@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Archive, Cpu, HardDrive, Save, Settings2, Zap } from "lucide-react";
+import { Archive, Cpu, Download, HardDrive, Save, Settings2, Zap } from "lucide-react";
 
 import { ErrorState, LoadingState } from "@/components/PageState";
 import PageHeader from "@/components/admin/PageHeader";
@@ -9,7 +9,7 @@ import Button from "@/design-system/components/Button";
 import FormField from "@/design-system/components/FormField";
 import Select from "@/design-system/components/Select";
 import { apiPath, request } from "@/lib/api";
-import type { HardwareInfo, ImportStatus, RuntimeSettings } from "@/types/api";
+import type { ExportStatus, HardwareInfo, ImportStatus, RuntimeSettings } from "@/types/api";
 
 interface Option { value: string; label: string }
 
@@ -109,30 +109,150 @@ function HardwarePanel({ hw }: { hw: HardwareInfo }) {
   );
 }
 
+function ProgressBar({
+  percent,
+  isError,
+  isDone,
+  message,
+}: {
+  percent: number;
+  isError: boolean;
+  isDone: boolean;
+  message?: string;
+}) {
+  return (
+    <div className="space-y-1.5 mt-2">
+      <div className="flex items-center justify-between">
+        <span
+          className={`text-xs ${
+            isError
+              ? "text-destructive"
+              : isDone
+              ? "text-emerald-600 dark:text-emerald-400"
+              : "text-muted-foreground"
+          }`}
+        >
+          {message}
+        </span>
+        <span className="text-xs tabular-nums text-muted-foreground">{percent}%</span>
+      </div>
+      <div className="h-1.5 w-full rounded-full bg-border/40 overflow-hidden">
+        <div
+          className={`h-full rounded-full transition-all duration-500 ${
+            isError
+              ? "bg-destructive"
+              : isDone
+              ? "bg-emerald-500"
+              : "bg-primary"
+          }`}
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
 function BackupPanel({ token }: { token?: string }) {
-  const [exportLoading, setExportLoading] = useState(false);
   const [includeDetections, setIncludeDetections] = useState(false);
+  const [exportStatus, setExportStatus] = useState<ExportStatus>({ phase: "idle", percent: 0 });
+  const exportPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const [importStatus, setImportStatus] = useState<ImportStatus>({ phase: "idle", percent: 0 });
   const [importFile, setImportFile] = useState<File | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const importPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  function stopPolling() {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
+  function stopExportPolling() {
+    if (exportPollRef.current) { clearInterval(exportPollRef.current); exportPollRef.current = null; }
+  }
+  function stopImportPolling() {
+    if (importPollRef.current) { clearInterval(importPollRef.current); importPollRef.current = null; }
+  }
+
+  function startExportPolling() {
+    stopExportPolling();
+    exportPollRef.current = setInterval(async () => {
+      try {
+        const status = await request<ExportStatus>("/api/v1/exports/export/status", { token });
+        // Stop polling once the backend reaches a terminal state
+        if (status.phase === "ready" || status.phase === "error" || status.phase === "done" || status.phase === "idle") {
+          stopExportPolling();
+        }
+        setExportStatus(status);
+      } catch {
+        // ignore transient poll failures
+      }
+    }, 1000);
+  }
+
+  function startImportPolling() {
+    stopImportPolling();
+    importPollRef.current = setInterval(async () => {
+      try {
+        const status = await request<ImportStatus>("/api/v1/exports/import/status", { token });
+        setImportStatus(status);
+        if (status.phase === "done" || status.phase === "error") {
+          stopImportPolling();
+        }
+      } catch {
+        // ignore transient poll failures
+      }
+    }, 1500);
+  }
+
+  // On mount: sync with server-side state so page refresh doesn't lose progress
+  useEffect(() => {
+    if (!token) return;
+    void (async () => {
+      try {
+        const [expSt, impSt] = await Promise.all([
+          request<ExportStatus>("/api/v1/exports/export/status", { token }),
+          request<ImportStatus>("/api/v1/exports/import/status", { token }),
+        ]);
+        if (expSt.phase !== "idle") {
+          setExportStatus(expSt);
+          if (expSt.phase === "building") startExportPolling();
+        }
+        if (impSt.phase !== "idle") {
+          setImportStatus(impSt);
+          if (["uploading", "validating", "importing"].includes(impSt.phase)) startImportPolling();
+        }
+      } catch {
+        // server unreachable at mount; leave defaults
+      }
+    })();
+    return () => { stopExportPolling(); stopImportPolling(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
+
+  async function handleExport() {
+    stopExportPolling();
+    setExportStatus({ phase: "building", percent: 0, message: "Starting export…" });
+    try {
+      const res = await fetch(
+        apiPath(`/api/v1/exports/export/start?include_detection_images=${includeDetections}`),
+        { method: "POST", headers: token ? { Authorization: `Bearer ${token}` } : {} }
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        throw new Error(body.detail ?? "Export failed to start");
+      }
+      startExportPolling();
+    } catch (err) {
+      setExportStatus({ phase: "error", percent: 0, message: err instanceof Error ? err.message : "Export failed" });
     }
   }
 
-  async function handleExport() {
-    setExportLoading(true);
+  // Called directly from a button click (user gesture) — required for reliable blob downloads
+  async function handleDownload() {
+    setExportStatus((s) => ({ ...s, phase: "downloading", message: "Downloading…" }));
     try {
-      const url = apiPath(
-        `/api/v1/exports/download?include_detection_images=${includeDetections}`
-      );
-      const res = await fetch(url, {
+      const res = await fetch(apiPath("/api/v1/exports/download"), {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
-      if (!res.ok) throw new Error(`Export failed: ${res.status}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        throw new Error(body.detail ?? `Download failed: ${res.status}`);
+      }
       const blob = await res.blob();
       const objectUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -140,27 +260,22 @@ function BackupPanel({ token }: { token?: string }) {
       const match = disposition.match(/filename="?([^"]+)"?/);
       a.download = match?.[1] ?? "carvision-backup.zip";
       a.href = objectUrl;
+      document.body.appendChild(a);
       a.click();
+      document.body.removeChild(a);
       URL.revokeObjectURL(objectUrl);
+      setExportStatus({ phase: "done", percent: 100, message: "Backup downloaded successfully." });
     } catch (err) {
-      setImportStatus({
-        phase: "error",
-        percent: 0,
-        error: err instanceof Error ? err.message : "Export failed",
-      });
-    } finally {
-      setExportLoading(false);
+      setExportStatus({ phase: "error", percent: 0, message: err instanceof Error ? err.message : "Download failed" });
     }
   }
 
   async function handleImport() {
     if (!importFile) return;
-    stopPolling();
+    stopImportPolling();
     setImportStatus({ phase: "uploading", percent: 5, message: "Uploading…" });
-
     const form = new FormData();
     form.append("file", importFile);
-
     try {
       const res = await fetch(apiPath("/api/v1/exports/import"), {
         method: "POST",
@@ -171,30 +286,22 @@ function BackupPanel({ token }: { token?: string }) {
         const body = await res.json().catch(() => ({ detail: res.statusText }));
         throw new Error(body.detail ?? "Import request failed");
       }
-
-      pollRef.current = setInterval(async () => {
-        try {
-          const status = await request<ImportStatus>("/api/v1/exports/import/status", { token });
-          setImportStatus(status);
-          if (status.phase === "done" || status.phase === "error") {
-            stopPolling();
-          }
-        } catch {
-          // ignore transient poll failures
-        }
-      }, 1500);
+      startImportPolling();
     } catch (err) {
-      setImportStatus({
-        phase: "error",
-        percent: 0,
-        error: err instanceof Error ? err.message : "Import failed",
-      });
+      setImportStatus({ phase: "error", percent: 0, error: err instanceof Error ? err.message : "Import failed" });
     }
   }
 
+  const exportBuilding = exportStatus.phase === "building";
+  const exportReady    = exportStatus.phase === "ready";
+  const exportDling    = exportStatus.phase === "downloading";
+  const exportDone     = exportStatus.phase === "done";
+  const exportError    = exportStatus.phase === "error";
+  const exportActive   = exportBuilding || exportDling;
+
   const activeImport = ["uploading", "validating", "importing"].includes(importStatus.phase);
-  const isDone = importStatus.phase === "done";
-  const isError = importStatus.phase === "error";
+  const importDone   = importStatus.phase === "done";
+  const importError  = importStatus.phase === "error";
 
   return (
     <SurfaceCard>
@@ -218,22 +325,58 @@ function BackupPanel({ token }: { token?: string }) {
             id="include_detections"
             type="checkbox"
             checked={includeDetections}
+            disabled={exportActive}
             onChange={(e) => setIncludeDetections(e.target.checked)}
-            className="size-4 rounded border-border accent-primary"
+            className="size-4 rounded border-border accent-primary disabled:opacity-50"
           />
           <label htmlFor="include_detections" className="text-sm text-foreground cursor-pointer">
             Include detection snapshot images{" "}
             <span className="text-muted-foreground">(increases export size)</span>
           </label>
         </div>
-        <Button
-          type="button"
-          disabled={exportLoading}
-          onClick={() => void handleExport()}
-        >
-          <Archive className="size-4" />
-          {exportLoading ? "Preparing…" : "Download backup ZIP"}
-        </Button>
+
+        <div className="flex flex-wrap gap-2">
+          {/* Primary action: build when idle/error/done, download when ready */}
+          {exportReady ? (
+            <Button type="button" onClick={() => void handleDownload()}>
+              <Download className="size-4" />
+              Download backup ZIP
+            </Button>
+          ) : (
+            <Button type="button" disabled={exportActive} onClick={() => void handleExport()}>
+              <Archive className="size-4" />
+              {exportBuilding ? "Preparing…" : exportDling ? "Downloading…" : "Build backup ZIP"}
+            </Button>
+          )}
+
+          {/* Secondary: re-download if already downloaded once (file still cached on server) */}
+          {exportDone && (
+            <Button type="button" variant="outline" onClick={() => void handleDownload()}>
+              <Download className="size-4" />
+              Download again
+            </Button>
+          )}
+
+          {/* Reset to start a fresh export */}
+          {(exportDone || exportError) && (
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setExportStatus({ phase: "idle", percent: 0 })}
+            >
+              New export
+            </Button>
+          )}
+        </div>
+
+        {exportStatus.phase !== "idle" && (
+          <ProgressBar
+            percent={exportStatus.percent}
+            isError={exportError}
+            isDone={exportDone}
+            message={exportStatus.message}
+          />
+        )}
       </div>
 
       <hr className="border-border/40 my-5" />
@@ -260,27 +403,12 @@ function BackupPanel({ token }: { token?: string }) {
         </Button>
 
         {importStatus.phase !== "idle" && (
-          <div className="space-y-2 mt-2">
-            <div className="h-1.5 w-full rounded-full bg-border/40 overflow-hidden">
-              <div
-                className="h-full rounded-full bg-primary transition-all duration-500"
-                style={{ width: `${importStatus.percent}%` }}
-              />
-            </div>
-            {(importStatus.message || importStatus.error) && (
-              <p
-                className={`text-xs ${
-                  isError
-                    ? "text-destructive"
-                    : isDone
-                    ? "text-emerald-600 dark:text-emerald-400"
-                    : "text-muted-foreground"
-                }`}
-              >
-                {isError ? importStatus.error : importStatus.message}
-              </p>
-            )}
-          </div>
+          <ProgressBar
+            percent={importStatus.percent}
+            isError={importError}
+            isDone={importDone}
+            message={importError ? (importStatus.error ?? "Import failed") : importStatus.message}
+          />
         )}
       </div>
     </SurfaceCard>

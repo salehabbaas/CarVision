@@ -65,3 +65,13 @@ export interface ImportStatus {
   error?: string | null;
   job_id?: string | null;
 }
+
+export type ExportPhase = "idle" | "building" | "ready" | "error" | "downloading" | "done";
+
+export interface ExportStatus {
+  phase: ExportPhase;
+  percent: number;
+  message?: string;
+  error?: string | null;
+  job_id?: string | null;
+}

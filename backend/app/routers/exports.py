@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 from sqlalchemy.orm import Session
@@ -48,6 +48,31 @@ _AUTH_PREFIXES = ("auth_admin_", "auth_master_")
 _HW_FIELDS = frozenset(
     {"runtime_profile", "inference_device", "training_device", "model_backend"}
 )
+
+# ── Export background state ───────────────────────────────────────────────────
+
+_EXPORT_LOCK = threading.Lock()
+_EXPORT_THREAD: threading.Thread | None = None
+_EXPORT_STATE: dict[str, Any] = {
+    "phase": "idle",   # idle | building | ready | error
+    "percent": 0,
+    "message": "",
+    "error": None,
+    "job_id": None,
+    "file_path": None,
+    "filename": None,
+}
+
+
+def _set_export_state(**kwargs: Any) -> None:
+    with _EXPORT_LOCK:
+        _EXPORT_STATE.update(kwargs)
+
+
+def _get_export_state() -> dict[str, Any]:
+    with _EXPORT_LOCK:
+        return dict(_EXPORT_STATE)
+
 
 # ── Import background state ───────────────────────────────────────────────────
 
@@ -101,65 +126,68 @@ def _sha256_zip_member(zf: zipfile.ZipFile, name: str) -> str:
     return h.hexdigest()
 
 
-# ── Export endpoint ───────────────────────────────────────────────────────────
+# ── Export background worker ──────────────────────────────────────────────────
 
-@router.get("/download")
-def export_download(
-    include_detection_images: bool = False,
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> FileResponse:
-    """Stream a complete backup ZIP of the CarVision installation."""
-    media_root = Path(MEDIA_DIR)
-    model_root = Path(PROJECT_ROOT) / "models"
-
-    # ── Serialise all tables ──────────────────────────────────────────────────
-    cameras = [_row_to_dict(r) for r in db.query(Camera).all()]
-    detections = [_row_to_dict(r) for r in db.query(Detection).all()]
-    allowed_plates = [_row_to_dict(r) for r in db.query(AllowedPlate).all()]
-    training_samples = [_row_to_dict(r) for r in db.query(TrainingSample).all()]
-    training_jobs = [_row_to_dict(r) for r in db.query(TrainingJob).all()]
-    clip_records = [_row_to_dict(r) for r in db.query(ClipRecord).all()]
-    notifications = [_row_to_dict(r) for r in db.query(Notification).all()]
-    model_versions = [_row_to_dict(r) for r in db.query(ModelVersion).all()]
-
-    # app_settings: strip auth credential keys
-    app_settings = [
-        _row_to_dict(r)
-        for r in db.query(AppSetting).all()
-        if not any(r.key.startswith(p) for p in _AUTH_PREFIXES)
-    ]
-
-    # runtime_settings: strip hardware-specific columns
-    rt_rows = db.query(RuntimeSettings).all()
-    runtime_settings = []
-    for r in rt_rows:
-        d = _row_to_dict(r)
-        for field in _HW_FIELDS:
-            d.pop(field, None)
-        runtime_settings.append(d)
-
-    # ── Write ZIP to a temp file ──────────────────────────────────────────────
+def _run_export(include_detection_images: bool, job_id: str) -> None:
+    """Build export ZIP in a daemon thread so the uvicorn pool stays free."""
+    db = SessionLocal()
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="carvision_export_")
     os.close(tmp_fd)
 
-    media_checksums: dict[str, str] = {}
-
     try:
+        # ── Phase 1: Query database ───────────────────────────────────────────
+        _set_export_state(phase="building", percent=5, message="Querying database…", error=None)
+
+        media_root = Path(MEDIA_DIR)
+        model_root = Path(PROJECT_ROOT) / "models"
+
+        cameras = [_row_to_dict(r) for r in db.query(Camera).all()]
+        detections = [_row_to_dict(r) for r in db.query(Detection).all()]
+        allowed_plates = [_row_to_dict(r) for r in db.query(AllowedPlate).all()]
+        training_samples = [_row_to_dict(r) for r in db.query(TrainingSample).all()]
+        training_jobs = [_row_to_dict(r) for r in db.query(TrainingJob).all()]
+        clip_records = [_row_to_dict(r) for r in db.query(ClipRecord).all()]
+        notifications = [_row_to_dict(r) for r in db.query(Notification).all()]
+        model_versions = [_row_to_dict(r) for r in db.query(ModelVersion).all()]
+
+        app_settings = [
+            _row_to_dict(r)
+            for r in db.query(AppSetting).all()
+            if not any(r.key.startswith(p) for p in _AUTH_PREFIXES)
+        ]
+
+        rt_rows = db.query(RuntimeSettings).all()
+        runtime_settings = []
+        for r in rt_rows:
+            d = _row_to_dict(r)
+            for field in _HW_FIELDS:
+                d.pop(field, None)
+            runtime_settings.append(d)
+
+        db.close()
+        db = None
+
+        tables = {
+            "cameras": cameras,
+            "detections": detections,
+            "allowed_plates": allowed_plates,
+            "training_samples": training_samples,
+            "training_jobs": training_jobs,
+            "clip_records": clip_records,
+            "notifications": notifications,
+            "app_settings": app_settings,
+            "runtime_settings": runtime_settings,
+            "model_versions": model_versions,
+        }
+
+        # ── Phase 2: Build ZIP ────────────────────────────────────────────────
+        _set_export_state(percent=20, message="Building backup archive…")
+
+        media_checksums: dict[str, str] = {}
+
         with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             # JSON table dumps
-            tables = {
-                "cameras": cameras,
-                "detections": detections,
-                "allowed_plates": allowed_plates,
-                "training_samples": training_samples,
-                "training_jobs": training_jobs,
-                "clip_records": clip_records,
-                "notifications": notifications,
-                "app_settings": app_settings,
-                "runtime_settings": runtime_settings,
-                "model_versions": model_versions,
-            }
+            _set_export_state(percent=25, message="Serialising database tables…")
             for name, rows in tables.items():
                 zf.writestr(
                     f"data/{name}.json",
@@ -167,6 +195,7 @@ def export_download(
                 )
 
             # Training sample images
+            _set_export_state(percent=40, message="Packing training samples…")
             for sample in training_samples:
                 rel = sample.get("image_path")
                 if not rel:
@@ -180,6 +209,7 @@ def export_download(
 
             # Detection snapshot images (optional)
             if include_detection_images:
+                _set_export_state(percent=60, message="Packing detection images…")
                 for det in detections:
                     rel = det.get("image_path")
                     if not rel:
@@ -188,11 +218,12 @@ def export_download(
                     if not src.is_file():
                         continue
                     arc_name = f"media/detections/{src.name}"
-                    if arc_name not in media_checksums:  # dedup
+                    if arc_name not in media_checksums:
                         zf.write(src, arc_name)
                         media_checksums[arc_name] = _sha256_zip_member(zf, arc_name)
 
             # Active model file
+            _set_export_state(percent=80, message="Packing model weights…")
             active_mv = next((mv for mv in model_versions if mv.get("active")), None)
             if active_mv:
                 model_src = Path(active_mv["path"])
@@ -204,6 +235,7 @@ def export_download(
                     media_checksums[arc_name] = _sha256_zip_member(zf, arc_name)
 
             # Manifest (written last so checksums are complete)
+            _set_export_state(percent=90, message="Writing manifest…")
             manifest = {
                 "export_format": EXPORT_FORMAT,
                 "exported_at": datetime.utcnow().isoformat() + "Z",
@@ -223,19 +255,109 @@ def export_download(
             }
             zf.writestr("manifest.json", json.dumps(manifest, indent=2))
 
-    except Exception:
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"carvision-backup-{ts}.zip"
+        _set_export_state(
+            phase="ready",
+            percent=100,
+            message="Backup ready for download.",
+            error=None,
+            file_path=tmp_path,
+            filename=filename,
+        )
+        logger.info("Backup export %s ready: %s", job_id, filename)
+
+    except Exception as exc:
+        logger.exception("Backup export %s failed: %s", job_id, exc)
         Path(tmp_path).unlink(missing_ok=True)
-        raise
+        _set_export_state(
+            phase="error",
+            percent=0,
+            message="Export failed.",
+            error=str(exc),
+            file_path=None,
+            filename=None,
+        )
+    finally:
+        if db is not None:
+            db.close()
 
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    filename = f"carvision-backup-{ts}.zip"
 
-    return FileResponse(
-        tmp_path,
-        media_type="application/zip",
-        filename=filename,
-        background=BackgroundTask(os.unlink, tmp_path),
+# ── Export endpoints ──────────────────────────────────────────────────────────
+
+@router.post("/export/start")
+def export_start(
+    include_detection_images: bool = Query(default=False),
+    _user: str = Depends(get_current_user),
+) -> JSONResponse:
+    """Start building a backup ZIP in the background. Poll /export/status for progress."""
+    state = _get_export_state()
+    if state["phase"] == "building":
+        raise HTTPException(status_code=409, detail="An export is already in progress")
+
+    # Clean up any previously built file before starting a new job
+    old_file = state.get("file_path")
+    if old_file:
+        Path(old_file).unlink(missing_ok=True)
+
+    job_id = secrets.token_hex(8)
+    _set_export_state(
+        phase="building",
+        percent=0,
+        message="Starting export…",
+        error=None,
+        job_id=job_id,
+        file_path=None,
+        filename=None,
     )
+
+    global _EXPORT_THREAD
+    _EXPORT_THREAD = threading.Thread(
+        target=_run_export,
+        args=(include_detection_images, job_id),
+        daemon=True,
+        name=f"carvision-export-{job_id}",
+    )
+    _EXPORT_THREAD.start()
+
+    return JSONResponse({"ok": True, "job_id": job_id, "message": "Export started"})
+
+
+@router.get("/export/status")
+def export_status(_user: str = Depends(get_current_user)) -> dict[str, Any]:
+    """Return the current export job state."""
+    return _get_export_state()
+
+
+@router.get("/download")
+def export_download(_user: str = Depends(get_current_user)) -> FileResponse:
+    """Serve the pre-built backup ZIP. Must call /export/start first.
+
+    The file is kept on disk after serving so the user can download it again
+    without rebuilding. It is deleted only when a new export is started.
+    """
+    state = _get_export_state()
+    if state["phase"] not in {"ready", "done"} or not state.get("file_path"):
+        raise HTTPException(
+            status_code=409,
+            detail="No backup is ready. Start an export with POST /export/start first.",
+        )
+
+    file_path = state["file_path"]
+    if not Path(file_path).is_file():
+        _set_export_state(phase="idle", percent=0, message="", error=None,
+                          job_id=None, file_path=None, filename=None)
+        raise HTTPException(
+            status_code=404,
+            detail="Backup file no longer exists. Please start a new export.",
+        )
+
+    filename = state["filename"] or "carvision-backup.zip"
+
+    # Mark as done (file stays on disk for re-download until a new export starts)
+    _set_export_state(phase="done", percent=100, message="Backup downloaded.")
+
+    return FileResponse(file_path, media_type="application/zip", filename=filename)
 
 
 # ── Import background worker ──────────────────────────────────────────────────
@@ -496,7 +618,7 @@ async def import_upload(
     return JSONResponse({"ok": True, "job_id": job_id, "message": "Import started"})
 
 
-# ── Status endpoint ───────────────────────────────────────────────────────────
+# ── Status endpoints ──────────────────────────────────────────────────────────
 
 @router.get("/import/status")
 def import_status(_user: str = Depends(get_current_user)) -> dict[str, Any]:
