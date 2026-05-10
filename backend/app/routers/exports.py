@@ -291,25 +291,26 @@ def export_start(
     _user: str = Depends(get_current_user),
 ) -> JSONResponse:
     """Start building a backup ZIP in the background. Poll /export/status for progress."""
-    state = _get_export_state()
-    if state["phase"] == "building":
-        raise HTTPException(status_code=409, detail="An export is already in progress")
-
-    # Clean up any previously built file before starting a new job
-    old_file = state.get("file_path")
-    if old_file:
-        Path(old_file).unlink(missing_ok=True)
-
     job_id = secrets.token_hex(8)
-    _set_export_state(
-        phase="building",
-        percent=0,
-        message="Starting export…",
-        error=None,
-        job_id=job_id,
-        file_path=None,
-        filename=None,
-    )
+
+    with _EXPORT_LOCK:
+        if _EXPORT_STATE["phase"] == "building":
+            raise HTTPException(status_code=409, detail="An export is already in progress")
+
+        # Clean up any previously built file before starting a new job
+        old_file = _EXPORT_STATE.get("file_path")
+        if old_file:
+            Path(old_file).unlink(missing_ok=True)
+
+        _EXPORT_STATE.update(
+            phase="building",
+            percent=0,
+            message="Starting export…",
+            error=None,
+            job_id=job_id,
+            file_path=None,
+            filename=None,
+        )
 
     global _EXPORT_THREAD
     _EXPORT_THREAD = threading.Thread(
