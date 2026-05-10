@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -11,7 +12,13 @@ for p in (str(ROOT), str(BACKEND)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-# Import Base and get_db after sys.path is set up.
+# Must be set before any app module is imported — core/config.py reads these at
+# import time and calls sys.exit() if JWT_SECRET is the insecure default while
+# CARVISION_STRICT_SECRETS is enabled (which it is by default).
+os.environ.setdefault("JWT_SECRET", "test-only-secret-not-used-in-production-aabbccdd1122")
+os.environ.setdefault("CARVISION_STRICT_SECRETS", "0")
+
+# Import Base and get_db after sys.path and env are set up.
 from db import Base, get_db  # noqa: E402
 from main import create_app   # noqa: E402
 
